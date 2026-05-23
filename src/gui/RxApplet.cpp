@@ -19,6 +19,7 @@
 #include <QHBoxLayout>
 #include <QGridLayout>
 #include <QMenu>
+#include <QApplication>
 #include <QToolButton>
 #include <QButtonGroup>
 #include <QSpinBox>
@@ -297,18 +298,6 @@ void RxApplet::buildUI()
         m_sliceGroup = new QButtonGroup(this);
         m_sliceGroup->setExclusive(true);
         tabLayout->addStretch();
-
-        m_muteAllBtn = new QPushButton(QString::fromUtf8("\xF0\x9F\x94\x87"));  // 🔇
-        m_muteAllBtn->setToolTip("Mute all slices (click again to unmute all)");
-        m_muteAllBtn->setFixedSize(28, 20);
-        m_muteAllBtn->setStyleSheet(
-            "QPushButton { background: #2a2a2a; border: 1px solid #504040; "
-            "border-radius: 3px; font-size: 12px; padding: 0; }"
-            "QPushButton:hover { background: #3a3030; border-color: #a06060; }"
-            "QPushButton:pressed { background: #6a2020; }");
-        connect(m_muteAllBtn, &QPushButton::clicked,
-                this, &RxApplet::muteAllToggled);
-        tabLayout->addWidget(m_muteAllBtn);
 
         root->addWidget(m_sliceTabRow);
     }
@@ -752,17 +741,30 @@ void RxApplet::buildUI()
         row->setSpacing(4);
 
         m_muteBtn = new QPushButton(QString::fromUtf8("\xF0\x9F\x94\x8A")); // 🔊
-        m_muteBtn->setCheckable(true);
         m_muteBtn->setFixedSize(18, 18);
         m_muteBtn->setStyleSheet(
             "QPushButton { background: transparent; border: none; font-size: 12px; padding: 0px; }"
             "QPushButton:hover { background: #204060; border-radius: 3px; }");
-        connect(m_muteBtn, &QPushButton::toggled, this, [this](bool muted) {
-            m_muteBtn->setText(muted
-                ? QString::fromUtf8("\xF0\x9F\x94\x87")    // 🔇
-                : QString::fromUtf8("\xF0\x9F\x94\x8A"));  // 🔊
-            if (m_slice) m_slice->setAudioMute(muted);
+        // Single click toggles this slice; double click toggles all owned
+        // slices.  Defer the single-click action by the platform double-
+        // click interval so the second click can override it; the visual
+        // 🔊/🔇 update is driven by SliceModel::audioMuteChanged so the
+        // icon flips when the radio acks, not on click.
+        //
+        // No suppress flag is needed for the trailing clicked() of a
+        // double-click sequence: the eventFilter returns true on
+        // MouseButtonDblClick, so QAbstractButton::mouseDoubleClickEvent
+        // is never called, the button never enters pressed-state on the
+        // second press, and the second release does not emit clicked().
+        m_muteClickTimer = new QTimer(this);
+        m_muteClickTimer->setSingleShot(true);
+        connect(m_muteClickTimer, &QTimer::timeout, this, [this]() {
+            if (m_slice) m_slice->setAudioMute(!m_slice->audioMute());
         });
+        connect(m_muteBtn, &QPushButton::clicked, this, [this]() {
+            m_muteClickTimer->start(QApplication::doubleClickInterval());
+        });
+        m_muteBtn->installEventFilter(this);
         row->addWidget(m_muteBtn);
 
         m_afSlider = new GuardedSlider(Qt::Horizontal);
@@ -1018,7 +1020,9 @@ void RxApplet::buildUI()
     m_stepDown->setToolTip("Decrease tuning step size.");
     m_stepLabel->setToolTip("Current tuning step size. Scroll to change.");
     m_stepUp->setToolTip("Increase tuning step size.");
-    m_muteBtn->setToolTip("Mutes this slice's audio output.");
+    m_muteBtn->setToolTip(
+        "Click to mute/unmute this slice. Double-click to mute/unmute "
+        "all owned slices.");
     m_afSlider->setToolTip("Audio output volume for this slice.");
     m_sqlBtn->setToolTip("Squelch gate \u2014 silences audio when the signal drops below the threshold.");
     m_sqlSlider->setToolTip("Squelch threshold. Increase to require a stronger signal before audio opens.");
@@ -1281,7 +1285,6 @@ void RxApplet::setMaxSlices(int maxSlices)
 
     if (maxSlices <= 1) {
         m_sliceTabRow->setVisible(false);
-        m_muteAllBtn->hide();
         return;
     }
 
@@ -1294,24 +1297,18 @@ void RxApplet::setMaxSlices(int maxSlices)
     if (useInline) {
         m_sliceBadge->setVisible(false);
         targetLayout = m_headerRow;
-        // Insert at position 0 (where the badge was)
+        // Insert at position 0 (where the badge was).  Hide the now-empty
+        // slice-tab row above so it doesn't reserve a strip of vertical
+        // space — the inline path uses the header row for slice tabs.
         insertIdx = 0;
-        // Move mute-all button to the right end of the header row.
-        // addWidget() reparents it from m_sliceTabRow if needed.
-        m_headerRow->addWidget(m_muteAllBtn);
-        m_muteAllBtn->show();
+        m_sliceTabRow->setVisible(false);
     } else {
         auto* layout = qobject_cast<QHBoxLayout*>(m_sliceTabRow->layout());
-        // Ensure button is in the tab row (may have been reparented to
-        // m_headerRow during a previous inline call). addWidget() is a
-        // no-op if already here; otherwise it reparents from m_headerRow.
-        layout->addWidget(m_muteAllBtn);
         targetLayout = layout;
         // Insert slice buttons before the stretch so receiver letters stay
-        // left-aligned and the mute-all speaker stays right-aligned.
+        // left-aligned across the tab row.
         insertIdx = 0;
         m_sliceTabRow->setVisible(true);
-        m_muteAllBtn->show();
     }
 
     for (int i = 0; i < maxSlices; ++i) {
@@ -1358,6 +1355,11 @@ void RxApplet::setMaxSlices(int maxSlices)
     if (!useInline) {
         m_sliceTabRow->setVisible(true);
     }
+
+    // Re-apply the all-muted dim to the freshly-rebuilt buttons so the
+    // visual stays in sync if the rebuild happens while the user is in
+    // the all-muted state.
+    refreshAllMutedDim();
 }
 
 void RxApplet::clearSliceButtons()
@@ -1374,7 +1376,6 @@ void RxApplet::clearSliceButtons()
     }
 
     m_sliceTabRow->setVisible(false);
-    m_muteAllBtn->hide();
     m_sliceBadge->setVisible(true);
 }
 
@@ -1603,6 +1604,32 @@ void RxApplet::setRadioModel(RadioModel* radioModel)
             const int active = m_slice ? m_slice->sliceId() : -1;
             updateSliceButtons(m_radioModel->slices(), active);
         });
+        // All-muted dim feedback: hook audioMuteChanged on every owned
+        // slice so the slice-tab row dims when every owned slice is
+        // muted (and brightens the moment any one unmutes).
+        //
+        // Critical: connect via member-function pointer, NOT a lambda —
+        // Qt::UniqueConnection silently rejects lambda slots (the
+        // connection is not made and Qt emits a runtime warning).  A
+        // member-function pointer pairs correctly with UniqueConnection
+        // so we get exactly one listener per (slice, applet) pair.
+        connect(m_radioModel, &RadioModel::sliceAdded, this,
+                [this](SliceModel* slice) {
+            if (!slice) return;
+            connect(slice, &SliceModel::audioMuteChanged,
+                    this, &RxApplet::refreshAllMutedDim,
+                    Qt::UniqueConnection);
+            refreshAllMutedDim();
+        });
+        connect(m_radioModel, &RadioModel::sliceRemoved,
+                this, &RxApplet::refreshAllMutedDim);
+        for (SliceModel* s : m_radioModel->slices()) {
+            if (!s) continue;
+            connect(s, &SliceModel::audioMuteChanged,
+                    this, &RxApplet::refreshAllMutedDim,
+                    Qt::UniqueConnection);
+        }
+        refreshAllMutedDim();
     }
     updateAntennaButtons();
 }
@@ -1882,17 +1909,14 @@ void RxApplet::connectSlice(SliceModel* s)
         }
     });
 
-    // Audio mute
-    {
-        QSignalBlocker b(m_muteBtn);
-        m_muteBtn->setChecked(s->audioMute());
-        m_muteBtn->setText(s->audioMute()
-            ? QString::fromUtf8("\xF0\x9F\x94\x87")
-            : QString::fromUtf8("\xF0\x9F\x94\x8A"));
-    }
+    // Audio mute — icon-only state (button is not checkable; double-click
+    // routes to muteAllToggled via eventFilter).  The icon flips when the
+    // radio acks the mute change via audioMuteChanged so the source of
+    // truth is the slice state, not the click.
+    m_muteBtn->setText(s->audioMute()
+        ? QString::fromUtf8("\xF0\x9F\x94\x87")
+        : QString::fromUtf8("\xF0\x9F\x94\x8A"));
     connect(s, &SliceModel::audioMuteChanged, this, [this](bool muted) {
-        QSignalBlocker b(m_muteBtn);
-        m_muteBtn->setChecked(muted);
         m_muteBtn->setText(muted
             ? QString::fromUtf8("\xF0\x9F\x94\x87")
             : QString::fromUtf8("\xF0\x9F\x94\x8A"));
@@ -2535,6 +2559,15 @@ void RxApplet::applyOffsetDir(const QString& dir)
 
 bool RxApplet::eventFilter(QObject* obj, QEvent* ev)
 {
+    // Mute button double-click → mute/unmute all owned slices.  The single-
+    // click action is deferred via m_muteClickTimer (see m_muteBtn setup);
+    // a real double-click cancels that timer and emits muteAllToggled.
+    if (obj == m_muteBtn && ev->type() == QEvent::MouseButtonDblClick) {
+        if (m_muteClickTimer) m_muteClickTimer->stop();
+        emit muteAllToggled();
+        return true;
+    }
+
     if (obj == m_freqEdit
         && (ev->type() == QEvent::ShortcutOverride
             || ev->type() == QEvent::KeyPress)) {
@@ -2665,6 +2698,72 @@ void RxApplet::clearLockedFrequencyFeedback()
     m_lockedFrequencyTimer.stop();
     m_showingLockedFrequencyFeedback = false;
     updateFreqLabel();
+}
+
+void RxApplet::refreshAllMutedDim()
+{
+    if (!m_radioModel) {
+        setSliceButtonsDimmed(false);
+        return;
+    }
+    const auto slices = m_radioModel->slices();
+    // RadioModel::slices() returns only owned slices (foreign clients are
+    // pruned on client_handle).  The dim should reflect whether every one
+    // of the user's own slices is muted — empty list means "no slices to
+    // indicate state for", treat as not-all-muted.
+    if (slices.isEmpty()) {
+        setSliceButtonsDimmed(false);
+        return;
+    }
+    bool anyUnmuted = false;
+    for (const SliceModel* s : slices) {
+        if (s && !s->audioMute()) { anyUnmuted = true; break; }
+    }
+    setSliceButtonsDimmed(!anyUnmuted);
+}
+
+void RxApplet::setSliceButtonsDimmed(bool dim)
+{
+    // QGraphicsOpacityEffect doesn't always compose cleanly with QSS-
+    // styled widgets on Linux X11 (the effect is silently dropped on some
+    // configurations).  Swap the stylesheet directly instead so the dim
+    // is guaranteed to render.  Each slice button's QSS carries a per-
+    // slice color baked in by setMaxSlices, so cache that original on
+    // first-dim and restore it on un-dim.
+    for (QToolButton* btn : m_sliceBtns) {
+        if (!btn) continue;
+        const QVariant cached = btn->property("originalStyleSheet");
+        if (cached.isNull())
+            btn->setProperty("originalStyleSheet", btn->styleSheet());
+        if (dim) {
+            // Uniform dark gray, no per-slice color — visually
+            // distinct from the foreign-slot grey and the empty-slot
+            // look so the operator can tell at a glance: "all my
+            // receivers are muted."
+            btn->setStyleSheet(
+                "QToolButton { background: #15181c; color: #383d44; "
+                "border: 1px solid #2a2e34; border-radius: 3px; "
+                "font-weight: bold; font-size: 10px; padding: 0; }"
+                "QToolButton:checked { background: #25292f; color: #4a5058; "
+                "border: 1px solid #383d44; }");
+        } else {
+            btn->setStyleSheet(cached.toString());
+        }
+    }
+    // Slice badge (shown on single-slice radios) — same uniform dim.
+    if (m_sliceBadge) {
+        const QVariant cached = m_sliceBadge->property("originalStyleSheet");
+        if (cached.isNull())
+            m_sliceBadge->setProperty("originalStyleSheet",
+                                       m_sliceBadge->styleSheet());
+        if (dim) {
+            m_sliceBadge->setStyleSheet(
+                "QLabel { background: #25292f; color: #4a5058; "
+                "border-radius: 3px; font-weight: bold; font-size: 11px; }");
+        } else {
+            m_sliceBadge->setStyleSheet(cached.toString());
+        }
+    }
 }
 
 } // namespace AetherSDR

@@ -157,6 +157,14 @@ private:
     static QString formatHz(int hz);
     static QString formatStepLabel(int hz);
 
+    // Recomputes the "all owned slices muted" state from RadioModel and
+    // dims the slice-tab buttons accordingly.  Called on any owned-slice
+    // audioMuteChanged + on slice add/remove + after slice-button rebuild.
+    // The dim is the visual ack the user gets after a double-click on
+    // m_muteBtn that toggles every slice.
+    void refreshAllMutedDim();
+    void setSliceButtonsDimmed(bool dim);
+
     SliceModel* m_slice{nullptr};
     TransmitModel* m_txModel{nullptr};
     RadioModel* m_radioModel{nullptr};
@@ -174,7 +182,12 @@ private:
     QButtonGroup*           m_sliceGroup{nullptr};
     QVector<QToolButton*>   m_sliceBtns;
     bool                    m_sliceButtonClicksConnected{false};
-    QPushButton*            m_muteAllBtn{nullptr};
+
+    // Mute button click handling — single click toggles this slice (timer-
+    // deferred by the platform double-click interval, typically 400 ms),
+    // double click toggles all owned slices (handled in eventFilter, which
+    // cancels the timer and emits muteAllToggled).
+    QTimer*                 m_muteClickTimer{nullptr};
 
     // ── Header row ────────────────────────────────────────────────────────
     QLabel*      m_sliceBadge{nullptr};   // "A" / "B" / "C" / "D"
