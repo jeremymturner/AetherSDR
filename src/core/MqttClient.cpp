@@ -145,10 +145,40 @@ void MqttClient::disconnect()
     m_connected = false;
 }
 
-void MqttClient::subscribe(const QString& topic)
+void MqttClient::setSubscriptions(const QStringList& topics)
 {
 #ifdef HAVE_MQTT
-    if (m_connected && m_mosq) {
+    QStringList desired;
+    for (const QString& raw : topics) {
+        const QString topic = raw.trimmed();
+        if (!topic.isEmpty() && !desired.contains(topic)) {
+            desired.append(topic);
+        }
+    }
+
+    const QStringList previous = m_pendingTopics;
+    m_pendingTopics = desired;
+
+    if (!m_connected || !m_mosq) {
+        return;
+    }
+
+    for (const QString& topic : previous) {
+        if (!desired.contains(topic)) {
+            mosquitto_unsubscribe(m_mosq, nullptr, topic.toUtf8().constData());
+            qCDebug(lcMqtt) << "MqttClient: unsubscribed from" << topic;
+        }
+    }
+
+    // Subscribe only to topics in `desired` that weren't already in
+    // `previous`.  Mosquitto's subscribe is idempotent broker-side, so
+    // re-subscribing to a stable topic is correct-but-wasteful — costs
+    // a small CONNECT packet and a SUBACK round-trip for every retained
+    // topic on every settings change.  Pin the diff here so a 20-topic
+    // user-list with one added topic emits one SUBSCRIBE instead of 20.
+    for (const QString& topic : desired) {
+        if (previous.contains(topic))
+            continue;
         int rc = mosquitto_subscribe(m_mosq, nullptr, topic.toUtf8().constData(), 0);
         if (rc != MOSQ_ERR_SUCCESS) {
             qCWarning(lcMqtt) << "MqttClient: subscribe failed for" << topic
@@ -156,8 +186,31 @@ void MqttClient::subscribe(const QString& topic)
         } else {
             qCDebug(lcMqtt) << "MqttClient: subscribed to" << topic;
         }
-    } else {
-        m_pendingTopics.append(topic);
+    }
+#else
+    Q_UNUSED(topics);
+#endif
+}
+
+void MqttClient::subscribe(const QString& topic)
+{
+#ifdef HAVE_MQTT
+    const QString trimmedTopic = topic.trimmed();
+    if (trimmedTopic.isEmpty()) {
+        return;
+    }
+    if (!m_pendingTopics.contains(trimmedTopic)) {
+        m_pendingTopics.append(trimmedTopic);
+    }
+
+    if (m_connected && m_mosq) {
+        int rc = mosquitto_subscribe(m_mosq, nullptr, trimmedTopic.toUtf8().constData(), 0);
+        if (rc != MOSQ_ERR_SUCCESS) {
+            qCWarning(lcMqtt) << "MqttClient: subscribe failed for" << trimmedTopic
+                              << mosquitto_strerror(rc);
+        } else {
+            qCDebug(lcMqtt) << "MqttClient: subscribed to" << trimmedTopic;
+        }
     }
 #else
     Q_UNUSED(topic);
