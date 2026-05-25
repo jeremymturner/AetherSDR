@@ -7,6 +7,27 @@ set(CMAKE_AUTOMOC ON)
 set(CMAKE_AUTORCC ON)
 set(CMAKE_AUTOUIC ON)
 
+# Libraries options — opt-in system-package replacements for vendored
+# dependencies.  Off by default so existing build hosts (CI containers,
+# release builds, contributor laptops) keep using the bundled, version-
+# pinned third_party/ snapshots.  Distro packagers turn these ON to
+# match their dynamic-linking policy.
+
+option(USE_SYSTEM_ZLIB         "Use system zlib"         OFF)
+option(USE_SYSTEM_MSPACK       "Use system libmspack"    OFF)
+option(USE_SYSTEM_LIBMOSQUITTO "Use system libmosquitto" OFF)
+option(USE_SYSTEM_RTMIDI       "Use system RtMidi"       OFF)
+
+# Build features options
+
+option(REQUIRE_SERIALPORT "Fail if Qt6 SerialPort is not found (use for release builds)" OFF)
+option(ENABLE_RADE "Build with RADE digital voice support (uses vendored Opus snapshot)" ON)
+option(AETHER_GPU_SPECTRUM "Enable QRhi GPU spectrum rendering" ON)
+option(ENABLE_BNR "Enable NVIDIA NIM BNR noise removal (requires grpc++)" OFF)
+option(ENABLE_SPECBLEACH "Enable NR4 spectral bleach noise reduction" ON)
+option(ENABLE_DFNR "Enable DFNR DeepFilterNet3 noise reduction" ON)
+option(ENABLE_MQTT "Enable MQTT client support" ON)
+option(MQTT_TLS "Enable MQTT TLS via OpenSSL (disable for AppImage)" ON)
 option(LOWER_CASE_BINARY_NAME "Make the output binary lower case. Only affects Linux" OFF)
 
 # macOS: ensure Homebrew lib/include paths are in the search path
@@ -43,8 +64,16 @@ find_package(Qt6 6.2 REQUIRED COMPONENTS
 # is gone — single source-of-truth across all platforms. (#2651)
 set(ZLIB_BUILD_EXAMPLES OFF CACHE BOOL "Disable zlib examples" FORCE)
 set(SKIP_INSTALL_ALL ON CACHE BOOL "Don't install zlib" FORCE)
-add_subdirectory(third_party/zlib EXCLUDE_FROM_ALL)
-option(REQUIRE_SERIALPORT "Fail if Qt6 SerialPort is not found (use for release builds)" OFF)
+
+if (USE_SYSTEM_ZLIB)
+    find_package(PkgConfig REQUIRED)
+    if(PkgConfig_FOUND)
+        pkg_check_modules(zlib REQUIRED IMPORTED_TARGET zlib)
+    endif()
+else()
+    add_subdirectory(third_party/zlib EXCLUDE_FROM_ALL)
+endif()
+
 # Note: on Windows the SerialPortController uses raw Win32 WaitCommEvent for
 # DSR/CTS edge detection (FTDI VCP drivers don't refresh
 # GetCommModemStatus outside a WaitCommEvent completion).  Qt6::SerialPort
@@ -119,7 +148,6 @@ endif()
 # Bundled RADE (BSD-2) — FreeDV Radio Autoencoder digital voice codec
 # Opus (with FARGAN/LPCNet) is built from a vendored local snapshot via ExternalProject
 set(RADE_DIR ${CMAKE_SOURCE_DIR}/third_party/radae)
-option(ENABLE_RADE "Build with RADE digital voice support (uses vendored Opus snapshot)" ON)
 if(ENABLE_RADE AND EXISTS "${RADE_DIR}/src/rade_api.h")
     # macOS universal binary: build Opus for both architectures
     if(APPLE AND CMAKE_OSX_ARCHITECTURES MATCHES "x86_64.*arm64|arm64.*x86_64")
@@ -214,7 +242,6 @@ endif()
 # GPU-accelerated spectrum/waterfall rendering via QRhi (#391)
 # Requires: Qt 6.7+ (QRhiWidget), Qt6::ShaderTools (build-time shader compilation)
 # Defaults to ON but auto-disables on Qt < 6.7 (e.g. Ubuntu 24.04 ships Qt 6.4).
-option(AETHER_GPU_SPECTRUM "Enable QRhi GPU spectrum rendering" ON)
 if(AETHER_GPU_SPECTRUM)
     if(Qt6_VERSION VERSION_LESS "6.7")
         set(AETHER_GPU_SPECTRUM OFF)
@@ -259,7 +286,6 @@ endif()
 
 # NVIDIA NIM BNR (Background Noise Removal) — GPU-accelerated neural denoising
 # Requires: grpc++, protobuf, NVIDIA RTX 4000+ GPU, Docker container
-option(ENABLE_BNR "Enable NVIDIA NIM BNR noise removal (requires grpc++)" OFF)
 if(ENABLE_BNR)
     find_package(PkgConfig REQUIRED)
     pkg_check_modules(GRPC REQUIRED grpc++)
@@ -301,13 +327,9 @@ endif()
 # When clang-cl is available, build as a separate static lib using it.
 if(MSVC)
     find_program(CLANG_CL clang-cl HINTS "C:/Program Files/LLVM/bin")
-    if(CLANG_CL)
-        option(ENABLE_SPECBLEACH "Enable NR4 spectral bleach noise reduction" ON)
-    else()
-        option(ENABLE_SPECBLEACH "Enable NR4 spectral bleach noise reduction" OFF)
+    if(NOT CLANG_CL)
+        set(ENABLE_SPECBLEACH OFF CACHE BOOL "Enable NR4 spectral bleach noise reduction" FORCE)
     endif()
-else()
-    option(ENABLE_SPECBLEACH "Enable NR4 spectral bleach noise reduction" ON)
 endif()
 if(ENABLE_SPECBLEACH)
     file(GLOB_RECURSE SPECBLEACH_SOURCES third_party/libspecbleach/src/*.c)
@@ -355,7 +377,6 @@ endif()
 
 # DeepFilterNet3 DFNR — bundled neural noise reduction (MIT/Apache-2.0)
 # Pre-built static library from Rust crate (libdf), model weights embedded.
-option(ENABLE_DFNR "Enable DFNR DeepFilterNet3 noise reduction" ON)
 if(ENABLE_DFNR)
     set(DEEPFILTER_DIR ${CMAKE_SOURCE_DIR}/third_party/deepfilter)
     if(WIN32)
@@ -397,31 +418,36 @@ if(ENABLE_DFNR)
 endif()
 
 # MQTT client support — bundled libmosquitto (#699)
-option(ENABLE_MQTT "Enable MQTT client support" ON)
-option(MQTT_TLS "Enable MQTT TLS via OpenSSL (disable for AppImage)" ON)
 if(ENABLE_MQTT)
-    if(MQTT_TLS)
-        find_package(OpenSSL)
-    endif()
-    set(MOSQUITTO_DIR ${CMAKE_SOURCE_DIR}/third_party/mosquitto)
-    file(GLOB MOSQUITTO_SOURCES ${MOSQUITTO_DIR}/src/*.c)
-    # Remove broker-only and optional files we don't need
-    list(FILTER MOSQUITTO_SOURCES EXCLUDE REGEX "socks_mosq\\.c$")
-    list(FILTER MOSQUITTO_SOURCES EXCLUDE REGEX "http_client\\.c$")
-    list(FILTER MOSQUITTO_SOURCES EXCLUDE REGEX "picohttpparser\\.c$")
-    list(FILTER MOSQUITTO_SOURCES EXCLUDE REGEX "extended_auth\\.c$")
-    list(FILTER MOSQUITTO_SOURCES EXCLUDE REGEX "cjson_common\\.c$")
-    list(FILTER MOSQUITTO_SOURCES EXCLUDE REGEX "password_common\\.c$")
-    list(FILTER MOSQUITTO_SOURCES EXCLUDE REGEX "base64_common\\.c$")
-    list(FILTER MOSQUITTO_SOURCES EXCLUDE REGEX "json_help\\.c$")
-    list(FILTER MOSQUITTO_SOURCES EXCLUDE REGEX "srv_mosq\\.c$")
-    if(OpenSSL_FOUND)
-        message(STATUS "MQTT client support enabled (bundled libmosquitto, TLS via OpenSSL ${OPENSSL_VERSION})")
+    if (USE_SYSTEM_LIBMOSQUITTO)
+        find_package(PkgConfig REQUIRED)
+        if(PkgConfig_FOUND)
+            pkg_check_modules(libmosquitto REQUIRED IMPORTED_TARGET libmosquitto)
+        endif()
     else()
-        # tls_mosq.c and file_common.c (cert file access) require OpenSSL — exclude when not available
-        list(FILTER MOSQUITTO_SOURCES EXCLUDE REGEX "tls_mosq\\.c$")
-        list(FILTER MOSQUITTO_SOURCES EXCLUDE REGEX "file_common\\.c$")
-        message(STATUS "MQTT client support enabled (bundled libmosquitto, TLS disabled — OpenSSL not found)")
+        if(MQTT_TLS)
+            find_package(OpenSSL)
+        endif()
+        set(MOSQUITTO_DIR ${CMAKE_SOURCE_DIR}/third_party/mosquitto)
+        file(GLOB MOSQUITTO_SOURCES ${MOSQUITTO_DIR}/src/*.c)
+        # Remove broker-only and optional files we don't need
+        list(FILTER MOSQUITTO_SOURCES EXCLUDE REGEX "socks_mosq\\.c$")
+        list(FILTER MOSQUITTO_SOURCES EXCLUDE REGEX "http_client\\.c$")
+        list(FILTER MOSQUITTO_SOURCES EXCLUDE REGEX "picohttpparser\\.c$")
+        list(FILTER MOSQUITTO_SOURCES EXCLUDE REGEX "extended_auth\\.c$")
+        list(FILTER MOSQUITTO_SOURCES EXCLUDE REGEX "cjson_common\\.c$")
+        list(FILTER MOSQUITTO_SOURCES EXCLUDE REGEX "password_common\\.c$")
+        list(FILTER MOSQUITTO_SOURCES EXCLUDE REGEX "base64_common\\.c$")
+        list(FILTER MOSQUITTO_SOURCES EXCLUDE REGEX "json_help\\.c$")
+        list(FILTER MOSQUITTO_SOURCES EXCLUDE REGEX "srv_mosq\\.c$")
+        if(OpenSSL_FOUND)
+            message(STATUS "MQTT client support enabled (bundled libmosquitto, TLS via OpenSSL ${OPENSSL_VERSION})")
+        else()
+            # tls_mosq.c and file_common.c (cert file access) require OpenSSL — exclude when not available
+            list(FILTER MOSQUITTO_SOURCES EXCLUDE REGEX "tls_mosq\\.c$")
+            list(FILTER MOSQUITTO_SOURCES EXCLUDE REGEX "file_common\\.c$")
+            message(STATUS "MQTT client support enabled (bundled libmosquitto, TLS disabled — OpenSSL not found)")
+        endif()
     endif()
 endif()
 
@@ -820,14 +846,14 @@ endif()
 # consumes liquid symbols. Standard linker dead-code elimination
 # (--gc-sections on ELF) drops the unused static lib from the final binary.
 if(NOT MSVC)
-set(BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
-set(BUILD_AUTOTESTS OFF CACHE BOOL "" FORCE)
-set(BUILD_BENCHMARKS OFF CACHE BOOL "" FORCE)
-set(BUILD_SANDBOX OFF CACHE BOOL "" FORCE)
-set(BUILD_DOC OFF CACHE BOOL "" FORCE)
-set(BUILD_STATIC_LIBS ON CACHE BOOL "" FORCE)
-set(FIND_FFTW OFF CACHE BOOL "" FORCE)
-set(ENABLE_LOGGING OFF CACHE BOOL "" FORCE)
+    set(BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+    set(BUILD_AUTOTESTS OFF CACHE BOOL "" FORCE)
+    set(BUILD_BENCHMARKS OFF CACHE BOOL "" FORCE)
+    set(BUILD_SANDBOX OFF CACHE BOOL "" FORCE)
+    set(BUILD_DOC OFF CACHE BOOL "" FORCE)
+    set(BUILD_STATIC_LIBS ON CACHE BOOL "" FORCE)
+    set(FIND_FFTW OFF CACHE BOOL "" FORCE)
+    set(ENABLE_LOGGING OFF CACHE BOOL "" FORCE)
 # liquid-dsp's cmake_minimum_required(VERSION 3.10) puts its option() calls
 # under CMP0077 OLD behavior — option() with that policy does NOT honor a
 # same-name *normal* variable. We must use CACHE BOOL FORCE so the override
@@ -839,19 +865,40 @@ set(ENABLE_LOGGING OFF CACHE BOOL "" FORCE)
 # Cache pollution is undone with unset(CACHE) after add_subdirectory so
 # this doesn't leak into the rest of the project's BUILD_SHARED_LIBS
 # semantics.
-set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
-add_subdirectory(third_party/liquid-dsp EXCLUDE_FROM_ALL)
-unset(BUILD_SHARED_LIBS CACHE)
+    set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+    add_subdirectory(third_party/liquid-dsp EXCLUDE_FROM_ALL)
+    unset(BUILD_SHARED_LIBS CACHE)
 # Suppress warnings from vendored code (same pattern as other third_party
 # integrations — we don't want -Werror surfaces on code we don't own).
-if(TARGET liquid-static)
-    target_compile_options(liquid-static PRIVATE -w)
-endif()
+    if(TARGET liquid-static)
+        target_compile_options(liquid-static PRIVATE -w)
+    endif()
 endif()  # NOT MSVC
 
 qt_add_resources(RESOURCES resources/resources.qrc)
 
 add_executable(AetherSDR ${ALL_SOURCES} ${RNNOISE_SOURCES} ${GGMORSE_SOURCES} ${RADE_SOURCES} ${BNR_SOURCES} ${SPECBLEACH_SOURCES} ${RESOURCES})
+
+if (USE_SYSTEM_ZLIB)
+    target_link_libraries(AetherSDR PRIVATE PkgConfig::zlib)
+else()
+    target_link_libraries(AetherSDR PRIVATE zlibstatic) # bundled third_party/zlib 1.3.1
+endif()
+
+if (USE_SYSTEM_MSPACK)
+    target_link_libraries(AetherSDR PRIVATE PkgConfig::libmspack)
+else()
+    target_link_libraries(AetherSDR PRIVATE mspack_static)
+endif()
+
+# Link the system libmosquitto target only when MQTT is enabled — the
+# pkg_check_modules() call that defines PkgConfig::libmosquitto lives
+# inside the ENABLE_MQTT block above, so without this guard the combo
+# (ENABLE_MQTT=OFF + USE_SYSTEM_LIBMOSQUITTO=ON) would configure cleanly
+# then fail at link time with a missing target.
+if (ENABLE_MQTT AND USE_SYSTEM_LIBMOSQUITTO)
+    target_link_libraries(AetherSDR PRIVATE PkgConfig::libmosquitto)
+endif()
 
 # Optionally change binary name to lower case on Linux
 if (LINUX AND LOWER_CASE_BINARY_NAME)
@@ -962,7 +1009,6 @@ target_link_libraries(AetherSDR PRIVATE
     # bundled third_party/liquid-dsp (#3043) — non-MSVC only; see CMakeLists
     # block above for the liquid-dsp/MSVC C99 _Complex incompatibility.
     $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:liquid-static>
-    zlibstatic           # bundled third_party/zlib 1.3.1
     ${CMAKE_DL_LIBS}   # dlopen/dlsym for tolerant X11 error handler (#1839)
 )
 
@@ -1017,18 +1063,33 @@ endif()
 
 # Bundled libmspack (LGPL-2.1) — CAB+LZX decompression for the v4.2+ MSI
 # firmware-installer extraction path. See third_party/libmspack/README.md.
-add_subdirectory(third_party/libmspack)
-target_link_libraries(AetherSDR PRIVATE mspack_static)
+if (USE_SYSTEM_MSPACK)
+    find_package(PkgConfig REQUIRED)
+    if(PkgConfig_FOUND)
+        pkg_check_modules(libmspack REQUIRED IMPORTED_TARGET libmspack)
+    endif()
+else()
+    add_subdirectory(third_party/libmspack)
+endif()
 
 # Bundled RtMidi (MIT license) — MIDI controller support on all platforms
-message(STATUS "MIDI controller support enabled (bundled RtMidi)")
+message(STATUS "MIDI controller support enabled (RtMidi)")
 target_compile_definitions(AetherSDR PRIVATE HAVE_MIDI)
 target_sources(AetherSDR PRIVATE
-    third_party/rtmidi/RtMidi.cpp
     src/core/MidiControlManager.cpp
     src/core/MidiSettings.cpp
     src/gui/MidiMappingDialog.cpp)
-target_include_directories(AetherSDR PRIVATE third_party/rtmidi)
+if (USE_SYSTEM_RTMIDI)
+    find_package(PkgConfig REQUIRED)
+    if(PkgConfig_FOUND)
+        pkg_check_modules(rtmidi REQUIRED IMPORTED_TARGET rtmidi)
+    endif()
+    target_link_libraries(AetherSDR PRIVATE PkgConfig::rtmidi)
+else()
+    target_sources(AetherSDR PRIVATE third_party/rtmidi/RtMidi.cpp)
+    target_include_directories(AetherSDR PRIVATE third_party/rtmidi)
+endif()
+
 if(APPLE)
     target_compile_definitions(AetherSDR PRIVATE __MACOSX_CORE__)
     target_link_libraries(AetherSDR PRIVATE "-framework CoreMIDI" "-framework CoreAudio" "-framework CoreFoundation" "-framework IOKit")
@@ -1037,7 +1098,11 @@ elseif(WIN32)
     target_link_libraries(AetherSDR PRIVATE winmm)
 else()
     target_compile_definitions(AetherSDR PRIVATE __LINUX_ALSA__)
-    target_link_libraries(AetherSDR PRIVATE asound)
+    find_package(PkgConfig REQUIRED)
+    if(PkgConfig_FOUND)
+        pkg_check_modules(alsa REQUIRED IMPORTED_TARGET alsa)
+    endif()
+    target_link_libraries(AetherSDR PRIVATE PkgConfig::alsa)
 endif()
 
 # hidapi — USB HID encoder support (Stream Deck, Icom RC-28, Griffin PowerMate, Contour Shuttle)
@@ -1288,25 +1353,37 @@ if(ENABLE_DFNR)
 endif()
 
 if(ENABLE_MQTT)
+    # HAVE_MQTT gates the project's MQTT client code (MqttApplet,
+    # RadioModel plumbing) — must be set regardless of whether
+    # libmosquitto is the bundled or the system copy.
     target_compile_definitions(AetherSDR PRIVATE HAVE_MQTT)
-    target_include_directories(AetherSDR PRIVATE
-        ${MOSQUITTO_DIR}/include
-        ${MOSQUITTO_DIR}/src)
-    target_sources(AetherSDR PRIVATE ${MOSQUITTO_SOURCES})
-    if(OpenSSL_FOUND)
-        set(MQTT_TLS_FLAG " -DWITH_TLS")
-        target_compile_definitions(AetherSDR PRIVATE HAVE_MQTT_TLS)
-        target_link_libraries(AetherSDR PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+    if (USE_SYSTEM_LIBMOSQUITTO)
+        # System libmosquitto is conventionally built with TLS support on
+        # distro packages — assume HAVE_MQTT_TLS unless the packager
+        # explicitly opted out via -DMQTT_TLS=OFF.
+        if(MQTT_TLS)
+            target_compile_definitions(AetherSDR PRIVATE HAVE_MQTT_TLS)
+        endif()
     else()
-        set(MQTT_TLS_FLAG "")
-    endif()
-    if(WIN32)
-        set_source_files_properties(${MOSQUITTO_SOURCES} PROPERTIES
-            COMPILE_FLAGS "-w -DLIBMOSQUITTO_STATIC -DLIBMOSQCOMMON_STATIC${MQTT_TLS_FLAG}")
-        target_compile_definitions(AetherSDR PRIVATE LIBMOSQUITTO_STATIC LIBMOSQCOMMON_STATIC)
-    else()
-        set_source_files_properties(${MOSQUITTO_SOURCES} PROPERTIES
-            COMPILE_FLAGS "-w -DWITH_THREADING${MQTT_TLS_FLAG}")
+        target_include_directories(AetherSDR PRIVATE
+            ${MOSQUITTO_DIR}/include
+            ${MOSQUITTO_DIR}/src)
+        target_sources(AetherSDR PRIVATE ${MOSQUITTO_SOURCES})
+        if(OpenSSL_FOUND)
+            set(MQTT_TLS_FLAG " -DWITH_TLS")
+            target_compile_definitions(AetherSDR PRIVATE HAVE_MQTT_TLS)
+            target_link_libraries(AetherSDR PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+        else()
+            set(MQTT_TLS_FLAG "")
+        endif()
+        if(WIN32)
+            set_source_files_properties(${MOSQUITTO_SOURCES} PROPERTIES
+                COMPILE_FLAGS "-w -DLIBMOSQUITTO_STATIC -DLIBMOSQCOMMON_STATIC${MQTT_TLS_FLAG}")
+            target_compile_definitions(AetherSDR PRIVATE LIBMOSQUITTO_STATIC LIBMOSQCOMMON_STATIC)
+        else()
+            set_source_files_properties(${MOSQUITTO_SOURCES} PROPERTIES
+                COMPILE_FLAGS "-w -DWITH_THREADING${MQTT_TLS_FLAG}")
+        endif()
     endif()
     if(NOT WIN32)
         target_link_libraries(AetherSDR PRIVATE pthread)
@@ -1593,7 +1670,11 @@ add_executable(ole_compound_file_test
     src/core/AppSettings.cpp
 )
 target_include_directories(ole_compound_file_test PRIVATE src)
-target_link_libraries(ole_compound_file_test PRIVATE Qt6::Core mspack_static)
+if (USE_SYSTEM_MSPACK)
+    target_link_libraries(ole_compound_file_test PRIVATE Qt6::Core PkgConfig::libmspack)
+else()
+    target_link_libraries(ole_compound_file_test PRIVATE Qt6::Core mspack_static)
+endif()
 if(UNIX)
     target_link_libraries(ole_compound_file_test PRIVATE pthread)
 endif()
@@ -1813,7 +1894,12 @@ add_executable(midi_settings_test
     src/core/MidiSettings.cpp
 )
 target_compile_definitions(midi_settings_test PRIVATE HAVE_MIDI)
-target_include_directories(midi_settings_test PRIVATE src third_party/rtmidi)
+
+if (USE_SYSTEM_RTMIDI)
+    target_link_libraries(midi_settings_test PRIVATE PkgConfig::rtmidi)
+else()
+    target_include_directories(midi_settings_test PRIVATE src third_party/rtmidi)
+endif()
 target_link_libraries(midi_settings_test PRIVATE Qt6::Core)
 add_test(NAME midi_settings_test COMMAND midi_settings_test)
 
