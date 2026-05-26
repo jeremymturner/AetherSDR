@@ -2,6 +2,7 @@
 #include "AppSettings.h"
 #include "LogManager.h"
 
+#include <QEvent>
 #include <QStandardPaths>
 #include <QDir>
 #include <QFile>
@@ -430,6 +431,24 @@ void ThemeManager::seedBuiltinDefaults()
     m_tokens.insert("color.slice.h",  QString("#ff60a0"));
     m_tokens.insert("color.slice.tx", QString("#ff4d4d"));
 
+    // Slider + knob component tokens — seeded so themes that pre-date
+    // the namespace (e.g. user copies forked before this PR) still
+    // resolve the canonical Wave-blue look instead of falling through
+    // to empty QSS.  Default Dark / Default Light's JSON aliases
+    // override these when those themes load.
+    m_tokens.insert("color.slider.background",          QString("#1a2a3a"));
+    m_tokens.insert("color.slider.foreground",          QString("#00b4d8"));
+    m_tokens.insert("color.slider.handle",              QString("#c8d8e8"));
+    m_tokens.insert("color.slider.background.disabled", QString("#1a2330"));
+    m_tokens.insert("color.slider.foreground.disabled", QString("#3a4a5a"));
+    m_tokens.insert("color.slider.handle.disabled",     QString("#506070"));
+    m_tokens.insert("color.knob.background",            QString("#1a2a3a"));
+    m_tokens.insert("color.knob.foreground",            QString("#0070c0"));
+    m_tokens.insert("color.knob.handle",                QString("#c8d8e8"));
+    m_tokens.insert("color.knob.background.disabled",   QString("#1a2330"));
+    m_tokens.insert("color.knob.foreground.disabled",   QString("#3a4a5a"));
+    m_tokens.insert("color.knob.handle.disabled",       QString("#506070"));
+
     // Font + sizing
     m_tokens.insert("font.family.ui",        QString("Inter"));
     m_tokens.insert("font.family.mono",      QString("monospace"));
@@ -453,6 +472,37 @@ void ThemeManager::seedBuiltinDefaults()
     m_tokens.insert("sizing.panel.cornerRadius", 4);
     m_tokens.insert("sizing.border.subtle",      1);
     m_tokens.insert("sizing.border.strong",      2);
+
+    // Per-applet slider + knob foreground overrides seeded into the
+    // scope tree so user themes that pre-date the v2 scope architecture
+    // (e.g. "My Default Dark" forked before this PR) still get the
+    // visible per-applet differentiation.  Bundled themes' JSON
+    // re-asserts these via {color.red.500} aliases — idempotent and
+    // editable in the Theme Editor.  Raw hex used here so the seeds
+    // don't depend on the primitives palette being loaded yet
+    // (older user themes have no primitives section).
+    //
+    // KEEP IN SYNC: the hex values below mirror the primitives palette
+    // in resources/themes/default-dark.json (color.red.500 / .green.500
+    // / .amber.500).  If those primitives shift, update both sites or
+    // the seeded look will drift from the JSON-defined look on bundled
+    // themes (silently — both layers resolve, the JSON wins, but the
+    // visible vs. seeded values diverge for pre-PR user themes).
+    {
+        ThemeScope* s = scopeOrCreate(QStringLiteral("applet/tx"));
+        s->tokens.insert("color.slider.foreground", QString("#ff4d4d"));
+        s->tokens.insert("color.knob.foreground",   QString("#ff4d4d"));
+    }
+    {
+        ThemeScope* s = scopeOrCreate(QStringLiteral("applet/rx"));
+        s->tokens.insert("color.slider.foreground", QString("#4dd87a"));
+        s->tokens.insert("color.knob.foreground",   QString("#4dd87a"));
+    }
+    {
+        ThemeScope* s = scopeOrCreate(QStringLiteral("applet/comp"));
+        s->tokens.insert("color.slider.foreground", QString("#ffb84d"));
+        s->tokens.insert("color.knob.foreground",   QString("#ffb84d"));
+    }
 }
 
 void ThemeManager::scanAvailableThemes()
@@ -548,10 +598,17 @@ bool ThemeManager::loadThemeFromPath(const QString& path)
     // Reset the scope tree before loading the new theme.  Compiled-in
     // defaults stay as the fallback layer so older theme files with
     // fewer tokens still produce a fully-rendered UI on a newer build.
+    //
+    // Ordering matters: clear() empties any child scopes from the
+    // previous theme load (including the per-applet scope seeds), then
+    // seedBuiltinDefaults() re-seeds them via scopeOrCreate().  If the
+    // active theme's JSON contains its own nested scopes, readScopeFromJson
+    // below overwrites the seeded values where they overlap — the seeds
+    // are the floor, the JSON wins where defined.
     m_rootScope->children.clear();
     m_primitives.clear();
     rebuildScopePathIndex();
-    seedBuiltinDefaults();  // resets m_tokens (= root scope tokens) to defaults
+    seedBuiltinDefaults();  // resets m_tokens (= root scope tokens) + re-seeds applet/* scope tree
 
     if (schemaVersion >= 2) {
         // v2 — primitives + nested scopes.  Canonical shape is
@@ -1516,16 +1573,49 @@ void ThemeManager::applyStyleSheet(QWidget* widget, const QString& stylesheetTem
     widget->setStyleSheet(resolveFor(widget, stylesheetTemplate));
 
     // First-time registration: connect to destroyed() so the entry
-    // disappears when the widget does.  Subsequent calls on the same
-    // widget just overwrite the recorded template / token list.
+    // disappears when the widget does, AND install ourselves as an
+    // event filter so a later QEvent::ParentChange re-resolves the
+    // template against the widget's now-correct scope chain.
+    // (Widgets configured pre-reparent — common for helpers like
+    // applyPrimarySliderStyle — would otherwise be stuck with their
+    // resolved-at-no-parent root-scope QSS.)  Subsequent calls on
+    // the same widget just overwrite the recorded template / token
+    // list without re-installing.
     if (!m_trackedWidgets.contains(widget)) {
         connect(widget, &QObject::destroyed,
                 this, &ThemeManager::onTrackedWidgetDestroyed);
+        // Event filter cost: installEventFilter routes every event
+        // delivered to `widget` through ThemeManager::eventFilter().
+        // The handler early-outs on a single int compare for everything
+        // that isn't QEvent::ParentChange, so per-event overhead is
+        // negligible — but with N tracked widgets the cumulative
+        // wakeups during high-frequency interaction (drag, paint
+        // storms) is N×events.  If profiling ever flags this, gate the
+        // install to "widgets that have no parent at apply time" since
+        // those are the only ones that NEED the post-reparent fix.
+        widget->installEventFilter(this);
     }
     TrackedWidget ctx;
     ctx.stylesheetTemplate = stylesheetTemplate;
     ctx.tokens = extractReferencedTokens(stylesheetTemplate);
     m_trackedWidgets.insert(widget, ctx);
+}
+
+bool ThemeManager::eventFilter(QObject* watched, QEvent* event)
+{
+    if (event->type() == QEvent::ParentChange) {
+        QWidget* w = qobject_cast<QWidget*>(watched);
+        if (w) {
+            const auto it = m_trackedWidgets.constFind(w);
+            if (it != m_trackedWidgets.constEnd()
+                && !it.value().stylesheetTemplate.isEmpty()) {
+                // Re-resolve against the new scope chain.  Cheap: only
+                // fires on rare reparent events, not in any hot path.
+                w->setStyleSheet(resolveFor(w, it.value().stylesheetTemplate));
+            }
+        }
+    }
+    return QObject::eventFilter(watched, event);
 }
 
 void ThemeManager::clearWidgetTracking(QWidget* widget)
