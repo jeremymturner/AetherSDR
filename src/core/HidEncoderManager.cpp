@@ -96,6 +96,9 @@ void HidEncoderManager::close()
     m_pollTimer->stop();
     m_hotplugTimer->stop();
     if (m_device) {
+        // Extinguish RC-28 LEDs on clean close. hid_write may return EIO if
+        // the device was surprise-disconnected; that is safe to ignore here.
+        setRC28Leds(RC28_LEDS_OFF);
         hid_close(m_device);
         m_device = nullptr;
     }
@@ -264,6 +267,20 @@ void HidEncoderManager::setTouchscreenImage(const QByteArray& jpegData,
         offset     += chunkLen;
         pageNumber++;
     }
+}
+
+void HidEncoderManager::setRC28Leds(uint8_t ledByte)
+{
+    if (!m_device || !isRC28Compatible()) return;
+    // Output report: [0x00=reportID, 0x01=cmd, ledByte, zeros...], 33 bytes total.
+    // Format verified against FlexRC-28 Node.js driver (_sendLED) and
+    // wfview src/usbcontroller.cpp (RC28 featureLEDControl path).
+    // Active-low: bit0=TX, bit1=F1, bit2=F2, bit3=LINK; 0x0F = all off.
+    uint8_t report[33] = {};
+    report[0] = 0x00;
+    report[1] = 0x01;
+    report[2] = ledByte;
+    hid_write(m_device, report, sizeof(report));
 }
 
 void HidEncoderManager::loadSettings()
