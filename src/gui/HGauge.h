@@ -87,6 +87,12 @@ public:
         update();
     }
 
+    void clearPeak() {
+        if (!m_peakEnabled) return;
+        m_peakEnabled = false;
+        update();
+    }
+
     void setReversed(bool rev) {
         if (m_reversed == rev) return;
         m_reversed = rev;
@@ -107,6 +113,10 @@ public:
     // the right edge.  Used for the ALC gauge so the bar tracks the scale
     // in the natural direction.
     void setFillFromRight(bool on) { m_fillFromRight = on; update(); }
+
+    void setBallistics(const MeterSmoother::Ballistics& b) {
+        m_smooth.setBallistics(b);
+    }
 
     void setRange(float min, float max, float redStart,
                   const QVector<Tick>& ticks, float yellowStart = std::numeric_limits<float>::quiet_NaN()) {
