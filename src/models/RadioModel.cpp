@@ -9,6 +9,7 @@
 #include "core/StreamStatus.h"
 #include "core/UdpRegistrationPolicy.h"
 #include "RadioStatusOwnership.h"
+#include "SliceRecreatePolicy.h"
 #include <QCoreApplication>
 #include <QDebug>
 #include <QJsonArray>
@@ -2194,18 +2195,9 @@ void RadioModel::registerAsGuiClient(const QString& clientId)
                         qCDebug(lcProtocol) << "RadioModel: slice list ->" << (ids.isEmpty() ? "(empty)" : body);
 
                         if (ids.isEmpty()) {
-                            // Radio has no slices at all — create one
-                            qCDebug(lcProtocol) << "RadioModel: no slices on radio, creating default";
-                            auto& settings = AppSettings::instance();
-                            double lastFreq = settings.value("LastFrequency", "0").toDouble();
-                            QString lastMode = settings.value("LastMode", "").toString();
-                            if (lastFreq > 0.0) {
-                                createDefaultSlice(
-                                    QString::number(lastFreq, 'f', 6),
-                                    lastMode.isEmpty() ? "USB" : lastMode);
-                            } else {
-                                createDefaultSlice();
-                            }
+                            // Radio reports no slices. Reuse an already-restored pan if we
+                            // have one; only create a fresh panafall otherwise (#3212).
+                            ensureDefaultSlicePreferringRestoredPan();
                         } else if (m_slices.isEmpty()) {
                             // Radio has slices but we haven't matched any to our
                             // client_handle yet (status messages still in flight).
@@ -2216,16 +2208,7 @@ void RadioModel::registerAsGuiClient(const QString& clientId)
                             QTimer::singleShot(500, this, [this]() {
                                 if (m_slices.isEmpty() && isConnected()) {
                                     qCDebug(lcProtocol) << "RadioModel: deferred check — still no owned slices, creating default";
-                                    auto& settings = AppSettings::instance();
-                                    double lastFreq = settings.value("LastFrequency", "0").toDouble();
-                                    QString lastMode = settings.value("LastMode", "").toString();
-                                    if (lastFreq > 0.0) {
-                                        createDefaultSlice(
-                                            QString::number(lastFreq, 'f', 6),
-                                            lastMode.isEmpty() ? "USB" : lastMode);
-                                    } else {
-                                        createDefaultSlice();
-                                    }
+                                    ensureDefaultSlicePreferringRestoredPan();
                                 } else if (!m_slices.isEmpty()) {
                                     qCDebug(lcProtocol) << "RadioModel: deferred check — adopted"
                                              << m_slices.size() << "existing slice(s)";
@@ -4945,6 +4928,38 @@ void RadioModel::configureWaterfall()
             qCDebug(lcProtocol) << "RadioModel: waterfall configured (auto_black=0 black_level=15 color_gain=50)";
         }
     });
+}
+
+void RadioModel::ensureDefaultSlicePreferringRestoredPan()
+{
+    auto& settings = AppSettings::instance();
+
+    SliceRecreatePolicy::Inputs in;
+    in.lastFreqMhz = settings.value("LastFrequency", "0").toDouble();
+    in.lastMode = settings.value("LastMode", "").toString();
+
+    // If m_activePanId names a pan we already hold, the radio restored it for us
+    // (claimed well before the "slice list" query resolved — see #3212). Feed its
+    // center to the policy so the recreated slice lands inside the visible span.
+    PanadapterModel* restored = (!m_activePanId.isEmpty())
+        ? m_panadapters.value(m_activePanId, nullptr)
+        : nullptr;
+    if (restored) {
+        in.hasRestoredPan = true;
+        in.restoredPanCenterMhz = restored->centerMhz();
+    }
+
+    const SliceRecreatePolicy::Decision d = SliceRecreatePolicy::decide(in);
+    const QString freqStr = QString::number(d.freqMhz, 'f', 6);
+
+    if (d.action == SliceRecreatePolicy::Action::ReuseRestoredPan) {
+        qCDebug(lcProtocol) << "RadioModel: no slices but pan" << m_activePanId
+                 << "already restored — creating slice on it at" << freqStr << d.mode;
+        createDefaultSliceOnPan(m_activePanId, freqStr, d.mode, d.antenna);
+    } else {
+        qCDebug(lcProtocol) << "RadioModel: no slices and no restored pan — creating default panafall + slice";
+        createDefaultSlice(freqStr, d.mode, d.antenna);
+    }
 }
 
 // Standalone mode: create panadapter + slice.
