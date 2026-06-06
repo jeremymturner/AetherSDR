@@ -3137,7 +3137,7 @@ void SpectrumWidget::updateSpectrum(const QVector<float>& binsDbm)
         }
     }
 
-    update();
+    leanCappedUpdate();
 }
 
 void SpectrumWidget::updateWaterfallRow(const QVector<float>& binsIntensity,
@@ -3317,7 +3317,7 @@ void SpectrumWidget::updateWaterfallRow(const QVector<float>& binsIntensity,
     if (PerfTelemetry::instance().enabled())
         PerfTelemetry::instance().recordWaterfallNativeRows(rowsToPush);
 
-    update();
+    leanCappedUpdate();
 }
 
 // ─── Layout helpers ────────────────────────────────────────────────────────────
@@ -4605,6 +4605,27 @@ void SpectrumWidget::leaveEvent(QEvent* event)
     updateTrackedCursorState(QPoint(-1, -1), false);
 }
 
+void SpectrumWidget::setLeanMode(bool on)
+{
+    if (m_leanMode == on)
+        return;
+    m_leanMode = on;
+    m_leanRepaintClock.invalidate();
+    markOverlayDirty();  // re-render with/without wallpaper + fill
+}
+
+void SpectrumWidget::leanCappedUpdate()
+{
+    if (m_leanMode) {
+        if (m_leanRepaintClock.isValid()
+            && m_leanRepaintClock.elapsed() < kLeanFrameMs) {
+            return;  // drop frames above ~30 Hz (kLeanFrameMs = 33)
+        }
+        m_leanRepaintClock.restart();
+    }
+    update();
+}
+
 void SpectrumWidget::setBackgroundImage(const QString& path)
 {
     m_bgImagePath = path;
@@ -5460,7 +5481,7 @@ void SpectrumWidget::renderGpuFrame(QRhiCommandBuffer* cb)
             QPainter bp(&m_overlayBg);
             bp.setRenderHint(QPainter::Antialiasing, false);
             bp.fillRect(specRect, m_bgFillColor);
-            if (!m_bgImage.isNull()) {
+            if (!m_leanMode && !m_bgImage.isNull()) {
                 if (m_bgScaledSize != specRect.size()) {
                     QImage expanded = m_bgImage.scaled(specRect.size(),
                         Qt::KeepAspectRatioByExpanding, Qt::SmoothTransformation);
@@ -5698,7 +5719,7 @@ void SpectrumWidget::renderGpuFrame(QRhiCommandBuffer* cb)
             const float fr = m_fftFillColor.redF();
             const float fg = m_fftFillColor.greenF();
             const float fb = m_fftFillColor.blueF();
-            const float fa = m_fftFillAlpha;
+            const float fa = m_leanMode ? 0.0f : m_fftFillAlpha;
 
             // Solid fill: slider sweeps from translucent gradient to solid.
             // At low slider: soft glow under curve (bright top, dark faint base)
@@ -6094,7 +6115,7 @@ void SpectrumWidget::paintEvent(QPaintEvent* ev)
         //           bleeds through as the slider moves toward 100
         //   above:  grid → FFT trace → band plan → markers
         p.fillRect(specRect, m_bgFillColor);
-        if (!m_bgImage.isNull()) {
+        if (!m_leanMode && !m_bgImage.isNull()) {
             if (m_bgScaledSize != specRect.size()) {
                 QImage expanded = m_bgImage.scaled(specRect.size(),
                     Qt::KeepAspectRatioByExpanding, Qt::SmoothTransformation);
@@ -6511,8 +6532,9 @@ void SpectrumWidget::drawSpectrum(QPainter& p, const QRect& r)
 
             float avgT = (pts[i].t + pts[i+1].t) * 0.5f;
             QColor top = heatColor(avgT);
-            top.setAlphaF(m_fftFillAlpha * 0.3f);
-            QColor bot(0, 0, 77, static_cast<int>(255 * m_fftFillAlpha));
+            const float swFillAlpha = m_leanMode ? 0.0f : m_fftFillAlpha;
+            top.setAlphaF(swFillAlpha * 0.3f);
+            QColor bot(0, 0, 77, static_cast<int>(255 * swFillAlpha));
             QLinearGradient grad(0, qMin(pts[i].y, pts[i+1].y), 0, bottom);
             grad.setColorAt(0.0, top);
             grad.setColorAt(1.0, bot);
