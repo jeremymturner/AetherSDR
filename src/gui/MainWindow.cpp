@@ -188,6 +188,8 @@
 #include <QJsonObject>
 #include <QJsonArray>
 #include "core/VersionNumber.h"
+#include "core/UpdateChecker.h"
+#include <QDesktopServices>
 #include <QPointer>
 #include <QTextEdit>
 #include <QPlainTextEdit>
@@ -1654,6 +1656,36 @@ MainWindow::MainWindow(QWidget* parent)
     // Band plan manager — must be created before buildMenuBar() which references it
     m_bandPlanMgr = new BandPlanManager(this);
     m_bandPlanMgr->loadPlans();
+
+    // UpdateChecker — must be created before buildMenuBar() which references it
+    m_updateChecker = new UpdateChecker(this);
+    connect(m_updateChecker, &UpdateChecker::updateAvailable, this, [this](const QString& ver) {
+        const QString current = QCoreApplication::applicationVersion();
+        QMessageBox box(this);
+        box.setWindowTitle("AetherSDR Update Available");
+        box.setIcon(QMessageBox::Information);
+        box.setText(QString("AetherSDR v%1 is available.").arg(ver));
+        box.setInformativeText(QString("You are running v%1.").arg(current));
+        QPushButton* viewBtn = box.addButton("View Latest Release", QMessageBox::ActionRole);
+        viewBtn->setAutoDefault(false);
+        QPushButton* closeBtn = box.addButton(QMessageBox::Close);
+        closeBtn->setAutoDefault(false);
+        // Force minimum width via layout spacer — setMinimumWidth() is ignored by QMessageBox
+        if (auto* grid = qobject_cast<QGridLayout*>(box.layout()))
+            grid->addItem(new QSpacerItem(480, 0, QSizePolicy::Minimum, QSizePolicy::Fixed),
+                          grid->rowCount(), 0, 1, grid->columnCount());
+        box.exec();
+        if (box.clickedButton() == viewBtn)
+            QDesktopServices::openUrl(QUrl(UpdateChecker::kReleasesPageUrl));
+    });
+    connect(m_updateChecker, &UpdateChecker::upToDate, this, [this](const QString& ver) {
+        QMessageBox::information(this, "Check for Updates",
+            QString("AetherSDR is up to date (v%1).").arg(ver));
+    });
+    connect(m_updateChecker, &UpdateChecker::checkFailed, this, [this]() {
+        QMessageBox::warning(this, "Check for Updates",
+            "Could not reach GitHub. Check your connection and try again.");
+    });
 
     buildMenuBar();
     buildUI();
@@ -9985,6 +10017,9 @@ void MainWindow::buildMenuBar()
                                            return renderer;
                                        });
         dlg.exec();
+    });
+    helpMenu->addAction("Check for Updates...", this, [this]() {
+        m_updateChecker->checkNow();
     });
     helpMenu->addSeparator();
     helpMenu->addAction("About AetherSDR", this, [this]{
