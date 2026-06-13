@@ -2213,6 +2213,7 @@ void MainWindow::wireMeters()
             this, [this](bool present) {
         m_tgxlContainer->setVisible(present);
         m_tgxlSeparator->setVisible(present);
+        updateStatusBarMinimumWidth();
         // Auto-connect/disconnect direct TGXL connection for manual relay control (#469)
         if (present) {
             QString ip = m_radioModel.tunerModel().tgxlIp();
@@ -2428,6 +2429,7 @@ void MainWindow::wireMeters()
         m_pgxlContainer->setVisible(present);
         m_pgxlSeparator->setVisible(present);
         m_appletPanel->setAmpVisible(present);
+        updateStatusBarMinimumWidth();
         if (present) {
             updatePgxlStyle();
             m_appletPanel->ampApplet()->setState(
