@@ -63,8 +63,8 @@ namespace AetherSDR {
 
 namespace {
 
-constexpr auto kPacketDecoderProfileSetting = "Ax25PacketDecoderProfile";
-constexpr auto kPacketDecoderDebugSetting = "Ax25PacketDecoderDiagnosticsDebug";
+constexpr auto kPacketDecoderProfileSetting  = "Ax25PacketDecoderProfile";
+constexpr auto kPacketDecoderDebugSetting    = "Ax25PacketDecoderDiagnosticsDebug";
 // TNC settings live as nested JSON under "AetherModemKissTnc" — see
 // TncSettings class in the header. Legacy flat-key migration in
 // TncSettings::migrateLegacy() is run from MainWindow at startup.
@@ -888,6 +888,10 @@ Ax25HfPacketDecodeDialog::Ax25HfPacketDecodeDialog(AudioEngine* audio,
             this, &Ax25HfPacketDecodeDialog::paceTransmitAudio);
     connect(m_shim, &AetherAx25LibmodemShim::frameDecoded,
             this, &Ax25HfPacketDecodeDialog::appendFrame);
+#ifdef HAVE_MQTT
+    connect(m_shim, &AetherAx25LibmodemShim::frameDecoded,
+            this, &Ax25HfPacketDecodeDialog::publishFrameMqtt);
+#endif
     // RX -> KISS clients: forward every decoded frame to connected hosts.
     connect(m_shim, &AetherAx25LibmodemShim::frameDecoded, this,
             [this](const Ax25DecodedFrame& frame) {
@@ -1130,7 +1134,6 @@ void Ax25HfPacketDecodeDialog::setAttachedSlice(SliceModel* slice)
 
 void Ax25HfPacketDecodeDialog::setModemProfile(Ax25ModemProfile profile, bool persist)
 {
-    // Tone polarity is always Normal for the supported HF DIGU / VHF FM paths.
     m_shimConfig = ax25DemodConfigForProfile(profile, Ax25TonePolarity::Normal);
     QMetaObject::invokeMethod(m_shim, [shim = m_shim, cfg = m_shimConfig]() {
         shim->configure(cfg);
@@ -1386,6 +1389,7 @@ void Ax25HfPacketDecodeDialog::handleMqttMessage(const QString& topic, const QBy
 }
 #endif
 
+
 void Ax25HfPacketDecodeDialog::beginTransmitWhenReady()
 {
     if (m_txPcm.isEmpty())
@@ -1632,9 +1636,6 @@ void Ax25HfPacketDecodeDialog::appendFrame(const Ax25DecodedFrame& frame)
     m_log->verticalScrollBar()->setValue(m_log->verticalScrollBar()->maximum());
     if (m_packetActivity)
         m_packetActivity->recordFrame();
-#ifdef HAVE_MQTT
-    publishFrameMqtt(frame);
-#endif
     refreshStatus();
 }
 
