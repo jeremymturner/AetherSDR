@@ -615,6 +615,26 @@ void section8(CatClient& c, Runner& r)
             respZz == QLatin1String("ZZSW0"), repr(respZz));
     r.check(QStringLiteral("8.6  FT; also reflects split off (FT0)"),
             respFt == QLatin1String("FT0"), repr(respFt));
+
+    // 8.7 REGRESSION: bare "ZZFT;" reads split state and must NOT toggle it.
+    // (Previously ZZFT unconditionally flipped split on every call.)
+    QString ft1 = c.query(QStringLiteral("ZZFT"));
+    QString ft2 = c.query(QStringLiteral("ZZFT"));
+    r.check(QStringLiteral("8.7  bare ZZFT; reads split (ZZFT0) and does not toggle on repeat"),
+            ft1 == QLatin1String("ZZFT0") && ft2 == QLatin1String("ZZFT0"),
+            QStringLiteral("first=%1 second=%2").arg(repr(ft1), repr(ft2)));
+
+    // 8.8 ZZFT1/ZZFT0 set split, consistent with ZZSW.
+    c.send(QStringLiteral("ZZFT1"));
+    QString ftOn = c.query(QStringLiteral("ZZFT"));
+    QString swOn = c.query(QStringLiteral("ZZSW"));
+    r.check(QStringLiteral("8.8  ZZFT1; enables split; ZZFT; → ZZFT1, ZZSW; → ZZSW1"),
+            ftOn == QLatin1String("ZZFT1") && swOn == QLatin1String("ZZSW1"),
+            QStringLiteral("ZZFT=%1 ZZSW=%2").arg(repr(ftOn), repr(swOn)));
+    c.send(QStringLiteral("ZZFT0"));  // restore split off
+    QString ftOff = c.query(QStringLiteral("ZZFT"));
+    r.check(QStringLiteral("8.9  ZZFT0; clears split; ZZFT; → ZZFT0"),
+            ftOff == QLatin1String("ZZFT0"), repr(ftOff));
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -647,7 +667,23 @@ void section10ptt(CatClient& c, Runner& r)
     r.check(QStringLiteral("10.0 ZZIF confirms TX=0 before keying"),
             fields.tx == QChar('0'), repr(QString(fields.tx)));
 
-    c.send(QStringLiteral("ZZTX"));
+    // 10.0r REGRESSION: a bare "ZZTX;" (no parameter) is a READ of the TX state,
+    // NOT a key command. Apps poll TX status this way; if the read keys the radio,
+    // every poll causes uncommanded transmit. It must return "ZZTX0" and NOT key.
+    resp = c.query(QStringLiteral("ZZTX"));
+    r.check(QStringLiteral("10.0r bare ZZTX; is a read → 'ZZTX0' (not a key)"),
+            resp == QLatin1String("ZZTX0"), repr(resp));
+    QThread::msleep(500);
+    {
+        QString chk = c.query(QStringLiteral("ZZIF"));
+        IfFields cf = parseIfBody(chk.startsWith(QLatin1String("ZZIF")) ? chk.mid(4) : QString());
+        r.check(QStringLiteral("10.0r2 bare ZZTX; did NOT key radio; ZZIF TX='0'"),
+                cf.tx == QChar('0'), repr(QString(cf.tx)));
+        if (cf.tx != QChar('0')) { c.send(QStringLiteral("ZZRX")); c.send(QStringLiteral("RX")); }
+    }
+
+    // Key with the explicit set form ZZTX1 (parameterised), then verify.
+    c.send(QStringLiteral("ZZTX1"));
     QThread::msleep(1000);
 
     resp = c.query(QStringLiteral("ZZIF"));
@@ -655,8 +691,10 @@ void section10ptt(CatClient& c, Runner& r)
     const bool txOn = (fields.tx == QChar('1'));
 
     if (!txOn) {
-        r.skip(QStringLiteral("10.1 ZZTX; keys radio; ZZIF TX='1'"),
+        r.skip(QStringLiteral("10.1 ZZTX1; keys radio; ZZIF TX='1'"),
                QStringLiteral("TX blocked — check interlock/inhibit line"));
+        r.skip(QStringLiteral("10.1r read while keyed → 'ZZTX1'"),
+               QStringLiteral("TX blocked"));
         r.skip(QStringLiteral("10.2 ZZRX; unkeys radio; ZZIF TX='0'"),
                QStringLiteral("TX blocked"));
         r.skip(QStringLiteral("10.3 base TX;/RX; also work; IF TX='0'"),
@@ -666,8 +704,14 @@ void section10ptt(CatClient& c, Runner& r)
         return;
     }
 
-    r.check(QStringLiteral("10.1 ZZTX; keys radio; ZZIF body TX field = '1'"),
+    r.check(QStringLiteral("10.1 ZZTX1; keys radio; ZZIF body TX field = '1'"),
             txOn, repr(QString(fields.tx)));
+
+    // 10.1r: while keyed, the bare read must report the keyed state ('ZZTX1')
+    // and must not toggle it.
+    resp = c.query(QStringLiteral("ZZTX"));
+    r.check(QStringLiteral("10.1r bare ZZTX; read reflects keyed state → 'ZZTX1'"),
+            resp == QLatin1String("ZZTX1"), repr(resp));
 
     c.send(QStringLiteral("ZZRX"));
     QThread::msleep(250);
@@ -710,7 +754,8 @@ void section10ptt(CatClient& c, Runner& r)
 void section10skip(Runner& r)
 {
     r.section(QStringLiteral("Section 10 — PTT  (skipped — pass --ptt to enable)"));
-    for (const char* name : { "10.0 baseline", "10.1 ZZTX; keys",
+    for (const char* name : { "10.0 baseline", "10.0r bare ZZTX read (no key)",
+                               "10.1 ZZTX1 keys", "10.1r read while keyed",
                                "10.2 ZZRX; unkeys", "10.3 base TX/RX" }) {
         r.skip(QString::fromLatin1(name), QStringLiteral("--ptt not set"));
     }
@@ -1027,22 +1072,32 @@ void section13(CatClient& c, Runner& r)
     c.send(origBi);
     QThread::msleep(200);
 
-    // ── ZZFR: toggle active VFO ───────────────────────────────────────────
+    // ── ZZFR: RX VFO select (0=A, 1=B) — bare form is a READ, not a swap ──────
     QString faBefore = c.query(QStringLiteral("ZZFA"));
     QString fbBefore = c.query(QStringLiteral("ZZFB"));
-    c.send(QStringLiteral("ZZFR"));
+    // 13.34r REGRESSION: bare "ZZFR;" reads the selector and must NOT swap VFOs.
+    QString zzfrRead = c.query(QStringLiteral("ZZFR"));
+    QThread::msleep(50);
+    QString faUnchanged = c.query(QStringLiteral("ZZFA"));
+    r.check(QStringLiteral("13.34r bare ZZFR; reads selector ('ZZFR0') without swapping"),
+            zzfrRead == QLatin1String("ZZFR0") && faUnchanged.mid(4) == faBefore.mid(4),
+            QStringLiteral("read=%1 ZZFA before=%2 after=%3")
+                .arg(repr(zzfrRead), repr(faBefore.mid(4)), repr(faUnchanged.mid(4))));
+    // 13.34 explicit select: ZZFR1 selects VFO B as RX → new ZZFA matches old ZZFB.
+    c.send(QStringLiteral("ZZFR1"));
     QThread::msleep(50);
     QString faAfter = c.query(QStringLiteral("ZZFA"));
-    // If VFO A and B differ, after ZZFR the new ZZFA should match old ZZFB.
+    QString zzfrAfter = c.query(QStringLiteral("ZZFR"));
+    // If VFO A and B differ, after ZZFR1 the new ZZFA should match old ZZFB.
     // If they're equal (single-slice session), the swap is a no-op — treat as pass.
     const bool zzfrOk = (faBefore.mid(4) == fbBefore.mid(4))
                         ? true
                         : (faAfter.mid(4) == fbBefore.mid(4));
-    r.check(QStringLiteral("13.34 ZZFR; swaps VFOs — new ZZFA matches old ZZFB freq"),
-            zzfrOk,
-            QStringLiteral("before: ZZFA=%1 ZZFB=%2 after ZZFA=%3")
-                .arg(repr(faBefore.mid(4)), repr(fbBefore.mid(4)), repr(faAfter.mid(4))));
-    c.send(QStringLiteral("ZZFR"));  // swap back
+    r.check(QStringLiteral("13.34 ZZFR1; selects VFO B — new ZZFA matches old ZZFB; ZZFR; → 'ZZFR1'"),
+            zzfrOk && zzfrAfter == QLatin1String("ZZFR1"),
+            QStringLiteral("before: ZZFA=%1 ZZFB=%2 after ZZFA=%3 sel=%4")
+                .arg(repr(faBefore.mid(4)), repr(fbBefore.mid(4)), repr(faAfter.mid(4)), repr(zzfrAfter)));
+    c.send(QStringLiteral("ZZFR0"));  // select VFO A again (swap back)
     QThread::msleep(50);
 
     // ── ZZAR: VFO A AGC threshold (0-100, 3-digit) ───────────────────────────
