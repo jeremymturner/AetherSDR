@@ -6985,6 +6985,14 @@ void SpectrumWidget::renderGpuFrame(QRhiCommandBuffer* cb)
                 bp.setOpacity(1.0 - m_bgOpacity / 100.0);
                 bp.drawImage(specRect.topLeft(), m_bgScaled);
             }
+            // #3606: the grid lives in the background layer so it composites
+            // BELOW the FFT trace (GPU/software parity) -- the rectangular grid
+            // cells must sit behind the signal peaks, not paint over them.
+            // Reset opacity first: the bg-image branch above leaves bp at
+            // (1 - m_bgOpacity/100), and drawGrid sets its own pen but not
+            // opacity, so the grid must not inherit the image opacity (review @NF0T).
+            bp.setOpacity(1.0);
+            drawGrid(bp, specRect);
             m_overlayBgNeedsUpload = true;
         }
 
@@ -6994,7 +7002,9 @@ void SpectrumWidget::renderGpuFrame(QRhiCommandBuffer* cb)
             QPainter p(&m_overlayStatic);
             p.setRenderHint(QPainter::Antialiasing, false);
 
-            drawGrid(p, specRect);
+            // #3606: grid moved to the background layer (composites below the
+            // FFT trace). The static overlay composites ABOVE the trace, so only
+            // markers/scales/band-plan that belong on top of the peaks stay here.
             if (m_bandPlanFontSize > 0)
                 drawBandPlan(p, specRect);
 
