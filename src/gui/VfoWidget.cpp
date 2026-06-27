@@ -2285,17 +2285,9 @@ void VfoWidget::buildTabContent()
             modeRow->addWidget(btn, 1);
         }
 
-        // WFM software demodulator toggle (DAX IQ → Hi-Fi Cable)
-        m_wfmBtn = new QPushButton("WFM");
-        m_wfmBtn->setCheckable(true);
-        m_wfmBtn->setFixedHeight(26);
-        m_wfmBtn->setVisible(false);
-        m_wfmBtn->setToolTip("Software FM demodulator: DAX IQ → Hi-Fi Cable Input");
-        m_wfmBtn->setStyleSheet(kModeBtn);
-        connect(m_wfmBtn, &QPushButton::toggled, this, [this](bool on) {
-            emit wfmActivated(on, m_slice ? m_slice->sliceId() : -1);
-        });
-        modeRow->addWidget(m_wfmBtn, 1);
+        // WFM software-demod toggle lives in the spectrum overlay DAX menu
+        // (mode-independent, beside the IQ-channel selector it consumes); it is
+        // no longer on the flag. (#3853)
 
         vb->addLayout(modeRow);
 
@@ -2947,13 +2939,6 @@ void VfoWidget::setAfGain(int pct)
         m_afGainSlider->setValue(pct);
         m_updatingFromModel = false;
     }
-}
-
-void VfoWidget::setWfmActive(bool on, int sliceId)
-{
-    if (!m_wfmBtn || !m_slice || m_slice->sliceId() != sliceId) return;
-    QSignalBlocker sb(m_wfmBtn);
-    m_wfmBtn->setChecked(on);
 }
 
 void VfoWidget::updatePosition(int vfoX, int specTop, FlagDir dir)
@@ -3943,12 +3928,6 @@ void VfoWidget::setSlice(SliceModel* slice)
         bool isFdv  = mode.startsWith("FDV");  // FDVU, FDVM, etc.
         // Swap DSP tab label to OPT for FM modes
         m_tabBtns[1]->setText(isFm ? "OPT" : "DSP");
-        if (!isFm && m_wfmBtn->isChecked()) {
-            QSignalBlocker sb(m_wfmBtn);
-            m_wfmBtn->setChecked(false);
-            emit wfmActivated(false, m_slice ? m_slice->sliceId() : -1);
-        }
-        m_wfmBtn->setVisible(isFm);
         m_rttyContainer->setVisible(isRtty);
         m_apfContainer->setVisible(isCw);
         m_digContainer->setVisible(isDig && !isFdv && mode != "NT");
@@ -4522,12 +4501,6 @@ void VfoWidget::syncFromSlice()
     bool isDig = (m_slice->mode() == "DIGL" || m_slice->mode() == "DIGU" || m_slice->mode() == "NT");
     bool isFm = (m_slice->mode() == "FM" || m_slice->mode() == "NFM");
     m_tabBtns[1]->setText(isFm ? "OPT" : "DSP");
-    if (!isFm && m_wfmBtn->isChecked()) {
-        QSignalBlocker sb(m_wfmBtn);
-        m_wfmBtn->setChecked(false);
-        emit wfmActivated(false, m_slice->sliceId());
-    }
-    m_wfmBtn->setVisible(isFm);
     m_apfBtn->setVisible(isCw);
     m_anfBtn->setVisible(!isRtty && !isCw && !isDig && !isFm);
     m_anflBtn->setVisible(!isRtty && !isCw && !isDig && !isFm);
@@ -4831,6 +4804,17 @@ void VfoWidget::updateModeTab()
         m_filterCustomHi.fill(INT_MIN, m_filterWidths.size());
     }
     rebuildFilterButtons();
+
+    // The filter-preset grid's row count changes with mode (FM has no preset
+    // grid; voice modes have 2+ rows). Rebuilding it here changes the mode-tab
+    // page height, but the synchronous relayout on the same turn can read a
+    // stale page sizeHint before the new grid geometry settles — leaving the
+    // panel too short when growing back (FM -> LSB/USB), so the filter rows
+    // overflow the flag. Defer a relayout to the next event-loop turn, once the
+    // rebuilt grid is fully laid out, so the panel resizes to fit. (#3853)
+    if (m_tabStack && m_tabStack->isVisible()) {
+        QTimer::singleShot(0, this, [this] { relayoutToCurrentContent(); });
+    }
 }
 
 void VfoWidget::updateQuickModeButtons()
