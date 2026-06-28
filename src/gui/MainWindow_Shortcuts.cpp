@@ -163,6 +163,50 @@ bool MainWindow::handleCwMomentaryShortcut(QKeyEvent* keyEvent, QEvent::Type eve
 }
 
 
+bool MainWindow::handlePttHoldShortcut(QKeyEvent* keyEvent, QEvent::Type eventType)
+{
+    // PTT (Hold) can't go through a QShortcut (no key-released signal), so it
+    // is driven here from the app-level event filter. Resolve the bound key
+    // through ShortcutManager — exactly like handleCwMomentaryShortcut — so a
+    // reassigned PTT-hold key actually keys the radio instead of staying stuck
+    // on the old Space default (#3879).
+    if (!keyEvent || keyEvent->isAutoRepeat())
+        return false;
+    if (eventType != QEvent::KeyPress && eventType != QEvent::KeyRelease)
+        return false;
+
+    const QKeySequence seq = shortcutSequenceFromKeyEvent(keyEvent);
+    const auto* action = m_shortcutManager.actionForKey(seq);
+    if (!action || action->id != QLatin1String(kPttHoldActionId))
+        return false;
+
+    // Mirror the prior Space behavior: only key while connected and not typing
+    // into a text field. When those gates fail, do not consume the key — let it
+    // fall through (matching the old `&& m_radioModel.isConnected()` guard).
+    if (textInputCaptured() || !m_radioModel.isConnected())
+        return false;
+
+    if (m_keyboardShortcutsEnabled) {
+        // Route through the PTT coordinator (not the raw setTransmit() path) so
+        // the Quindar intro/outro runs for keyboard PTT just like the GUI MOX
+        // button. requestPttOn/Off still terminate in an `xmit` command, so the
+        // interlock/gating in RadioModel's xmit handler is preserved; the
+        // coordinator's preflight applies the same local interlock check.
+        // (#3610)
+        if (eventType == QEvent::KeyPress && !m_pttHoldActive) {
+            m_pttHoldActive = true;
+            m_radioModel.transmitModel().requestPttOn(
+                TransmitModel::PttSource::Mox);
+        } else if (eventType == QEvent::KeyRelease && m_pttHoldActive) {
+            m_pttHoldActive = false;
+            m_radioModel.transmitModel().requestPttOff(
+                TransmitModel::PttSource::Mox);
+        }
+    }
+    return true;  // consume the bound key so it can't also activate a button
+}
+
+
 void MainWindow::beginSliderShortcutLease(QWidget* slider)
 {
     if (!slider) return;
@@ -284,29 +328,11 @@ bool MainWindow::eventFilter(QObject* obj, QEvent* event)
         if (handleCwMomentaryShortcut(ke, event->type()))
             return true;
 
-        if (ke->key() == Qt::Key_Space && !ke->isAutoRepeat()
-            && !textInputCaptured()
-            && m_radioModel.isConnected()) {
-            if (m_keyboardShortcutsEnabled) {
-                // Route through the PTT coordinator (not the raw
-                // setTransmit() path) so the Quindar intro/outro runs for
-                // space-bar PTT just like it does for the GUI MOX button.
-                // requestPttOn/Off still terminate in an `xmit` command, so
-                // the interlock/gating in RadioModel's xmit handler is
-                // preserved; the coordinator's preflight applies the same
-                // local interlock check. (#3610)
-                if (event->type() == QEvent::KeyPress && !m_spacePttActive) {
-                    m_spacePttActive = true;
-                    m_radioModel.transmitModel().requestPttOn(
-                        TransmitModel::PttSource::Mox);
-                } else if (event->type() == QEvent::KeyRelease && m_spacePttActive) {
-                    m_spacePttActive = false;
-                    m_radioModel.transmitModel().requestPttOff(
-                        TransmitModel::PttSource::Mox);
-                }
-            }
-            return true;  // always consume Space to prevent button activation
-        }
+        // PTT (Hold) — resolves its (rebindable) key through ShortcutManager
+        // rather than a hardcoded Space, so reassigning it actually moves the
+        // transmit key (#3879).
+        if (handlePttHoldShortcut(ke, event->type()))
+            return true;
 
         // MeterSlider (TCI/DAX gain) handles its own arrow stepping, badge,
         // and Enter-to-release inside keyPressEvent; the lease only frees the
@@ -685,10 +711,11 @@ void MainWindow::registerShortcutActions()
             else
                 tx.requestPttOn(TransmitModel::PttSource::Mox);
         });
-    // PTT (Hold) via Space is handled by the app-level event filter
-    // because QShortcut has no "released" signal. Register with null
-    // handler so the keyboard map shows it as bound.
-    m_shortcutManager.registerAction("ptt_hold", "PTT (Hold)", "TX",
+    // PTT (Hold) is handled by the app-level event filter (handlePttHoldShortcut)
+    // because QShortcut has no "released" signal. Register with a null handler so
+    // the keyboard map shows it as bound; the event filter looks the binding up
+    // by kPttHoldActionId so a reassigned key takes effect (#3879).
+    m_shortcutManager.registerAction(kPttHoldActionId, "PTT (Hold)", "TX",
         QKeySequence(Qt::Key_Space), nullptr);
     m_shortcutManager.registerAction("atu_start", "ATU Start", "TX",
         QKeySequence(), [this]() {

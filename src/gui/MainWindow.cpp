@@ -3150,7 +3150,7 @@ void MainWindow::cancelTransmitFromIndicator()
         return;
     }
 
-    m_spacePttActive = false;
+    m_pttHoldActive = false;
     m_cwStraightKeyActive = false;
     m_cwLeftPaddleActive = false;
     m_cwRightPaddleActive = false;

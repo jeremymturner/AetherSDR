@@ -625,6 +625,10 @@ private:
     void pushCwPaddleState(const QString& source = {},
                            quint64 traceId = 0, quint64 sourceMs = 0);
     bool handleCwMomentaryShortcut(QKeyEvent* keyEvent, QEvent::Type eventType);
+    // PTT (Hold) shortcut: resolve the bound key via ShortcutManager (not a
+    // hardcoded Qt::Key_Space) so a reassigned PTT-hold key actually keys the
+    // radio. Returns true when the bound key was consumed (#3879).
+    bool handlePttHoldShortcut(QKeyEvent* keyEvent, QEvent::Type eventType);
 
     // Core objects
     RadioDiscovery    m_discovery;
@@ -1126,7 +1130,7 @@ private:
     std::atomic<quint64> m_lastCwPaddleSourceMs{0};
     qint64 m_bsConnectGraceUntilMs{0};   // suppress auto-save right after connect
     bool m_keyboardShortcutsEnabled{false}; // global enable for keyboard shortcuts (View menu)
-    bool m_spacePttActive{false};          // true while Space is held for PTT
+    bool m_pttHoldActive{false};           // true while the PTT-hold key is held (#3879)
     bool m_cwStraightKeyActive{false};
     bool m_cwLeftPaddleActive{false};
     bool m_cwRightPaddleActive{false};
