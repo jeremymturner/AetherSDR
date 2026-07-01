@@ -124,6 +124,7 @@ protected:
         if (ev->button() == Qt::LeftButton) {
             setSliderDown(true);
             setValue(valueFromPosition(ev->position().x()));
+            showDragValuePopup(ev->globalPosition().toPoint());
             ev->accept();
             return;
         }
@@ -138,6 +139,7 @@ protected:
         }
         if (isSliderDown() && ev->buttons().testFlag(Qt::LeftButton)) {
             setValue(valueFromPosition(ev->position().x()));
+            showDragValuePopup(ev->globalPosition().toPoint());
             ev->accept();
             return;
         }
@@ -149,6 +151,9 @@ protected:
         if (isSliderDown() && ev->button() == Qt::LeftButton) {
             setValue(valueFromPosition(ev->position().x()));
             setSliderDown(false);
+            showDragValuePopup(ev->globalPosition().toPoint());
+            if (m_dragValuePopup)
+                m_dragValuePopup->linger();
             ev->accept();
             return;
         }
@@ -1281,7 +1286,34 @@ void SpectrumOverlayMenu::buildDisplayPanel()
         ++row;
     };
 
+    // Helper: section header — small-caps label + thin divider, spans all 4
+    // columns. Splits the panel into Panadapter / Waterfall / Background /
+    // Appearance / 3D View / System groups so users can scan for the control
+    // they want instead of reading a flat 24-row list top to bottom.
+    bool firstHeader = true;
+    auto makeHeader = [&](const QString& text) {
+        if (!firstHeader) {
+            grid->setRowMinimumHeight(row, 8);  // breathing room above each new group
+            ++row;
+        }
+        firstHeader = false;
+
+        auto* hdr = new QLabel(text);
+        AetherSDR::ThemeManager::instance().applyStyleSheet(hdr,
+            "QLabel { color: {{color.accent}}; font-size: 9px; font-weight: bold; border: none; }");
+        grid->addWidget(hdr, row, 0, 1, 4);
+        ++row;
+
+        auto* line = new QFrame;
+        line->setFrameShape(QFrame::HLine);
+        AetherSDR::ThemeManager::instance().applyStyleSheet(line,
+            "QFrame { background: {{color.border.strong}}; max-height: 1px; border: none; }");
+        grid->addWidget(line, row, 0, 1, 4);
+        ++row;
+    };
+
     // ── Toggle button row ─────────────────────────────────────────────────
+    makeHeader("PANADAPTER");
     {
         auto* toggleRow = new QWidget;
         // The Display panel's QWidget { border: 1px solid } cascades to this
@@ -1310,6 +1342,9 @@ void SpectrumOverlayMenu::buildDisplayPanel()
         makeToggle("Heat Map", m_heatMapBtn);
         makeToggle("Grid", m_showGridBtn, true);
         makeToggle("Wt Avg", m_weightedAvgBtn);
+        m_heatMapBtn->setObjectName("displayHeatMapBtn");
+        m_showGridBtn->setObjectName("displayShowGridBtn");
+        m_weightedAvgBtn->setObjectName("displayWeightedAvgBtn");
 
         grid->addWidget(toggleRow, row, 0, 1, 4);
         ++row;
@@ -1329,6 +1364,7 @@ void SpectrumOverlayMenu::buildDisplayPanel()
 
     // AVG
     makeRow("FFT AVG:", 0, 100, 0, m_avgSlider, m_avgLabel);
+    m_avgSlider->setObjectName("displayFftAvgSlider");
     connect(m_avgSlider, &QSlider::valueChanged, this, [this](int v) {
         m_avgLabel->setText(QString::number(v));
         emit fftAverageChanged(v);
@@ -1336,6 +1372,7 @@ void SpectrumOverlayMenu::buildDisplayPanel()
 
     // FPS
     makeRow("FFT FPS:", 5, 30, 25, m_fpsSlider, m_fpsLabel);
+    m_fpsSlider->setObjectName("displayFftFpsSlider");
     connect(m_fpsSlider, &QSlider::valueChanged, this, [this](int v) {
         m_fpsLabel->setText(QString::number(v));
         emit fftFpsChanged(v);
@@ -1347,11 +1384,18 @@ void SpectrumOverlayMenu::buildDisplayPanel()
         lbl->setStyleSheet(labelStyle);
         grid->addWidget(lbl, row, 0);
 
-        m_lineWidthSlider = new QSlider(Qt::Horizontal);
-        m_lineWidthSlider->setRange(0, 10);
-        m_lineWidthSlider->setValue(4);
-        m_lineWidthSlider->setSingleStep(1);
-        m_lineWidthSlider->setPageStep(1);
+        auto* lineWidthSlider = new GuardedSlider(Qt::Horizontal);
+        lineWidthSlider->setRange(0, 10);
+        lineWidthSlider->setValue(4);
+        lineWidthSlider->setSingleStep(1);
+        lineWidthSlider->setPageStep(1);
+        lineWidthSlider->setObjectName("displayFftLineWidthSlider");
+        // Drag popup mirrors the adjacent value label's units (line width in
+        // px, not the raw 0-10 slider steps).
+        lineWidthSlider->setDragValueFormatter([](int v) {
+            return v == 0 ? QStringLiteral("Off") : QString::number(v * 0.5f, 'f', 1);
+        });
+        m_lineWidthSlider = lineWidthSlider;
         applyPrimarySliderStyle(m_lineWidthSlider);
         grid->addWidget(m_lineWidthSlider, row, 1, 1, 2);
 
@@ -1376,6 +1420,7 @@ void SpectrumOverlayMenu::buildDisplayPanel()
         grid->addWidget(lbl, row, 0);
 
         m_fillColorBtn = new QPushButton;
+        m_fillColorBtn->setObjectName("displayFftFillColorBtn");
         m_fillColorBtn->setFixedSize(18, 18);
         m_fillColorBtn->setStyleSheet(
             QString("QPushButton { background: %1; border: 1px solid #506070;"
@@ -1387,6 +1432,7 @@ void SpectrumOverlayMenu::buildDisplayPanel()
         m_fillSlider = new GuardedSlider(Qt::Horizontal);
         m_fillSlider->setRange(0, 100);
         m_fillSlider->setValue(70);
+        m_fillSlider->setObjectName("displayFftFillSlider");
         applyPrimarySliderStyle(m_fillSlider);
         grid->addWidget(m_fillSlider, row, 2);
 
@@ -1418,6 +1464,8 @@ void SpectrumOverlayMenu::buildDisplayPanel()
     // ── Noise Floor reference line ────────────────────────────────────────
     makeRowWithBtn("FFT Floor:", 1, 99, 75, m_floorSlider, m_floorLabel,
                    m_floorEnableBtn, "Auto");
+    m_floorSlider->setObjectName("displayNoiseFloorSlider");
+    m_floorEnableBtn->setObjectName("displayNoiseFloorEnableBtn");
     m_floorSlider->setEnabled(false);
     connect(m_floorEnableBtn, &QPushButton::toggled, this, [this](bool on) {
         m_floorSlider->setEnabled(on);
@@ -1428,9 +1476,13 @@ void SpectrumOverlayMenu::buildDisplayPanel()
         emit noiseFloorPositionChanged(v);
     });
 
+    makeHeader("WATERFALL");
+
     // NB Blank + Off/On
     makeRowWithBtn("NB Blank:", 5, 95, 15, m_wfBlankerThreshSlider, m_wfBlankerThreshLabel,
                    m_wfBlankerBtn, "Off");
+    m_wfBlankerThreshSlider->setObjectName("displayWfBlankerThreshSlider");
+    m_wfBlankerBtn->setObjectName("displayWfBlankerBtn");
     m_wfBlankerBtn->setToolTip("Suppress impulse noise stripes in waterfall");
     connect(m_wfBlankerBtn, &QPushButton::toggled, this, [this](bool on) {
         m_wfBlankerBtn->setText(on ? "On" : "Off");
@@ -1450,6 +1502,8 @@ void SpectrumOverlayMenu::buildDisplayPanel()
     //              wfAutoBlackOffsetChanged.
     makeRowWithBtn("Black Level:", 0, 100, 50, m_blackSlider, m_blackLabel,
                    m_autoBlackBtn, "SW");
+    m_blackSlider->setObjectName("displayBlackLevelSlider");
+    m_autoBlackBtn->setObjectName("displayAutoBlackBtn");
     connect(m_blackSlider, &QSlider::valueChanged, this, [this](int v) {
         m_blackLabel->setText(m_kiwiWaterfallControlMode
             ? kiwiWaterfallDbText(v)
@@ -1496,6 +1550,7 @@ void SpectrumOverlayMenu::buildDisplayPanel()
 
     // Gain
     makeRow("WtrFall Gain:", 0, 100, 50, m_gainSlider, m_gainLabel);
+    m_gainSlider->setObjectName("displayWfGainSlider");
     connect(m_gainSlider, &QSlider::valueChanged, this, [this](int v) {
         m_gainLabel->setText(m_kiwiWaterfallControlMode
             ? kiwiWaterfallDbText(v)
@@ -1516,6 +1571,7 @@ void SpectrumOverlayMenu::buildDisplayPanel()
         m_rateSlider = new WaterfallRateSlider;
         m_rateSlider->setRange(WF_RATE_SLIDER_MIN, WF_RATE_SLIDER_MAX);
         m_rateSlider->setValue(lineDurationToRateSliderValue(100));
+        m_rateSlider->setObjectName("displayWfRateSlider");
         applyPrimarySliderStyle(m_rateSlider);
         grid->addWidget(m_rateSlider, row, 1, 1, 2);
 
@@ -1540,6 +1596,52 @@ void SpectrumOverlayMenu::buildDisplayPanel()
         emit wfLineDurationChanged(lineDurationMs);
     });
 
+    makeHeader("BACKGROUND");
+
+    // ── Background row: Choose / Clear / Off, opacity + colour swatch below ─
+    // Layout:  "Background:"   [Choose...]  [Clear]  [Off]
+    //          "BG Opacity:"   [slider]
+    //          "Color:"        [color swatch]
+    // The colour swatch picks the solid fill that paints BENEATH the
+    // background image — fade the BG Opacity slider to see this colour
+    // bleed through.  Z-order in the spectrum area, bottom to top:
+    //     [fill colour]  →  [bg image w/ opacity]  →  [FFT trace]
+    {
+        auto* lbl = new QLabel("Background:");
+        lbl->setStyleSheet(labelStyle);
+        grid->addWidget(lbl, row, 0);
+
+        auto* bgBtn = new QPushButton("Choose...");
+        bgBtn->setObjectName("displayBgChooseBtn");
+        bgBtn->setFixedHeight(18);
+        bgBtn->setStyleSheet(btnStyle);
+        connect(bgBtn, &QPushButton::clicked, this, [this] {
+            emit backgroundImageRequested();
+        });
+        grid->addWidget(bgBtn, row, 1);
+
+        auto* clearBtn = new QPushButton("Clear");
+        clearBtn->setObjectName("displayBgClearBtn");
+        clearBtn->setFixedHeight(18);
+        clearBtn->setStyleSheet(btnStyle);
+        clearBtn->setToolTip("Revert to the default logo background.");
+        connect(clearBtn, &QPushButton::clicked, this, [this] {
+            emit backgroundImageCleared();
+        });
+        grid->addWidget(clearBtn, row, 2);
+
+        auto* offBtn = new QPushButton("Off");
+        offBtn->setObjectName("displayBgOffBtn");
+        offBtn->setFixedHeight(18);
+        offBtn->setStyleSheet(btnStyle);
+        offBtn->setToolTip("Turn the background off entirely (no image, just the fill colour).");
+        connect(offBtn, &QPushButton::clicked, this, [this] {
+            emit backgroundImageDisabled();
+        });
+        grid->addWidget(offBtn, row, 3);
+        ++row;
+    }
+
     // BG Opacity
     {
         auto* lbl = new QLabel("BG Opacity:");
@@ -1548,6 +1650,7 @@ void SpectrumOverlayMenu::buildDisplayPanel()
         m_bgOpacitySlider = new GuardedSlider(Qt::Horizontal);
         m_bgOpacitySlider->setRange(0, 100);
         m_bgOpacitySlider->setValue(80);
+        m_bgOpacitySlider->setObjectName("displayBgOpacitySlider");
         applyPrimarySliderStyle(m_bgOpacitySlider);
         grid->addWidget(m_bgOpacitySlider, row, 1, 1, 2);
         m_bgOpacityLabel = new QLabel("80");
@@ -1562,19 +1665,15 @@ void SpectrumOverlayMenu::buildDisplayPanel()
         ++row;
     }
 
-    // ── Background row: colour swatch + Choose + Clear ────────────────────
-    // Layout:  "Background:"   [color]  [Choose...]  [Clear]
-    // The colour swatch picks the solid fill that paints BENEATH the
-    // background image — fade the BG Opacity slider to see this colour
-    // bleed through.  Z-order in the spectrum area, bottom to top:
-    //     [fill colour]  →  [bg image w/ opacity]  →  [FFT trace]
+    // ── Color row: fill-colour swatch on its own row below the buttons ──────
     {
-        auto* lbl = new QLabel("Background:");
+        auto* lbl = new QLabel("Color:");
         lbl->setStyleSheet(labelStyle);
         grid->addWidget(lbl, row, 0);
 
         m_bgFillColorBtn = new QPushButton;
-        m_bgFillColorBtn->setFixedHeight(18);
+        m_bgFillColorBtn->setObjectName("displayBgFillColorBtn");
+        m_bgFillColorBtn->setFixedSize(18, 18);
         m_bgFillColorBtn->setToolTip("Solid fill colour painted beneath the background image");
         // Initial styling — overridden by syncExtraDisplaySettings once the
         // SpectrumWidget reports its loaded m_bgFillColor.
@@ -1593,31 +1692,11 @@ void SpectrumOverlayMenu::buildDisplayPanel()
             if (chosen.isValid())
                 emit backgroundFillColorChanged(chosen);
         });
-        grid->addWidget(m_bgFillColorBtn, row, 1);
-
-        auto* bgBtn = new QPushButton("Choose...");
-        bgBtn->setFixedHeight(18);
-        bgBtn->setStyleSheet(btnStyle);
-        connect(bgBtn, &QPushButton::clicked, this, [this] {
-            emit backgroundImageRequested();
-        });
-        grid->addWidget(bgBtn, row, 2);
-
-        auto* clearBtn = new QPushButton("Clear");
-        clearBtn->setFixedHeight(18);
-        clearBtn->setStyleSheet(btnStyle);
-        clearBtn->setToolTip("Left-click: revert to the default logo background.\n"
-                             "Right-click: turn the background off entirely.");
-        connect(clearBtn, &QPushButton::clicked, this, [this] {
-            emit backgroundImageCleared();
-        });
-        // Right-click clears the background completely (no image, just the fill).
-        clearBtn->setContextMenuPolicy(Qt::CustomContextMenu);
-        connect(clearBtn, &QWidget::customContextMenuRequested, this,
-                [this](const QPoint&) { emit backgroundImageDisabled(); });
-        grid->addWidget(clearBtn, row, 3);
+        grid->addWidget(m_bgFillColorBtn, row, 1, Qt::AlignLeft);
         ++row;
     }
+
+    makeHeader("APPEARANCE");
 
     // ── Freq Grid Spacing dropdown (#1390) ──────────────────────────────
     {
@@ -1625,6 +1704,7 @@ void SpectrumOverlayMenu::buildDisplayPanel()
         lbl->setStyleSheet(labelStyle);
         grid->addWidget(lbl, row, 0);
         m_freqGridSpacingCmb = new QComboBox;
+        m_freqGridSpacingCmb->setObjectName("displayGridSpacingCombo");
         m_freqGridSpacingCmb->setFixedHeight(18);
         applyComboStyle(m_freqGridSpacingCmb);
         m_freqGridSpacingCmb->addItem("Auto", 0);
@@ -1644,6 +1724,7 @@ void SpectrumOverlayMenu::buildDisplayPanel()
         lbl->setStyleSheet(labelStyle);
         grid->addWidget(lbl, row, 0);
         m_freqScaleFontCmb = new QComboBox;
+        m_freqScaleFontCmb->setObjectName("displayScaleTextCombo");
         m_freqScaleFontCmb->setFixedHeight(18);
         applyComboStyle(m_freqScaleFontCmb);
         for (int pt : {8, 9, 10, 11, 12, 14})
@@ -1662,6 +1743,7 @@ void SpectrumOverlayMenu::buildDisplayPanel()
         lbl->setStyleSheet(labelStyle);
         grid->addWidget(lbl, row, 0);
         m_colorSchemeCmb = new QComboBox;
+        m_colorSchemeCmb->setObjectName("displayColorSchemeCombo");
         m_colorSchemeCmb->setFixedHeight(18);
         applyComboStyle(m_colorSchemeCmb);
         for (int i = 0; i < static_cast<int>(WfColorScheme::Count); ++i)
@@ -1671,6 +1753,8 @@ void SpectrumOverlayMenu::buildDisplayPanel()
                 this, [this](int idx) { emit wfColorSchemeChanged(idx); });
         ++row;
     }
+
+    makeHeader("3D VIEW");
 
     // ── Spectrum render mode (2D waterfall vs 3DSS) ───────────────────────
     {
@@ -1714,12 +1798,15 @@ void SpectrumOverlayMenu::buildDisplayPanel()
         emit dssGainChanged(v);
     });
 
+    makeHeader("SYSTEM");
+
     // ── Lean render mode toggle (#3283) ─────────────────────────────────
     // Global low-overhead render mode: opaque panadapter + VFO, capped
     // repaint, WAVE scope off, throttled meters. Grouped with the spectrum
     // render controls, below the 3D Floor slider. Drives the app-wide toggle.
     {
         m_leanBtn = new QPushButton("Lean Mode");
+        m_leanBtn->setObjectName("displayLeanModeBtn");
         m_leanBtn->setCheckable(true);
         m_leanBtn->setStyleSheet(btnStyle);
         m_leanBtn->setToolTip("Lean mode: opaque panadapter + VFO, capped "
@@ -1740,6 +1827,7 @@ void SpectrumOverlayMenu::buildDisplayPanel()
         lbl->setStyleSheet(labelStyle);
         grid->addWidget(lbl, row, 0);
         m_gpuCombo = new QComboBox;
+        m_gpuCombo->setObjectName("displayGpuCombo");
         m_gpuCombo->setFixedHeight(18);
         applyComboStyle(m_gpuCombo);
         const QString savedId = GpuSelector::savedChoiceId();
@@ -1796,6 +1884,7 @@ void SpectrumOverlayMenu::buildDisplayPanel()
     // ── Reset button ──────────────────────────────────────────────────────
     {
         auto* resetBtn = new QPushButton("Reset to Defaults");
+        resetBtn->setObjectName("displayResetBtn");
         resetBtn->setStyleSheet(btnStyle);
         resetBtn->setToolTip("Reset all display settings to their default values");
         connect(resetBtn, &QPushButton::clicked, this, [this] {
