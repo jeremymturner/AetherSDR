@@ -155,6 +155,10 @@ void IcomUdpTransport::init()
     auto makeSocket = [this](Stream& s, void (IcomUdpTransport::*slot)()) {
         if (s.sock == nullptr) {
             s.sock = new QUdpSocket(this);
+            // Enlarge the OS receive buffer so bursty 48 kHz audio isn't dropped
+            // when the event loop is briefly busy.
+            s.sock->setSocketOption(QAbstractSocket::ReceiveBufferSizeSocketOption,
+                                    1 << 20);
             connect(s.sock, &QUdpSocket::readyRead, this, slot);
         }
         if (s.idleTimer == nullptr) {

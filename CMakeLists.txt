@@ -2037,6 +2037,21 @@ target_link_libraries(icom_backend_test PRIVATE Qt6::Core Qt6::Network)
 set_target_properties(icom_backend_test PROPERTIES AUTOMOC ON)
 add_test(NAME icom_backend_test COMMAND icom_backend_test)
 
+# Live connect harness — NOT registered as a ctest (needs a real radio on the
+# LAN). Build + run manually: ./icom_live_connect <ip> <user> <pass> [model].
+add_executable(icom_live_connect
+    tests/icom_live_connect.cpp
+    src/core/IcomUdpTransport.cpp
+    src/core/IcomSessionCodec.cpp
+    src/core/IcomCivCodec.cpp
+    src/core/LogManager.cpp
+    src/core/AsyncLogWriter.cpp
+    src/core/AppSettings.cpp
+)
+target_include_directories(icom_live_connect PRIVATE src)
+target_link_libraries(icom_live_connect PRIVATE Qt6::Core Qt6::Network)
+set_target_properties(icom_live_connect PROPERTIES AUTOMOC ON)
+
 add_executable(kiwi_sdr_trace_math_test
     tests/kiwi_sdr_trace_math_test.cpp
 )
