@@ -539,14 +539,18 @@ set(CORE_SOURCES
     src/core/ReceivePresentationSync.cpp
     src/core/KiwiPublicDirectory.cpp
     # Icom network-radio backend (epic #1): pure protocol/codec modules, the
-    # RadioBackend seam, and the session-transport scaffolding.
+    # RadioBackend seam (Flex + Icom), the session-transport, and profile/secret
+    # storage.
     src/core/RadioBackend.cpp
+    src/core/FlexRadioBackend.cpp
     src/core/IcomCivCodec.cpp
     src/core/IcomAudioCodec.cpp
     src/core/IcomScopeParser.cpp
     src/core/IcomRadioCapabilities.cpp
+    src/core/IcomSessionCodec.cpp
     src/core/IcomUdpTransport.cpp
     src/core/IcomBackend.cpp
+    src/core/IcomProfileStore.cpp
     src/core/SecretStore.cpp
     src/core/WanConnection.cpp
     src/core/DxClusterClient.cpp
@@ -1973,6 +1977,49 @@ add_executable(icom_capabilities_test
 target_include_directories(icom_capabilities_test PRIVATE src)
 target_link_libraries(icom_capabilities_test PRIVATE Qt6::Core)
 add_test(NAME icom_capabilities_test COMMAND icom_capabilities_test)
+
+# Pure session framing codec (control packets + stream envelopes).
+add_executable(icom_session_codec_test
+    tests/icom_session_codec_test.cpp
+    src/core/IcomSessionCodec.cpp
+)
+target_include_directories(icom_session_codec_test PRIVATE src)
+target_link_libraries(icom_session_codec_test PRIVATE Qt6::Core)
+add_test(NAME icom_session_codec_test COMMAND icom_session_codec_test)
+
+# Icom connection-profile persistence (pure JSON helpers; QHostAddress needs Network).
+add_executable(icom_profile_store_test
+    tests/icom_profile_store_test.cpp
+    src/core/IcomProfileStore.cpp
+    src/core/AppSettings.cpp
+    src/core/LogManager.cpp
+    src/core/AsyncLogWriter.cpp
+)
+target_include_directories(icom_profile_store_test PRIVATE src)
+target_link_libraries(icom_profile_store_test PRIVATE Qt6::Core Qt6::Network)
+add_test(NAME icom_profile_store_test COMMAND icom_profile_store_test)
+
+# IcomBackend pure helpers (filter-slot mapping, receiver->streamId, mode strings).
+# Links the whole Icom backend graph since the helpers live in IcomBackend.cpp.
+add_executable(icom_backend_test
+    tests/icom_backend_test.cpp
+    src/core/IcomBackend.cpp
+    src/core/IcomUdpTransport.cpp
+    src/core/IcomSessionCodec.cpp
+    src/core/IcomCivCodec.cpp
+    src/core/IcomScopeParser.cpp
+    src/core/IcomAudioCodec.cpp
+    src/core/IcomRadioCapabilities.cpp
+    src/core/SecretStore.cpp
+    src/core/RadioBackend.cpp
+    src/core/LogManager.cpp
+    src/core/AsyncLogWriter.cpp
+    src/core/AppSettings.cpp
+)
+target_include_directories(icom_backend_test PRIVATE src)
+target_link_libraries(icom_backend_test PRIVATE Qt6::Core Qt6::Network)
+set_target_properties(icom_backend_test PROPERTIES AUTOMOC ON)
+add_test(NAME icom_backend_test COMMAND icom_backend_test)
 
 add_executable(kiwi_sdr_trace_math_test
     tests/kiwi_sdr_trace_math_test.cpp
