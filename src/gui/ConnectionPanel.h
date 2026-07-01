@@ -2,7 +2,9 @@
 
 #include "core/RadioDiscovery.h"
 #include "core/SmartLinkClient.h"
+#include "core/IcomBackend.h"   // IcomConnectionProfile (unified radio list, #5)
 
+#include <QVector>
 #include <QWidget>
 #include <QListWidget>
 #include <QPushButton>
@@ -18,6 +20,8 @@
 class QVBoxLayout;
 
 namespace AetherSDR {
+
+class IcomProfileEditor;
 
 // Novice-first dialog for local, SmartLink, and manual/VPN radio connections.
 class ConnectionPanel : public QWidget {
@@ -49,6 +53,9 @@ public slots:
 
 signals:
     void connectRequested(const RadioInfo& radio);
+    // A saved Icom radio was chosen from the unified list (#5).  MainWindow
+    // routes this to RadioModel::connectToIcom().
+    void icomConnectRequested(const IcomConnectionProfile& profile);
     void wanConnectRequested(const WanRadioInfo& radio);
     void wanDisconnectClientsRequested(const WanRadioInfo& radio);
     void disconnectRequested();
@@ -111,8 +118,24 @@ private:
     QWidget* m_localEmptyState{nullptr};
     QPushButton* m_localConnectBtn{nullptr};
 
-    QList<RadioInfo> m_radios;   // LAN radios only
+    QList<RadioInfo> m_radios;   // discovered Flex LAN radios
     bool m_connected{false};
+
+    // --- Unified list: saved Icom radios alongside discovered Flex (#5) ----
+    void reloadIcomProfiles();
+    void rebuildRadioList();
+    QString formatIcomRadioLabel(const IcomConnectionProfile& profile) const;
+    void showIcomEditor(const QString& profileId);  // empty id = new
+    void onIcomEditorSaved(const IcomConnectionProfile& profile,
+                           const QString& password);
+    void deleteSelectedIcom();
+    QString currentRowIcomId() const;  // empty when the current row is not Icom
+
+    QVector<IcomConnectionProfile> m_icomProfiles;
+    IcomProfileEditor* m_icomEditor{nullptr};
+    QPushButton* m_addIcomBtn{nullptr};
+    QPushButton* m_editIcomBtn{nullptr};
+    QPushButton* m_removeIcomBtn{nullptr};
 
     // SmartLink UI
     SmartLinkClient* m_smartLink{nullptr};

@@ -1,8 +1,12 @@
 #include "ConnectionPanel.h"
 #include "core/AppSettings.h"
 #include "core/NetworkPathResolver.h"
+#include "core/IcomProfileStore.h"
+#include "core/IcomRadioCapabilities.h"
+#include "core/SecretStore.h"
 #include "FramelessResizer.h"
 #include "FramelessWindowTitleBar.h"
+#include "IcomProfileEditor.h"
 
 #include <memory>
 
@@ -30,6 +34,10 @@ constexpr int kSourceInterfaceIdRole = Qt::UserRole + 11;
 constexpr int kSourceInterfaceNameRole = Qt::UserRole + 12;
 constexpr int kSourceAddressRole = Qt::UserRole + 13;
 constexpr int kSourceStaleRole = Qt::UserRole + 14;
+// Unified-list row kind: a row is either a discovered Flex radio or a saved
+// Icom profile.  kRowIcomIdRole holds the profile id for Icom rows (#5).
+constexpr int kRowIsIcomRole = Qt::UserRole + 20;
+constexpr int kRowIcomIdRole = Qt::UserRole + 21;
 constexpr int kMaxRecentManualIps = 3;
 constexpr const char* kRecentManualIpsKey = "RecentConnectByIpAddresses";
 
@@ -338,10 +346,28 @@ ConnectionPanel::ConnectionPanel(QWidget* parent)
     localListLayout->addWidget(localGroup, 1);
 
     auto* localActionRow = new QHBoxLayout;
+    m_addIcomBtn = new QPushButton(tr("Add Icom radio…"), localListPage);
+    m_addIcomBtn->setObjectName(QStringLiteral("connectionAddIcomButton"));
+    m_addIcomBtn->setAccessibleName(tr("Add an Icom radio"));
+    connect(m_addIcomBtn, &QPushButton::clicked, this,
+            [this] { showIcomEditor(QString()); });
+    m_editIcomBtn = new QPushButton(tr("Edit"), localListPage);
+    m_editIcomBtn->setAccessibleName(tr("Edit selected Icom radio"));
+    m_editIcomBtn->setEnabled(false);
+    connect(m_editIcomBtn, &QPushButton::clicked, this,
+            [this] { showIcomEditor(currentRowIcomId()); });
+    m_removeIcomBtn = new QPushButton(tr("Remove"), localListPage);
+    m_removeIcomBtn->setAccessibleName(tr("Remove selected Icom radio"));
+    m_removeIcomBtn->setEnabled(false);
+    connect(m_removeIcomBtn, &QPushButton::clicked, this,
+            &ConnectionPanel::deleteSelectedIcom);
+    localActionRow->addWidget(m_addIcomBtn);
+    localActionRow->addWidget(m_editIcomBtn);
+    localActionRow->addWidget(m_removeIcomBtn);
     localActionRow->addStretch();
     m_localConnectBtn = new QPushButton("Connect Selected Radio", localListPage);
     m_localConnectBtn->setObjectName(QStringLiteral("connectionLocalConnectButton"));
-    m_localConnectBtn->setAccessibleName(tr("Connect selected local radio"));
+    m_localConnectBtn->setAccessibleName(tr("Connect selected radio"));
     m_localConnectBtn->setEnabled(false);
     localActionRow->addWidget(m_localConnectBtn);
     localListLayout->addLayout(localActionRow);
@@ -377,6 +403,16 @@ ConnectionPanel::ConnectionPanel(QWidget* parent)
     emptyLayout->addWidget(emptyCallout);
     emptyLayout->addStretch();
     m_localStateStack->addWidget(m_localEmptyState);
+
+    // Inline Icom add/edit editor — the third local-page state (#5). Shown when
+    // "Add Icom radio…"/"Edit" is clicked; Save/Cancel return to the list.
+    m_icomEditor = new IcomProfileEditor(m_localStateStack);
+    connect(m_icomEditor, &IcomProfileEditor::saved,
+            this, &ConnectionPanel::onIcomEditorSaved);
+    connect(m_icomEditor, &IcomProfileEditor::cancelled, this, [this] {
+        updateLocalPageState();  // back to list/empty
+    });
+    m_localStateStack->addWidget(m_icomEditor);
 
     m_modeStack->addWidget(localPage);
 
@@ -719,6 +755,7 @@ ConnectionPanel::ConnectionPanel(QWidget* parent)
     });
 
     setConnected(false);
+    reloadIcomProfiles();  // saved Icom radios appear alongside discovered Flex
     setCurrentMode(LocalMode);
     updateLocalPageState();
     updateSmartLinkUi();
@@ -895,9 +932,146 @@ void ConnectionPanel::setManualMessage(const QString& text, bool error)
     m_manualResultLabel->setVisible(true);
 }
 
+QString ConnectionPanel::currentRowIcomId() const
+{
+    if (m_radioList == nullptr) {
+        return QString();
+    }
+    auto* item = m_radioList->currentItem();
+    if (item == nullptr || !item->data(kRowIsIcomRole).toBool()) {
+        return QString();
+    }
+    return item->data(kRowIcomIdRole).toString();
+}
+
+QString ConnectionPanel::formatIcomRadioLabel(const IcomConnectionProfile& profile) const
+{
+    const IcomModelCaps caps = icomCapsFor(profile.modelKey);
+    const QString modelName = caps.isKnown ? caps.displayName : profile.modelKey;
+    QString title = profile.displayName.trimmed();
+    if (title.isEmpty()) {
+        title = modelName;
+    }
+    const QString transport =
+        caps.primaryTransport == IcomTransport::WiFi ? QStringLiteral("Wi-Fi")
+                                                     : QStringLiteral("Ethernet");
+    const QString addr = profile.address.isNull() ? tr("no address set")
+                                                  : profile.address.toString();
+    const QString detail = tr("Icom %1 • %2 • %3").arg(modelName, addr, transport);
+    return title + QLatin1Char('\n') + detail;
+}
+
+void ConnectionPanel::reloadIcomProfiles()
+{
+    m_icomProfiles = IcomProfileStore::load();
+    rebuildRadioList();
+}
+
+void ConnectionPanel::rebuildRadioList()
+{
+    // Remember the current selection so a rebuild doesn't lose it.
+    const QString selIcomId = currentRowIcomId();
+    QString selFlexSerial;
+    if (auto* cur = m_radioList->currentItem();
+        cur != nullptr && !cur->data(kRowIsIcomRole).toBool()) {
+        const int r = m_radioList->row(cur);
+        if (r >= 0 && r < m_radios.size()) {
+            selFlexSerial = m_radios[r].serial;
+        }
+    }
+
+    QSignalBlocker block(m_radioList);
+    m_radioList->clear();
+
+    // Flex rows FIRST so a Flex row index still maps to m_radios[index]
+    // (onLocalConnectClicked relies on that for the Flex path).
+    for (const RadioInfo& radio : m_radios) {
+        auto* item = new QListWidgetItem(formatLocalRadioLabel(radio), m_radioList);
+        item->setData(kRowIsIcomRole, false);
+    }
+    for (const IcomConnectionProfile& profile : m_icomProfiles) {
+        auto* item = new QListWidgetItem(formatIcomRadioLabel(profile), m_radioList);
+        item->setData(kRowIsIcomRole, true);
+        item->setData(kRowIcomIdRole, profile.id);
+    }
+
+    int restore = -1;
+    if (!selIcomId.isEmpty()) {
+        for (int i = 0; i < m_radioList->count(); ++i) {
+            auto* it = m_radioList->item(i);
+            if (it->data(kRowIsIcomRole).toBool()
+                && it->data(kRowIcomIdRole).toString() == selIcomId) {
+                restore = i;
+                break;
+            }
+        }
+    } else if (!selFlexSerial.isEmpty()) {
+        for (int i = 0; i < m_radios.size(); ++i) {
+            if (m_radios[i].serial == selFlexSerial) {
+                restore = i;
+                break;
+            }
+        }
+    }
+    if (restore < 0 && m_radioList->count() > 0) {
+        restore = 0;
+    }
+    if (restore >= 0) {
+        m_radioList->setCurrentRow(restore);
+    }
+
+    updateActionState();  // selection signal was blocked; sync buttons now
+}
+
+void ConnectionPanel::showIcomEditor(const QString& profileId)
+{
+    if (profileId.isEmpty()) {
+        m_icomEditor->clearForm();
+    } else {
+        for (const IcomConnectionProfile& p : m_icomProfiles) {
+            if (p.id == profileId) {
+                m_icomEditor->loadProfile(p, SecretStore::instance().secret(p.id));
+                break;
+            }
+        }
+    }
+    m_localStateStack->setCurrentWidget(m_icomEditor);
+}
+
+void ConnectionPanel::onIcomEditorSaved(const IcomConnectionProfile& profile,
+                                        const QString& password)
+{
+    // Secret first (durable id exists before the profile lands), then profile.
+    SecretStore::instance().setSecret(profile.id, password);
+    IcomProfileStore::addOrUpdate(profile);
+    reloadIcomProfiles();
+    updateLocalPageState();  // back to the list, with the new row selected
+    // Reselect the just-saved Icom row.
+    for (int i = 0; i < m_radioList->count(); ++i) {
+        auto* it = m_radioList->item(i);
+        if (it->data(kRowIsIcomRole).toBool()
+            && it->data(kRowIcomIdRole).toString() == profile.id) {
+            m_radioList->setCurrentRow(i);
+            break;
+        }
+    }
+}
+
+void ConnectionPanel::deleteSelectedIcom()
+{
+    const QString id = currentRowIcomId();
+    if (id.isEmpty()) {
+        return;
+    }
+    SecretStore::instance().removeSecret(id);
+    IcomProfileStore::remove(id);
+    reloadIcomProfiles();
+    updateLocalPageState();
+}
+
 void ConnectionPanel::updateLocalPageState()
 {
-    const bool hasRadios = !m_radios.isEmpty();
+    const bool hasRadios = !m_radios.isEmpty() || !m_icomProfiles.isEmpty();
     m_localStateStack->setCurrentIndex(hasRadios ? 0 : 1);
 
     if (hasRadios && !m_radioList->currentItem())
@@ -949,6 +1123,15 @@ void ConnectionPanel::updateSmartLinkUi()
 void ConnectionPanel::updateActionState()
 {
     m_localConnectBtn->setEnabled(!m_connected && m_radioList->currentItem() != nullptr);
+
+    // Edit/Remove apply only to saved Icom rows.
+    const bool icomRow = !currentRowIcomId().isEmpty();
+    if (m_editIcomBtn != nullptr) {
+        m_editIcomBtn->setEnabled(icomRow);
+    }
+    if (m_removeIcomBtn != nullptr) {
+        m_removeIcomBtn->setEnabled(icomRow);
+    }
 
     const bool smartLinkReady = !m_connected
         && m_smartLink
@@ -1046,17 +1229,14 @@ void ConnectionPanel::onRadioDiscovered(const RadioInfo& radio)
     for (int i = 0; i < m_radios.size(); ++i) {
         if (m_radios[i].serial == radio.serial) {
             m_radios[i] = radio;
-            if (auto* item = m_radioList->item(i))
-                item->setText(formatLocalRadioLabel(radio));
+            rebuildRadioList();
             updateLocalPageState();
             return;
         }
     }
 
     m_radios.append(radio);
-    m_radioList->addItem(formatLocalRadioLabel(radio));
-    if (m_radioList->count() == 1)
-        m_radioList->setCurrentRow(0);
+    rebuildRadioList();  // keeps Flex rows first, then saved Icom rows
     updateLocalPageState();
 }
 
@@ -1065,8 +1245,7 @@ void ConnectionPanel::onRadioUpdated(const RadioInfo& radio)
     for (int i = 0; i < m_radios.size(); ++i) {
         if (m_radios[i].serial == radio.serial) {
             m_radios[i] = radio;
-            if (auto* item = m_radioList->item(i))
-                item->setText(formatLocalRadioLabel(radio));
+            rebuildRadioList();
             return;
         }
     }
@@ -1076,12 +1255,12 @@ void ConnectionPanel::onRadioLost(const QString& serial)
 {
     for (int i = 0; i < m_radios.size(); ++i) {
         if (m_radios[i].serial == serial) {
-            delete m_radioList->takeItem(i);
             m_radios.removeAt(i);
             break;
         }
     }
 
+    rebuildRadioList();
     updateLocalPageState();
 }
 
@@ -1097,8 +1276,25 @@ void ConnectionPanel::onWanSelectionChanged()
 
 void ConnectionPanel::onLocalConnectClicked()
 {
+    if (m_connected) {
+        return;
+    }
+
+    // Icom row → connect via the RadioBackend seam (#5).
+    const QString icomId = currentRowIcomId();
+    if (!icomId.isEmpty()) {
+        for (const IcomConnectionProfile& p : m_icomProfiles) {
+            if (p.id == icomId) {
+                emit icomConnectRequested(p);
+                return;
+            }
+        }
+        return;
+    }
+
+    // Flex row (rows are Flex-first, so the row index maps to m_radios).
     const int row = m_radioList->currentRow();
-    if (m_connected || row < 0 || row >= m_radios.size())
+    if (row < 0 || row >= m_radios.size())
         return;
 
     auto& settings = AppSettings::instance();

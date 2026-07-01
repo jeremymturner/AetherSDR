@@ -54,7 +54,6 @@
 #include "core/AudioEngine.h"      // wireIcomStreams: feedAudioData (#2)
 #include "core/IcomBackend.h"      // wireIcomStreams: Icom backend signals (#2)
 #include "core/QsoRecorder.h"      // wireIcomStreams: feedRxAudio (#2)
-#include "IcomConnectDialog.h"     // toggleIcomConnectDialog (#5)
 #include "TitleBar.h"
 #include "core/AppSettings.h"
 #include "core/LogManager.h"
@@ -233,6 +232,16 @@ void MainWindow::wireDiscovery()
             s.remove("LastRoutedRadioIp");
         }
         s.save();
+    });
+
+    // Icom radios chosen from the unified list connect via the RadioBackend
+    // seam (#5). No Flex multi-client preflight applies.
+    connect(m_connPanel, &ConnectionPanel::icomConnectRequested,
+            this, [this](const IcomConnectionProfile& profile){
+        m_connPanel->setStatusText("Connecting…");
+        m_userDisconnected = false;
+        setPanadapterConnectionAnimation(true, "Connecting to Icom radio…");
+        m_radioModel.connectToIcom(profile);
     });
 
     // Start the AetherModem KISS TNC headlessly at launch if the user enabled
@@ -1579,24 +1588,6 @@ void MainWindow::wireDaxIq()
     });
 #endif
 
-}
-
-void MainWindow::toggleIcomConnectDialog()
-{
-    if (m_icomConnectDialog == nullptr) {
-        m_icomConnectDialog = new IcomConnectDialog(this);
-        connect(m_icomConnectDialog, &IcomConnectDialog::connectRequested,
-                this, [this](const IcomConnectionProfile& profile) {
-            m_radioModel.connectToIcom(profile);
-        });
-    }
-    if (m_icomConnectDialog->isVisible()) {
-        m_icomConnectDialog->hide();
-        return;
-    }
-    m_icomConnectDialog->show();
-    m_icomConnectDialog->raise();
-    m_icomConnectDialog->activateWindow();
 }
 
 // Route an Icom backend's format-agnostic RX media to the same UI sinks the

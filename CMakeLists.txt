@@ -756,7 +756,7 @@ set(GUI_SOURCES
     src/gui/AppletPanel.cpp
     src/gui/KiwiSdrApplet.cpp
     src/gui/KiwiPublicReceiverPicker.cpp
-    src/gui/IcomConnectDialog.cpp
+    src/gui/IcomProfileEditor.cpp
     src/gui/FavoritesPickerDialog.cpp
     src/gui/RxApplet.cpp
     src/gui/FilterPassbandWidget.cpp

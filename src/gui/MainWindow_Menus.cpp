@@ -108,11 +108,6 @@ void MainWindow::buildMenuBar()
         toggleConnectionDialog();
     });
 
-    auto* chooseIcom = settingsMenu->addAction("Connect to Icom Radio...");
-    chooseIcom->setMenuRole(QAction::NoRole);       // prevent macOS auto-reparenting (#883)
-    connect(chooseIcom, &QAction::triggered, this, [this] {
-        toggleIcomConnectDialog();
-    });
 
     auto* flexControlAction = settingsMenu->addAction("AetherControl...");
     flexControlAction->setMenuRole(QAction::NoRole);
