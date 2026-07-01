@@ -26,6 +26,18 @@ IcomProfileEditor::IcomProfileEditor(QWidget* parent)
     title->setStyleSheet(QStringLiteral("font-weight: 600;"));
     root->addWidget(title);
 
+    // Prompt banner (hidden until setNotice() is given text): surfaces the
+    // "add credentials" / "connection failed — check credentials" guidance.
+    m_notice = new QLabel(this);
+    m_notice->setObjectName(QStringLiteral("icomEditorNotice"));
+    m_notice->setAccessibleName(tr("Icom connection notice"));
+    m_notice->setWordWrap(true);
+    m_notice->setStyleSheet(QStringLiteral(
+        "QLabel#icomEditorNotice { color: #ffd27f; background: #2a2113; "
+        "border: 1px solid #6a5320; border-radius: 4px; padding: 6px 8px; }"));
+    m_notice->setVisible(false);
+    root->addWidget(m_notice);
+
     auto* form = new QFormLayout();
 
     m_name = new QLineEdit(this);
@@ -85,8 +97,18 @@ IcomProfileEditor::IcomProfileEditor(QWidget* parent)
     root->addLayout(buttons);
 }
 
+void IcomProfileEditor::setNotice(const QString& text)
+{
+    if (m_notice == nullptr) {
+        return;
+    }
+    m_notice->setText(text);
+    m_notice->setVisible(!text.trimmed().isEmpty());
+}
+
 void IcomProfileEditor::clearForm()
 {
+    setNotice(QString());
     m_editingId.clear();
     m_name->clear();
     m_model->setCurrentIndex(0);
@@ -106,6 +128,7 @@ void IcomProfileEditor::prefillNewForAddress(const QString& ip)
 void IcomProfileEditor::loadProfile(const IcomConnectionProfile& profile,
                                     const QString& password)
 {
+    setNotice(QString());
     m_editingId = profile.id;
     m_name->setText(profile.displayName);
     const int idx = m_model->findData(profile.modelKey);

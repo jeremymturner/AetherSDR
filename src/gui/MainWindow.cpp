@@ -5326,6 +5326,14 @@ void MainWindow::onConnectionError(const QString& msg)
     statusBar()->showMessage("Connection error: " + msg, 5000);
     if (!m_reconnectDlg)
         setPanadapterConnectionAnimation(false);
+
+    // For a failed Icom connect, resurface the connect panel and prompt the
+    // operator to fix the credentials for the profile we were connecting to
+    // (#5).  The panel no-ops when no Icom connect was pending.
+    if (m_radioModel.radioType() == RadioType::Icom) {
+        m_connPanel->show();
+        m_connPanel->onIcomConnectFailed(msg);
+    }
 }
 
 void MainWindow::onWanCertFingerprintMismatch(const QString& host,

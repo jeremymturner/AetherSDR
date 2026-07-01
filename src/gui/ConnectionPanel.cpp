@@ -353,12 +353,20 @@ ConnectionPanel::ConnectionPanel(QWidget* parent)
     m_addIcomBtn->setObjectName(QStringLiteral("connectionAddIcomButton"));
     m_addIcomBtn->setAccessibleName(tr("Add an Icom radio"));
     connect(m_addIcomBtn, &QPushButton::clicked, this,
-            [this] { showIcomEditor(QString()); });
+            [this] {
+        m_pendingConnectIcomId.clear();
+        m_connectAfterSaveNew = false;
+        showIcomEditor(QString());
+    });
     m_editIcomBtn = new QPushButton(tr("Edit"), localListPage);
     m_editIcomBtn->setAccessibleName(tr("Edit selected Icom radio"));
     m_editIcomBtn->setEnabled(false);
     connect(m_editIcomBtn, &QPushButton::clicked, this,
-            [this] { showIcomEditor(currentRowIcomId()); });
+            [this] {
+        m_pendingConnectIcomId.clear();
+        m_connectAfterSaveNew = false;
+        showIcomEditor(currentRowIcomId());
+    });
     m_removeIcomBtn = new QPushButton(tr("Remove"), localListPage);
     m_removeIcomBtn->setAccessibleName(tr("Remove selected Icom radio"));
     m_removeIcomBtn->setEnabled(false);
@@ -413,6 +421,8 @@ ConnectionPanel::ConnectionPanel(QWidget* parent)
     connect(m_icomEditor, &IcomProfileEditor::saved,
             this, &ConnectionPanel::onIcomEditorSaved);
     connect(m_icomEditor, &IcomProfileEditor::cancelled, this, [this] {
+        m_pendingConnectIcomId.clear();
+        m_connectAfterSaveNew = false;
         updateLocalPageState();  // back to list/empty
     });
     m_localStateStack->addWidget(m_icomEditor);
@@ -789,6 +799,12 @@ void ConnectionPanel::setFramelessMode(bool on)
 void ConnectionPanel::setConnected(bool connected)
 {
     m_connected = connected;
+    if (connected) {
+        // A connection went live — no Icom connect is pending anymore, so a
+        // later unrelated error won't reopen the credentials editor.
+        m_connectingIcomId.clear();
+        m_pendingConnectIcomId.clear();
+    }
     m_disconnectBtn->setVisible(connected);
     updateActionState();
 }
@@ -947,7 +963,14 @@ QString ConnectionPanel::currentRowIcomId() const
     return item->data(kRowIcomIdRole).toString();
 }
 
-QString ConnectionPanel::formatIcomRadioLabel(const IcomConnectionProfile& profile) const
+bool ConnectionPanel::icomProfileHasCredentials(const IcomConnectionProfile& profile)
+{
+    return !profile.username.trimmed().isEmpty()
+           && !SecretStore::instance().secret(profile.id).isEmpty();
+}
+
+QString ConnectionPanel::formatIcomRadioLabel(const IcomConnectionProfile& profile,
+                                              bool detectedOnline) const
 {
     const IcomModelCaps caps = icomCapsFor(profile.modelKey);
     const QString modelName = caps.isKnown ? caps.displayName : profile.modelKey;
@@ -960,7 +983,17 @@ QString ConnectionPanel::formatIcomRadioLabel(const IcomConnectionProfile& profi
                                                      : QStringLiteral("Ethernet");
     const QString addr = profile.address.isNull() ? tr("no address set")
                                                   : profile.address.toString();
-    const QString detail = tr("Icom %1 • %2 • %3").arg(modelName, addr, transport);
+    QString detail = tr("Icom %1 • %2 • %3").arg(modelName, addr, transport);
+    if (detectedOnline) {
+        detail += tr(" • On your network");
+    }
+    // Credentials line: show the saved username when we have one (with a stored
+    // password), otherwise prompt the operator to add credentials (#5).
+    if (icomProfileHasCredentials(profile)) {
+        detail += QLatin1Char('\n') + tr("Username: %1").arg(profile.username.trimmed());
+    } else {
+        detail += QLatin1Char('\n') + tr("No saved credentials — Connect to add them");
+    }
     return title + QLatin1Char('\n') + detail;
 }
 
@@ -974,6 +1007,19 @@ bool ConnectionPanel::icomAddressIsSaved(const QHostAddress& address) const
 {
     for (const IcomConnectionProfile& p : m_icomProfiles) {
         if (!p.address.isNull() && p.address.isEqual(address)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool ConnectionPanel::icomAddressIsDetected(const QHostAddress& address) const
+{
+    if (address.isNull()) {
+        return false;
+    }
+    for (const QHostAddress& a : m_icomDetected) {
+        if (a.isEqual(address)) {
             return true;
         }
     }
@@ -1027,7 +1073,9 @@ void ConnectionPanel::rebuildRadioList()
         item->setData(kRowIsIcomRole, false);
     }
     for (const IcomConnectionProfile& profile : m_icomProfiles) {
-        auto* item = new QListWidgetItem(formatIcomRadioLabel(profile), m_radioList);
+        const bool online = icomAddressIsDetected(profile.address);
+        auto* item =
+            new QListWidgetItem(formatIcomRadioLabel(profile, online), m_radioList);
         item->setData(kRowIsIcomRole, true);
         item->setData(kRowIcomIdRole, profile.id);
     }
@@ -1037,8 +1085,9 @@ void ConnectionPanel::rebuildRadioList()
         if (icomAddressIsSaved(addr)) {
             continue;
         }
-        const QString label = tr("Icom radio (detected)\n%1 • tap Connect to set up")
-                                  .arg(addr.toString());
+        const QString label =
+            tr("Icom radio (detected)\n%1 • No saved credentials — Connect to add them")
+                .arg(addr.toString());
         auto* item = new QListWidgetItem(label, m_radioList);
         item->setData(kRowIsIcomRole, true);
         item->setData(kRowIcomDetectedRole, true);
@@ -1088,6 +1137,51 @@ void ConnectionPanel::showIcomEditor(const QString& profileId)
     m_localStateStack->setCurrentWidget(m_icomEditor);
 }
 
+void ConnectionPanel::connectToSavedIcom(const IcomConnectionProfile& profile)
+{
+    // No stored credentials → don't attempt a doomed connect; open the editor
+    // pre-filled and prompt the operator to add them.  Saving then retries the
+    // connect automatically (m_pendingConnectIcomId).
+    if (!icomProfileHasCredentials(profile)) {
+        m_pendingConnectIcomId = profile.id;
+        showIcomEditor(profile.id);
+        m_icomEditor->setNotice(
+            tr("Add a username and password for %1, then Save to connect.")
+                .arg(profile.displayName.trimmed().isEmpty()
+                         ? tr("this radio")
+                         : profile.displayName.trimmed()));
+        return;
+    }
+
+    m_connectingIcomId = profile.id;
+    emit icomConnectRequested(profile);
+}
+
+void ConnectionPanel::onIcomConnectFailed(const QString& error)
+{
+    // Only act on a failure for a connect we actually initiated.
+    if (m_connectingIcomId.isEmpty()) {
+        return;
+    }
+    const QString failedId = m_connectingIcomId;
+    m_connectingIcomId.clear();
+
+    for (const IcomConnectionProfile& p : m_icomProfiles) {
+        if (p.id == failedId) {
+            // Re-open the editor so the operator can correct the credentials;
+            // saving retries the connect (m_pendingConnectIcomId).
+            m_pendingConnectIcomId = failedId;
+            setCurrentMode(LocalMode);
+            showIcomEditor(failedId);
+            m_icomEditor->setNotice(
+                tr("Couldn't connect: %1\nCheck the username and password, "
+                   "then Save to try again.")
+                    .arg(error.trimmed()));
+            return;
+        }
+    }
+}
+
 void ConnectionPanel::onIcomEditorSaved(const IcomConnectionProfile& profile,
                                         const QString& password)
 {
@@ -1104,6 +1198,18 @@ void ConnectionPanel::onIcomEditorSaved(const IcomConnectionProfile& profile,
             m_radioList->setCurrentRow(i);
             break;
         }
+    }
+
+    // If this save was in response to a connect prompt (missing creds, a failed
+    // attempt, or setting up a just-detected radio), retry the connection now
+    // with the fresh credentials.
+    const bool wantConnect =
+        (m_pendingConnectIcomId == profile.id) || m_connectAfterSaveNew;
+    m_pendingConnectIcomId.clear();
+    m_connectAfterSaveNew = false;
+    if (wantConnect && !m_connected && icomProfileHasCredentials(profile)) {
+        m_connectingIcomId = profile.id;
+        emit icomConnectRequested(profile);
     }
 }
 
@@ -1335,8 +1441,14 @@ void ConnectionPanel::onLocalConnectClicked()
     // sets the model + credentials (the model is not knowable pre-auth).
     if (auto* cur = m_radioList->currentItem();
         cur != nullptr && cur->data(kRowIcomDetectedRole).toBool()) {
+        // The operator clicked Connect intending to go live: set up the radio,
+        // then auto-connect once credentials are saved.
+        m_pendingConnectIcomId.clear();
+        m_connectAfterSaveNew = true;
         showIcomEditor(QString());
         m_icomEditor->prefillNewForAddress(cur->data(kRowIcomAddrRole).toString());
+        m_icomEditor->setNotice(
+            tr("Pick the model and enter a username and password, then Save to connect."));
         return;
     }
 
@@ -1345,7 +1457,7 @@ void ConnectionPanel::onLocalConnectClicked()
     if (!icomId.isEmpty()) {
         for (const IcomConnectionProfile& p : m_icomProfiles) {
             if (p.id == icomId) {
-                emit icomConnectRequested(p);
+                connectToSavedIcom(p);
                 return;
             }
         }

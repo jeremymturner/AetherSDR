@@ -54,6 +54,12 @@ public slots:
     void onIcomRadioDiscovered(const QHostAddress& address);
     void onIcomRadioLost(const QHostAddress& address);
 
+    // An in-progress Icom connection failed (bad/expired credentials, radio
+    // unreachable, …).  Re-opens the editor for the profile we were connecting
+    // to so the operator can fix the credentials and retry (#5).  Ignored when
+    // no Icom connect was pending.
+    void onIcomConnectFailed(const QString& error);
+
     // SmartLink
     void setSmartLinkClient(SmartLinkClient* client);
 
@@ -130,17 +136,33 @@ private:
     // --- Unified list: saved Icom radios alongside discovered Flex (#5) ----
     void reloadIcomProfiles();
     void rebuildRadioList();
-    QString formatIcomRadioLabel(const IcomConnectionProfile& profile) const;
+    QString formatIcomRadioLabel(const IcomConnectionProfile& profile,
+                                 bool detectedOnline) const;
     void showIcomEditor(const QString& profileId);  // empty id = new
     void onIcomEditorSaved(const IcomConnectionProfile& profile,
                            const QString& password);
     void deleteSelectedIcom();
     QString currentRowIcomId() const;  // empty when the current row is not Icom
 
+    // Start connecting to a saved Icom profile — but if it has no stored
+    // credentials, divert to the editor and prompt for them first (#5).
+    void connectToSavedIcom(const IcomConnectionProfile& profile);
     bool icomAddressIsSaved(const QHostAddress& address) const;
+    bool icomAddressIsDetected(const QHostAddress& address) const;
+    // True when the profile has a username AND a stored password (keychain or
+    // session), i.e. enough to attempt an authenticated connection.
+    static bool icomProfileHasCredentials(const IcomConnectionProfile& profile);
 
     QVector<IcomConnectionProfile> m_icomProfiles;
     QVector<QHostAddress> m_icomDetected;  // swept, not-yet-saved Icom radios
+    // Id of the profile a connect is in flight for (cleared on success/failure),
+    // and a profile queued to auto-connect once its credentials are saved.
+    QString m_connectingIcomId;
+    QString m_pendingConnectIcomId;
+    // Set when the editor was opened to set up a just-detected radio and the
+    // operator's intent is to connect once credentials are saved (the profile
+    // id does not exist until Save, so a bool rather than an id).
+    bool m_connectAfterSaveNew{false};
     IcomProfileEditor* m_icomEditor{nullptr};
     QPushButton* m_addIcomBtn{nullptr};
     QPushButton* m_editIcomBtn{nullptr};

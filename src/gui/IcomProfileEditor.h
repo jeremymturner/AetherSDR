@@ -6,6 +6,7 @@
 #include <QWidget>
 
 class QComboBox;
+class QLabel;
 class QLineEdit;
 class QSpinBox;
 
@@ -30,6 +31,12 @@ public:
     // the operator just picks the model and enters credentials.
     void prefillNewForAddress(const QString& ip);
 
+    // Show (non-empty) or hide (empty) a highlighted banner above the form —
+    // used to prompt the operator to add/fix credentials after a failed or
+    // credential-less connect attempt (#5).  Cleared automatically whenever the
+    // form is (re)loaded.
+    void setNotice(const QString& text);
+
 signals:
     // Emitted on Save with a valid form.  `profile.id` is stable (reused when
     // editing, freshly generated when new).  Password is carried separately so
@@ -42,6 +49,7 @@ private:
     IcomConnectionProfile formToProfile() const;
     void onSaveClicked();
 
+    QLabel*    m_notice{nullptr};
     QComboBox* m_model{nullptr};
     QLineEdit* m_name{nullptr};
     QLineEdit* m_host{nullptr};
