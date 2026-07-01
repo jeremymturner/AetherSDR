@@ -108,7 +108,7 @@ private:
 
     // Negotiated audio format.  PROVISIONAL default; the real value comes from
     // the transport's audio-session negotiation (#3/#7).
-    IcomAudio::IcomAudioFormat m_audioFormat{IcomAudio::IcomAudioFormat::ULaw8};
+    IcomAudio::IcomAudioFormat m_audioFormat{IcomAudio::IcomAudioFormat::PCM16};
 
     // Last known operating mode, kept so setFilterBandwidth can re-send
     // mode+filter (CI-V cmd 0x06 carries mode AND filter together) without

@@ -324,5 +324,46 @@ int main()
         }
     }
 
+    // --- passcode() username/password obfuscation --------------------------
+    // These vectors are computed straight from the verified substitution table
+    // (kappanhang passcode.go / wfview), the one part of this protocol confirmed
+    // against real hardware.  They guard the table + the index/wrap arithmetic.
+    {
+        // "a" (0x61) at index 0 -> table['a'] = 0x38, then zero-padded to 16.
+        const QByteArray a = passcode(QStringLiteral("a"));
+        if (a.size() != 16) {
+            return fail("passcode output must be 16 bytes");
+        }
+        if (static_cast<quint8>(a[0]) != 0x38) {
+            return fail("passcode(\"a\") first byte wrong");
+        }
+        for (int i = 1; i < 16; ++i) {
+            if (a[i] != '\0') {
+                return fail("passcode must zero-pad the tail");
+            }
+        }
+
+        // "ab": 'a'@0 -> 0x38; 'b'(0x62)@1 -> table[0x63] = 0x2e (index math).
+        const QByteArray ab = passcode(QStringLiteral("ab"));
+        if (static_cast<quint8>(ab[0]) != 0x38
+            || static_cast<quint8>(ab[1]) != 0x2e) {
+            return fail("passcode(\"ab\") wrong");
+        }
+
+        // Wrap path (char+index > 126): "~~~~" -> 0x52,0x47,0x5d,0x4c.
+        const QByteArray tilde = passcode(QStringLiteral("~~~~"));
+        if (static_cast<quint8>(tilde[0]) != 0x52
+            || static_cast<quint8>(tilde[1]) != 0x47
+            || static_cast<quint8>(tilde[2]) != 0x5d
+            || static_cast<quint8>(tilde[3]) != 0x4c) {
+            return fail("passcode wrap-around arithmetic wrong");
+        }
+
+        // Never emits more than 16 bytes even for a long input.
+        if (passcode(QStringLiteral("0123456789ABCDEFGHIJ")).size() != 16) {
+            return fail("passcode must cap at 16 bytes");
+        }
+    }
+
     return 0;
 }

@@ -47,12 +47,13 @@ struct AudioFormatDesc {
 // Byte-order / format assumptions (VERIFY AT CAPTURE TIME)
 // -----------------------------------------------------------------------------
 
-// ASSUMPTION — PCM16 network byte order. Icom PCM16 network audio samples are
-// assumed to arrive in BIG-ENDIAN (network) byte order. This has NOT yet been
-// confirmed against a captured stream from real hardware. It is exposed as a
-// single compile-time switch so the parent can flip it after capture-time
-// verification without touching the companding or framing logic below.
-inline constexpr bool kPcm16BigEndian = true;
+// PCM16 network byte order. The documented open-source references (kappanhang)
+// carry real IC-705 captures showing the network audio codec we request (0x04)
+// delivers 48 kHz SIGNED 16-bit LITTLE-ENDIAN mono PCM — the radio plays the
+// stream back as SAMPLE_S16LE. It is exposed as a single compile-time switch so
+// the byte order can be revisited per-model without touching the companding or
+// framing logic below.
+inline constexpr bool kPcm16BigEndian = false;
 
 // -----------------------------------------------------------------------------
 // G.711 µ-law constants (public ITU-T standard values)

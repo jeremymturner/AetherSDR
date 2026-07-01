@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QByteArray>
+#include <QHash>
 #include <QHostAddress>
 #include <QObject>
 #include <QString>
@@ -15,57 +16,60 @@ namespace AetherSDR {
 // Session/transport layer for network-capable Icom radios (IC-705 over Wi-Fi;
 // IC-9700 / IC-7610 / IC-7300MK2 over Ethernet).  Issue #3 / epic #1.
 //
-// Icom's IP-remote stack uses THREE UDP ports, each a semi-independent stream
-// sharing a common session/framing layer:
-//   * 50001 Control  — session establishment, are-you-there / are-you-ready,
-//                       periodic idle keepalive, sequence + retransmit, and
-//                       token-based login (username/password).
-//   * 50002 CI-V     — carries standard CI-V frames (parsed by IcomCiv codec).
-//   * 50003 Audio    — negotiated mu-law / PCM RX (and later TX) audio.
+// Icom's IP-remote stack uses THREE UDP ports, each an INDEPENDENT session with
+// its own handshake, session ids and sequence counters, sharing only the login
+// the control stream performs:
+//   * 50001 Control  — handshake, login (obfuscated username/password), token
+//                      auth, conninfo, keepalive, ping, retransmit.
+//   * 50002 CI-V     — standard CI-V frames wrapped in a 0xC1 stream envelope.
+//   * 50003 Audio    — RX (and later TX) audio, 48 kHz S16LE mono for IC-705.
 //
-// CLEAN-ROOM POSTURE (Constitution Principle IV — read-and-reimplement):
-//   The port numbers, the fact that transport is UDP, and that 50002 carries
-//   CI-V are PUBLIC (Icom manuals / CI-V reference).  The session-wrapper byte
-//   layout (packet opcodes, sequence/retransmit fields, login token exchange)
-//   is derived from clean sources: first-party packet captures AND reading
-//   wfview's open-source code (a permitted open-source reference under
-//   Principle IV) — then implemented here as AetherSDR's OWN code.  Do NOT copy
-//   wfview verbatim, and never touch the proprietary RS-BA1 binary.  See
-//   docs/icom-cleanroom-design.md.  Every seam below is marked
-//   `TODO(cleanroom #10)`; the class ships the framework (sockets, state
-//   machine, keepalive, teardown) with those encoders/decoders as the work left.
+// PROVENANCE (Constitution Principle IV — read-and-reimplement): the packet
+// layouts, login/token flow and stream framing were derived from the DOCUMENTED
+// open-source references (kappanhang's Go implementation with verbatim real-
+// radio captures, and wfview's packettypes.h), then re-expressed here as
+// AetherSDR's own code.  The proprietary RS-BA1 binary was never consulted.
+// The username/password obfuscation table is hardware-confirmed (see
+// IcomSession::passcode); the rest is best-effort against the references and is
+// verified end-to-end against a real radio (build-and-iterate).
 //
-// Designed to live on a worker thread like RadioConnection (#502): construct,
-// moveToThread(), call init(), then drive via queued slot calls.
+// Threading: lives on a worker thread like RadioConnection (#502): construct,
+// moveToThread(), then drive via queued slot calls.
 class IcomUdpTransport : public QObject {
     Q_OBJECT
 
 public:
     enum class State {
         Disconnected,
-        Connecting,      // control-port handshake in progress
-        Authenticating,  // login token exchange
-        Connected,       // control session live; CI-V + audio may open
+        Connecting,      // control-port handshake / login in progress
+        Authenticating,  // token exchange
+        Connected,       // control + serial (+ audio) live
         Error
     };
     Q_ENUM(State)
 
-    // Icom's fixed default UDP ports.  Per Icom docs these are part of the
-    // protocol and must not be remapped.
+    // Icom's fixed default UDP ports.
     static constexpr quint16 kControlPort = 50001;
     static constexpr quint16 kCivPort     = 50002;
     static constexpr quint16 kAudioPort   = 50003;
 
-    // Idle keepalive cadence.  PROVISIONAL — confirm against capture
-    // (TODO(cleanroom #10)); losing keepalive makes the radio drop the session.
-    static constexpr int kKeepaliveIntervalMs = 100;
-    static constexpr int kAreYouThereMs       = 500;
+    // Timing (milliseconds), matching the references.
+    static constexpr int kIdleIntervalMs   = 100;   // pkt0 keepalive
+    static constexpr int kPingIntervalMs    = 3000;  // pkt7 ping
+    static constexpr int kReauthIntervalMs  = 60000; // token renewal
+    static constexpr int kConnectTimeoutMs  = 8000;  // give up if no login
+
+    // RX audio format the IC-705 delivers for the codec we request (0x04).
+    static constexpr int kAudioSampleRate = 48000;   // S16LE, mono
 
     struct ConnectParams {
         QHostAddress address;
         quint16 controlPort{kControlPort};
         QString username;
         QString password;
+        // Plain-text radio/device name sent in the serial+audio request.  The
+        // radio echoes it back and it labels our session; defaults to IC-705.
+        QString deviceName{QStringLiteral("IC-705")};
     };
 
     explicit IcomUdpTransport(QObject* parent = nullptr);
@@ -80,10 +84,10 @@ public slots:
     void disconnectFromRadio();
 
     // Send a fully-framed CI-V frame (FE FE .. FD, built by IcomCiv) to the
-    // radio.  Wraps it in the 50002 session envelope and transmits.
+    // radio over the 50002 serial stream.
     void sendCivFrame(const QByteArray& civFrame);
 
-    // Send an encoded audio payload (mu-law/PCM) on the 50003 stream (TX path).
+    // Send RX/TX audio payload on the 50003 stream (TX path — RX-first stub).
     void sendAudioPayload(const QByteArray& payload);
 
 signals:
@@ -92,78 +96,109 @@ signals:
     void disconnected();
     void errorOccurred(const QString& message);
 
-    // A CI-V frame (FE FE .. FD) recovered from the 50002 session envelope,
-    // ready for the IcomCiv codec.
+    // A CI-V frame (FE FE .. FD) recovered from the 50002 stream envelope.
     void civFrameReceived(const QByteArray& civFrame);
 
-    // A raw audio payload recovered from the 50003 session envelope, ready for
-    // the IcomAudio codec (still in the radio's negotiated format).
+    // A raw RX audio payload (48 kHz S16LE mono for IC-705) from 50003.
     void audioPayloadReceived(const QByteArray& payload);
 
-    // Sequence-gap / retransmit telemetry for the diagnostics panel, mirroring
-    // KiwiSdrClient's sequence-gap counters.
+    // Sequence-gap telemetry for diagnostics.
     void sequenceGap(quint16 port, quint64 totalGaps);
 
 private slots:
     void onControlReadyRead();
     void onCivReadyRead();
     void onAudioReadyRead();
-    void onKeepaliveTick();
 
 private:
+    // Which of the three UDP streams a datagram / action belongs to.
+    enum class StreamId { Control, Civ, Audio };
+
+    // Per-stream session state.  Each stream has its own session ids, tracked
+    // send-sequence, keepalive/ping timers, and a small retransmit buffer.
+    struct Stream {
+        QUdpSocket* sock{nullptr};
+        quint16     port{0};
+        quint32     localSID{0};
+        quint32     remoteSID{0};
+        bool        gotRemoteSID{false};
+        bool        ready{false};        // pkt3/4/6 handshake complete
+
+        quint16     txSeq{1};            // pkt0 tracked send-sequence
+        quint16     pingSeq{0};          // pkt7 send-sequence
+        quint16     pingInnerSeq{0x8304};
+        quint16     streamSeq{0};        // serial/audio inner sequence
+
+        QTimer*     idleTimer{nullptr};  // pkt0 keepalive
+        QTimer*     pingTimer{nullptr};  // pkt7 ping
+
+        QHash<quint16, QByteArray> txBuf; // seq -> last sent tracked packet
+        int         lastRxSeq{-1};        // for gap detection
+        quint64     seqGaps{0};
+    };
+
+    Stream& streamFor(StreamId id);
+    Stream* streamForSocket(QObject* sock);
+
+    // --- Handshake (shared by all three streams) ------------------------
+    void startStreamHandshake(StreamId id);
+    void onStreamReady(StreamId id);            // pkt3/4/6 done
+    void handleControlDatagram(StreamId id, const QByteArray& dg);
+
+    // --- Low-level send helpers -----------------------------------------
+    void rawSend(StreamId id, const QByteArray& dg);           // untracked
+    void sendTracked(StreamId id, QByteArray dg);              // stamps txSeq
+    void sendAreYouThere(StreamId id);
+    void sendAreYouReady(StreamId id);
+    void sendDisconnect(StreamId id);
+    void sendIdle(StreamId id);
+    void sendPingRequest(StreamId id);
+    void sendPingReply(StreamId id, const QByteArray& reqReplyId, quint16 seq);
+    void handleRetransmit(StreamId id, const QByteArray& dg);
+
+    // --- Control-stream login / auth / conninfo -------------------------
+    void sendLogin();
+    void sendAuth(quint8 magic);
+    void sendRequestSerialAndAudio();
+    void maybeRequestSerialAndAudio();
+    void openSerialAndAudioStreams();
+
+    // --- Serial (CI-V) + audio framing ----------------------------------
+    void sendSerialOpenClose(bool close);
+    void handleSerialDatagram(const QByteArray& dg);
+    void handleAudioDatagram(const QByteArray& dg);
+
     void setState(State s);
-    void teardownSockets();
+    void teardown();
+    void fail(const QString& why);
 
-    // --- Session codec seams --------------------------------------------
-    // These four are the ONLY places the wire format is touched; they now
-    // delegate to IcomSessionCodec (the pure, testable framing codec derived
-    // clean-room from open-source references — see IcomSessionCodec.h).  The
-    // signatures are preserved from the original scaffolding so the rest of
-    // the class is unchanged.
-    QByteArray buildControlPacket(quint8 opcode, const QByteArray& body);
-    void handleControlDatagram(const QByteArray& datagram);
-    QByteArray wrapStreamPayload(quint16 port, const QByteArray& payload);
-    QByteArray unwrapStreamPayload(quint16 port, const QByteArray& datagram,
-                                   bool* ok);
-
-    // Emit our next control-port sequence number (post-increments m_txSeq).
-    quint16 nextControlSeq();
-    // Send the are-you-there opener (repeated until "I am here" arrives).
-    void sendAreYouThere();
-    // React to a decoded stream datagram: validate its sequence against the
-    // per-port counter, emit a sequenceGap on loss, and return the payload.
-    QByteArray trackStreamSequence(quint16 port, quint16 seq,
-                                   const QByteArray& payload);
+    // Build the shared 16-byte header (len/type/seq little-endian, session ids
+    // big-endian) for a stream, with a body appended.  seq is left at 0 for
+    // tracked packets (stamped later) or set for handshake packets.
+    QByteArray header(StreamId id, quint32 totalLen, quint16 type, quint16 seq);
 
     State m_state{State::Disconnected};
     ConnectParams m_params;
 
-    QUdpSocket* m_controlSocket{nullptr};
-    QUdpSocket* m_civSocket{nullptr};
-    QUdpSocket* m_audioSocket{nullptr};
-    QTimer* m_keepalive{nullptr};
+    Stream m_control;
+    Stream m_civ;
+    Stream m_audio;
 
-    // Session identifiers negotiated during the control handshake.  m_localId
-    // is a random 32-bit id we generate; m_remoteId is latched from the
-    // radio's "I am here" reply.
-    quint32 m_localId{0};
-    quint32 m_remoteId{0};
-    quint16 m_txSeq{0};        // our control-port sequence counter
+    // Control-stream auth bookkeeping.
+    quint16 m_authInnerSeq{0};
+    quint8  m_authId[6]{};
+    bool    m_gotAuthId{false};
+    quint8  m_a8ReplyId[16]{};
+    bool    m_gotA8ReplyId{false};
+    bool    m_authOk{false};
+    bool    m_streamsRequested{false};
+    bool    m_loginResponseSeen{false};
 
-    // Per-stream outbound sub-sequence counters (big-endian on the wire).
-    quint16 m_civStreamSeq{0};
-    quint16 m_audioStreamSeq{0};
+    QTimer* m_reauthTimer{nullptr};
+    QTimer* m_connectTimeout{nullptr};
 
-    // Last inbound stream sequence seen per port, for gap detection.  -1 means
-    // "no packet yet" so the first datagram is never counted as a gap.
-    int m_civRxSeq{-1};
-    int m_audioRxSeq{-1};
-
-    // Are-you-there retry bookkeeping while in Connecting.
-    QTimer* m_areYouThereTimer{nullptr};
-
-    quint64 m_civSeqGaps{0};
-    quint64 m_audioSeqGaps{0};
+    // CI-V frames pushed before the serial stream finished its handshake.
+    QList<QByteArray> m_pendingCiv;
 };
 
 } // namespace AetherSDR

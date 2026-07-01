@@ -227,6 +227,11 @@ void IcomBackend::connectToRadio(const RadioInfo& info)
     params.controlPort = m_profile.controlPort;
     params.username = m_profile.username;
     params.password = SecretStore::instance().secret(m_profile.id);
+    // The device name is echoed by the radio in the serial+audio request; use
+    // the model key ("IC-705", "IC-9700", …) so it matches the target radio.
+    if (!m_profile.modelKey.trimmed().isEmpty()) {
+        params.deviceName = m_profile.modelKey.trimmed();
+    }
 
     if (params.address.isNull()) {
         emit errorOccurred(QStringLiteral("Icom connect: no address"));

@@ -35,6 +35,19 @@
 
 namespace AetherSDR::IcomSession {
 
+// --- Credential obfuscation ------------------------------------------------
+// The Icom LAN login scrambles the username and password with a fixed
+// substitution table before putting them on the wire.  This table + algorithm
+// were taken from the documented open-source references (kappanhang's
+// passcode.go and wfview), which carry verbatim captures confirming them
+// against real radios — so, unlike the rest of this file, these ARE
+// hardware-confirmed.  Returns a 16-byte buffer: each of the first up-to-16
+// input characters is substituted, the remainder zero-padded.
+//
+//   p = char + index; if (p > 126) p = 32 + (p % 127); out = table[p]
+//
+QByteArray passcode(const QString& text);
+
 // --- Wire geometry ---------------------------------------------------------
 // The Icom control/stream packets share a fixed 16-byte little-endian header:
 //   offset 0x00  quint32 len      total datagram length (header + body)
