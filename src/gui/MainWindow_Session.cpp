@@ -54,6 +54,7 @@
 #include "core/AudioEngine.h"      // wireIcomStreams: feedAudioData (#2)
 #include "core/IcomBackend.h"      // wireIcomStreams: Icom backend signals (#2)
 #include "core/QsoRecorder.h"      // wireIcomStreams: feedRxAudio (#2)
+#include "IcomConnectDialog.h"     // toggleIcomConnectDialog (#5)
 #include "TitleBar.h"
 #include "core/AppSettings.h"
 #include "core/LogManager.h"
@@ -1578,6 +1579,24 @@ void MainWindow::wireDaxIq()
     });
 #endif
 
+}
+
+void MainWindow::toggleIcomConnectDialog()
+{
+    if (m_icomConnectDialog == nullptr) {
+        m_icomConnectDialog = new IcomConnectDialog(this);
+        connect(m_icomConnectDialog, &IcomConnectDialog::connectRequested,
+                this, [this](const IcomConnectionProfile& profile) {
+            m_radioModel.connectToIcom(profile);
+        });
+    }
+    if (m_icomConnectDialog->isVisible()) {
+        m_icomConnectDialog->hide();
+        return;
+    }
+    m_icomConnectDialog->show();
+    m_icomConnectDialog->raise();
+    m_icomConnectDialog->activateWindow();
 }
 
 // Route an Icom backend's format-agnostic RX media to the same UI sinks the

@@ -104,6 +104,7 @@ class WhatsNewDialog;
 class ProfileManagerDialog;
 class ProfileImportExportDialog;
 class RadioSetupDialog;
+class IcomConnectDialog;
 class NetworkDiagnosticsDialog;
 class AgcCalibrationDialog;
 class MemoryDialog;
@@ -1054,6 +1055,9 @@ private:
     bool m_panadapterUiPreparedForShutdown{false};
     void preparePanadapterUiForShutdown();
     void toggleConnectionDialog();
+    // Open the Icom connect dialog (#5); lazy-constructed, non-modal.
+    void toggleIcomConnectDialog();
+    IcomConnectDialog* m_icomConnectDialog{nullptr};
     bool m_useSystemClock{true};     // true when no GPS installed
     bool m_paTempUseFahrenheit{true};
     bool m_hasPaTempTelemetry{false};
