@@ -51,6 +51,9 @@
 #include "SMeterWidget.h"
 #include "core/ThemeManager.h"
 #include "SpectrumWidget.h"
+#include "core/AudioEngine.h"      // wireIcomStreams: feedAudioData (#2)
+#include "core/IcomBackend.h"      // wireIcomStreams: Icom backend signals (#2)
+#include "core/QsoRecorder.h"      // wireIcomStreams: feedRxAudio (#2)
 #include "TitleBar.h"
 #include "core/AppSettings.h"
 #include "core/LogManager.h"
@@ -952,6 +955,11 @@ void MainWindow::wirePanLifecycle()
     connect(m_radioModel.panStream(), &PanadapterStream::spectrumReady,
             this, &MainWindow::onSpectrumReadyForSHistory);
 
+    // Icom sessions surface scope/waterfall/audio from IcomBackend (not the
+    // VITA-49 panStream); wire them to the same sinks once the backend exists.
+    connect(&m_radioModel, &RadioModel::icomBackendReady,
+            this, &MainWindow::wireIcomStreams);
+
     connect(m_radioModel.panStream(), &PanadapterStream::waterfallRowReady,
             this, [this, profileLoadFrameReady](quint32 streamId,
                                                 const QVector<float>& bins,
@@ -1570,6 +1578,65 @@ void MainWindow::wireDaxIq()
     });
 #endif
 
+}
+
+// Route an Icom backend's format-agnostic RX media to the same UI sinks the
+// Flex panStream() feeds. Called once via RadioModel::icomBackendReady (#2).
+// The signal signatures match PanadapterStream's deliberately, so this is a
+// compact mirror of the Flex wiring above (minus the Flex-only profile-load
+// gating and XVTR tile handling, which don't apply to Icom).
+void MainWindow::wireIcomStreams(IcomBackend* backend)
+{
+    if (backend == nullptr) {
+        return;
+    }
+
+    // RX audio: IcomBackend emits float32 mono PCM, the same shape AudioEngine
+    // already consumes from the Flex narrow-audio path.
+    connect(backend, &IcomBackend::audioDataReady,
+            m_audio, &AudioEngine::feedAudioData);
+    connect(backend, &IcomBackend::audioDataReady,
+            m_qsoRecorder, &QsoRecorder::feedRxAudio);
+
+    // Scope FFT → the panadapter matching the stream, or the active spectrum
+    // when the Icom session has no radio-owned pan (the common single-scope
+    // case, since Icom emits no "display pan" status).
+    connect(backend, &IcomBackend::spectrumReady, this,
+            [this](quint32 streamId, const QVector<float>& bins, qint64) {
+        if (m_shuttingDown || !m_panStack) {
+            return;
+        }
+        for (auto* pan : m_radioModel.panadapters()) {
+            if (pan->panStreamId() == streamId) {
+                if (auto* sw = m_panStack->spectrum(pan->panId())) {
+                    sw->updateSpectrum(bins);
+                }
+                return;
+            }
+        }
+        if (auto* sw = spectrum()) {
+            sw->updateSpectrum(bins);
+        }
+    });
+
+    connect(backend, &IcomBackend::waterfallRowReady, this,
+            [this](quint32 streamId, const QVector<float>& bins,
+                   double low, double high, quint32 tc, qint64) {
+        if (m_shuttingDown || !m_panStack) {
+            return;
+        }
+        for (auto* pan : m_radioModel.panadapters()) {
+            if (pan->wfStreamId() == streamId) {
+                if (auto* sw = m_panStack->spectrum(pan->panId())) {
+                    sw->updateWaterfallRow(bins, low, high, tc);
+                }
+                return;
+            }
+        }
+        if (auto* sw = spectrum()) {
+            sw->updateWaterfallRow(bins, low, high, tc);
+        }
+    });
 }
 
 } // namespace AetherSDR

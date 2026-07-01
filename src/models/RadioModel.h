@@ -4,6 +4,7 @@
 #include "core/RadioConnection.h"
 #include "core/WanConnection.h"
 #include "core/PanadapterStream.h"
+#include "core/IcomBackend.h"   // RadioType, IcomBackend, IcomConnectionProfile (#2)
 #include "core/SleepInhibitor.h"
 #include "core/DaxTxPolicy.h"
 #include <QThread>
@@ -60,6 +61,11 @@ public:
     // Access the underlying connection and panadapter stream
     RadioConnection*  connection()  { return m_connection; }
     PanadapterStream* panStream()   { return m_panStream; }
+    // Radio protocol backend in use, and the Icom backend when radioType()
+    // == Icom (nullptr on the Flex path).  MainWindow wires the Icom backend's
+    // scope/audio signals to the same sinks as panStream() (#2).
+    RadioType         radioType()   const { return m_radioType; }
+    IcomBackend*      icomBackend() { return m_icomBackend; }
     // Sub-models owned by RadioModel (main thread). (#502)
     MeterModel&       meterModel()       { return m_meterModel; }
     TunerModel&       tunerModel()       { return m_tunerModel; }
@@ -320,6 +326,10 @@ public:
 
     // High-level actions
     void connectToRadio(const RadioInfo& info);
+    // Connect to a network-capable Icom radio via the RadioBackend seam (#2).
+    // Additive to the Flex path: sets radioType() to Icom and drives an
+    // IcomBackend on the connection thread; the Flex m_connection is left idle.
+    void connectToIcom(const IcomConnectionProfile& profile);
     void connectViaWan(WanConnection* wan, const QString& publicIp, quint16 udpPort);
     void setPendingClientDisconnects(const QList<quint32>& handles);
     bool disconnectClient(quint32 handle);
@@ -391,6 +401,10 @@ public:
 signals:
     void infoChanged();
     void connectionStateChanged(bool connected);
+    // Emitted once when the Icom backend is created (connectToIcom). MainWindow
+    // wires the backend's scope/waterfall/audio signals to the same sinks as
+    // panStream() (#2).
+    void icomBackendReady(IcomBackend* backend);
     // Emitted whenever the local CW key transitions on/off — funnel for
     // serial CTS/DSR, MIDI Gate, TCI key, CWX, and HID encoder sources.
     // Wired to AudioEngine's CwSidetoneGenerator for low-latency local
@@ -549,6 +563,13 @@ public:
 
 private slots:
     void onStatusReceived(const QString& object, const QMap<QString, QString>& kvs);
+    // Icom backend handlers (#2). onIcomStatus normalizes CI-V-derived status
+    // into the same slice path the Flex status parser uses; the connect/
+    // disconnect handlers are dedicated so the Flex-specific handshake in
+    // onConnected() never runs for an Icom session.
+    void onIcomStatus(const QString& object, const QMap<QString, QString>& kvs);
+    void onIcomConnected();
+    void onIcomDisconnected();
     void onMessageReceived(const ParsedMessage& msg);
     void onConnected();
     void onDisconnected();
@@ -630,6 +651,20 @@ private:
 
     RadioConnection*  m_connection{nullptr};
     QThread*          m_connThread{nullptr};
+
+    // --- Icom backend seam (#2) -----------------------------------------
+    // Additive: on the Flex path m_radioType stays Flex and m_icomBackend is
+    // null. connectToIcom() flips to Icom and drives m_icomBackend (which lives
+    // on m_connThread alongside the idle m_connection).
+    RadioType         m_radioType{RadioType::Flex};
+    IcomBackend*      m_icomBackend{nullptr};
+    // Accumulates the synthesized "slice 0" status for the Icom VFO so the
+    // slice is created once RF_frequency has arrived (handleSliceStatus needs
+    // in_use=1 + RF_frequency together).
+    QMap<QString, QString> m_icomSliceKvs;
+    // Translate the handful of SmartSDR slice/filter commands the UI emits into
+    // IcomBackend control intents (the Flex-text chokepoint for the Icom path).
+    void routeIcomCommand(const QString& cmd);
     // Sequence counter and callback map — owned by RadioModel on main thread.
     // RadioConnection no longer manages callbacks. (#502)
     std::atomic<quint32> m_seqCounter{1};

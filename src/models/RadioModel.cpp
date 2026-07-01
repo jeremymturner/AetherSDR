@@ -636,7 +636,140 @@ RadioModel::~RadioModel()
 
 bool RadioModel::isConnected() const
 {
+    if (m_radioType == RadioType::Icom) {
+        return m_icomBackend && m_icomBackend->isConnected();
+    }
     return m_connection->isConnected() || (m_wanConn && m_wanConn->isConnected());
+}
+
+void RadioModel::connectToIcom(const IcomConnectionProfile& profile)
+{
+    m_radioType = RadioType::Icom;
+    m_intentionalDisconnect = false;
+    m_icomSliceKvs.clear();
+
+    if (m_icomBackend == nullptr) {
+        // No parent — moved onto the existing connection thread so its sockets
+        // live off the GUI thread, exactly like RadioConnection (#502).
+        m_icomBackend = new IcomBackend;
+        m_icomBackend->moveToThread(m_connThread);
+        // Signals auto-queue from the worker thread back to the main thread.
+        connect(m_icomBackend, &IcomBackend::statusReceived,
+                this, &RadioModel::onIcomStatus);
+        connect(m_icomBackend, &IcomBackend::connected,
+                this, &RadioModel::onIcomConnected);
+        connect(m_icomBackend, &IcomBackend::disconnected,
+                this, &RadioModel::onIcomDisconnected);
+        connect(m_icomBackend, &IcomBackend::errorOccurred,
+                this, &RadioModel::onConnectionError);
+        // Let MainWindow wire scope/waterfall/audio to the same sinks as
+        // panStream(). Emitted once (guarded by the null check) so reconnects
+        // don't double-wire.
+        emit icomBackendReady(m_icomBackend);
+    }
+
+    qCInfo(lcIcom).noquote()
+        << QStringLiteral("RadioModel: connecting to Icom %1 (%2)")
+               .arg(profile.displayName, profile.modelKey);
+
+    // Set the profile and open the session on the worker thread so socket
+    // creation and the CI-V/UDP handshake never touch the GUI thread.
+    IcomBackend* be = m_icomBackend;
+    QMetaObject::invokeMethod(be, [be, profile]() {
+        be->setConnectionProfile(profile);
+        be->connectToRadio(RadioInfo{});
+    }, Qt::QueuedConnection);
+}
+
+void RadioModel::onIcomConnected()
+{
+    qCInfo(lcIcom) << "RadioModel: Icom connected";
+    m_reconnectTimer.stop();
+    emit connectionStateChanged(true);
+}
+
+void RadioModel::onIcomDisconnected()
+{
+    qCInfo(lcIcom) << "RadioModel: Icom disconnected";
+    emit connectionStateChanged(false);
+}
+
+void RadioModel::onIcomStatus(const QString& object,
+                              const QMap<QString, QString>& kvs)
+{
+    emit statusReceived(object, kvs);  // relay to listeners (memory dialog, etc.)
+
+    // The Icom backend normalizes CI-V freq/mode into "slice <n>" objects using
+    // the same keys the Flex parser understands (RF_frequency, mode). Merge into
+    // a synthesized full status so handleSliceStatus() creates/updates the VFO.
+    if (!object.startsWith(QStringLiteral("slice "))) {
+        return;
+    }
+    bool ok = false;
+    const int id = object.mid(6).trimmed().toInt(&ok);
+    if (!ok) {
+        return;
+    }
+    for (auto it = kvs.constBegin(); it != kvs.constEnd(); ++it) {
+        m_icomSliceKvs.insert(it.key(), it.value());
+    }
+    m_icomSliceKvs.insert(QStringLiteral("in_use"), QStringLiteral("1"));
+    handleSliceStatus(id, m_icomSliceKvs, /*removed=*/false);
+}
+
+void RadioModel::routeIcomCommand(const QString& cmd)
+{
+    if (m_icomBackend == nullptr) {
+        return;
+    }
+    IcomBackend* be = m_icomBackend;
+    const QStringList parts = cmd.split(QLatin1Char(' '), Qt::SkipEmptyParts);
+
+    auto invokeFreq = [be](int rx, double mhz) {
+        const quint64 hz = static_cast<quint64>(qRound64(mhz * 1.0e6));
+        QMetaObject::invokeMethod(be, [be, rx, hz]() { be->setFrequency(rx, hz); },
+                                  Qt::QueuedConnection);
+    };
+
+    // "slice tune <id> <MHz> [autopan=..]"
+    if (cmd.startsWith(QStringLiteral("slice tune ")) && parts.size() >= 4) {
+        invokeFreq(parts[2].toInt(), parts[3].toDouble());
+        return;
+    }
+    // "slice m <MHz> [pan=..]" — click-to-tune (targets the active VFO)
+    if (cmd.startsWith(QStringLiteral("slice m ")) && parts.size() >= 3) {
+        invokeFreq(0, parts[2].toDouble());
+        return;
+    }
+    // "slice set <id> mode=<MODE>"
+    if (cmd.startsWith(QStringLiteral("slice set ")) && cmd.contains(QStringLiteral("mode="))) {
+        const int rx = parts.size() >= 3 ? parts[2].toInt() : 0;
+        QString mode;
+        for (const QString& p : parts) {
+            if (p.startsWith(QStringLiteral("mode="))) {
+                mode = p.mid(5);
+                break;
+            }
+        }
+        if (!mode.isEmpty()) {
+            QMetaObject::invokeMethod(be, [be, rx, mode]() { be->setMode(rx, mode); },
+                                      Qt::QueuedConnection);
+        }
+        return;
+    }
+    // "filt <id> <lowHz> <highHz>"
+    if (cmd.startsWith(QStringLiteral("filt ")) && parts.size() >= 4) {
+        const int rx = parts[1].toInt();
+        const int lo = parts[2].toInt();
+        const int hi = parts[3].toInt();
+        QMetaObject::invokeMethod(be, [be, rx, lo, hi]() {
+            be->setFilterBandwidth(rx, lo, hi);
+        }, Qt::QueuedConnection);
+        return;
+    }
+
+    qCDebug(lcIcom).noquote()
+        << "RadioModel: Icom command ignored (no intent mapping):" << cmd;
 }
 
 int RadioModel::maxSlicesForModel(const QString& model)
@@ -1119,6 +1252,7 @@ void RadioModel::emitInterlockNotification(const QString& message,
 
 void RadioModel::connectToRadio(const RadioInfo& info)
 {
+    m_radioType = RadioType::Flex;  // Flex path (Icom uses connectToIcom)
     m_wanConn = nullptr;  // LAN mode
     m_lastInfo = info;
     m_intentionalDisconnect = false;
@@ -1353,6 +1487,18 @@ void RadioModel::disconnectFromRadio()
     m_intentionalDisconnect = true;
     m_rebootInProgress = false;
     m_reconnectTimer.stop();
+
+    // Icom path: tear down the backend on its thread; the Flex teardown below
+    // does not apply.
+    if (m_radioType == RadioType::Icom) {
+        if (m_icomBackend != nullptr) {
+            IcomBackend* be = m_icomBackend;
+            QMetaObject::invokeMethod(be, [be]() { be->disconnectFromRadio(); },
+                                      Qt::QueuedConnection);
+        }
+        emit connectionStateChanged(false);
+        return;
+    }
     m_pingTimer.stop();
     if (m_wanConn) {
         WanConnection* wan = m_wanConn;
@@ -3834,6 +3980,13 @@ void RadioModel::logRemoteAudioRxSummary(const QString& reason) const
 
 quint32 RadioModel::sendCmd(const QString& command, ResponseCallback cb)
 {
+    // Icom path: the UI/slice models still emit SmartSDR text; translate the
+    // handful we support into IcomBackend intents and skip the Flex machinery.
+    if (m_radioType == RadioType::Icom) {
+        routeIcomCommand(command);
+        return 0;
+    }
+
     auto& perf = PerfTelemetry::instance();
     if (perf.enabled()
         && command.startsWith(QStringLiteral("display pan set "))

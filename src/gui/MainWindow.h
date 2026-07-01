@@ -334,6 +334,9 @@ private:
     void wireExternalControllers(); // MainWindow_Controllers.cpp
     void wireKiwiSdr();             // MainWindow_KiwiSdr.cpp
     void refreshKiwiSdrAppletReceivers();
+    // Route an Icom backend's scope/waterfall/audio to the same sinks as the
+    // Flex panStream() (#2). MainWindow_Session.cpp.
+    void wireIcomStreams(IcomBackend* backend);
     void refreshKiwiSdrSlices();
     void refreshKiwiSdrWaterfallAvailability();
     void syncKiwiSdrAppletWaterfallState();
