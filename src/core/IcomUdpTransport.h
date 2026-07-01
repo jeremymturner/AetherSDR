@@ -23,16 +23,17 @@ namespace AetherSDR {
 //   * 50002 CI-V     — carries standard CI-V frames (parsed by IcomCiv codec).
 //   * 50003 Audio    — negotiated mu-law / PCM RX (and later TX) audio.
 //
-// CLEAN-ROOM BOUNDARY (Constitution Principle IV):
+// CLEAN-ROOM POSTURE (Constitution Principle IV — read-and-reimplement):
 //   The port numbers, the fact that transport is UDP, and that 50002 carries
-//   CI-V are PUBLIC (Icom manuals / CI-V reference).  The exact session-wrapper
-//   byte layout (packet opcodes, sequence/retransmit fields, the login token
-//   exchange) is NOT public and MUST be derived from first-party packet
-//   captures per docs/icom-cleanroom-design.md — it must NOT be imported from
-//   GPL wfview.  Every such spot below is marked `TODO(cleanroom #10)`.  This
-//   class deliberately ships the framework (sockets, state machine, keepalive,
-//   teardown) with those proprietary encoders/decoders left as clearly-marked
-//   seams to fill in from captures.
+//   CI-V are PUBLIC (Icom manuals / CI-V reference).  The session-wrapper byte
+//   layout (packet opcodes, sequence/retransmit fields, login token exchange)
+//   is derived from clean sources: first-party packet captures AND reading
+//   wfview's open-source code (a permitted open-source reference under
+//   Principle IV) — then implemented here as AetherSDR's OWN code.  Do NOT copy
+//   wfview verbatim, and never touch the proprietary RS-BA1 binary.  See
+//   docs/icom-cleanroom-design.md.  Every seam below is marked
+//   `TODO(cleanroom #10)`; the class ships the framework (sockets, state
+//   machine, keepalive, teardown) with those encoders/decoders as the work left.
 //
 // Designed to live on a worker thread like RadioConnection (#502): construct,
 // moveToThread(), call init(), then drive via queued slot calls.

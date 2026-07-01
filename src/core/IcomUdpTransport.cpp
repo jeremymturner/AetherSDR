@@ -79,7 +79,8 @@ void IcomUdpTransport::connectToRadio(const ConnectParams& params)
 
     // TODO(cleanroom #10): send the real control-port "are you there" opener
     // and drive the handshake state machine from handleControlDatagram().  The
-    // opcode/body encoding must come from a first-party capture, not wfview.
+    // opcode/body encoding is derived from captures and/or wfview's open-source
+    // code, then written as our own (read-and-reimplement; no verbatim copy).
     // Until buildControlPacket() is filled in, the session cannot complete and
     // will remain in Connecting; this is intentional — the scaffolding is here
     // for review, the proprietary encoding is the one remaining seam.
@@ -206,11 +207,13 @@ void IcomUdpTransport::teardownSockets()
 }
 
 // ---------------------------------------------------------------------------
-// Proprietary session codec seams.  These are the ONLY four functions that
-// encode/decode the reverse-engineered wire format.  They are documented
-// no-ops until the format is derived from first-party captures per
-// docs/icom-cleanroom-design.md (issue #10).  DO NOT port these from wfview
-// (GPLv3 clean-room contamination under Constitution Principle IV).
+// Session codec seams.  These are the ONLY four functions that encode/decode
+// the Icom session wire format.  They are documented no-ops until the format is
+// derived from clean sources — first-party captures and/or reading wfview's
+// open-source code (a permitted reference under Principle IV) — and then
+// implemented as our OWN code (read-and-reimplement, no verbatim copy).  See
+// docs/icom-cleanroom-design.md (issue #10).  Never derive from the proprietary
+// RS-BA1 binary.
 // ---------------------------------------------------------------------------
 
 QByteArray IcomUdpTransport::buildControlPacket(quint8 opcode,

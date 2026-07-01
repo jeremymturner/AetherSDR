@@ -6,13 +6,30 @@ gate for GitHub issue **#10** and **blocks merge** of all other Icom work
 (epic **#1**; issues **#3** transport, **#4** CI-V, **#6** audio, **#7**
 scope/waterfall).
 
-This document is itself written to a clean-room standard. It records only
-publicly-documented facts and the *methodology* for deriving everything else
-from first-party packet captures of hardware we own. It deliberately does
-**not** reproduce, transcribe, or paraphrase any protocol detail whose only
-known source is the GPLv3 `wfview` project (its `udphandler` / `udpserver`
-classes in particular) or any RS-BA1 disassembly. Every session/framing detail
-in that category is marked **TO BE DERIVED FROM CAPTURE — do not import**.
+This document is written to a clean-room standard. It records publicly-documented
+facts and the *methodology* for deriving everything else from clean inputs.
+
+**Provenance posture (maintainer decision, 2026-07-01): read-and-reimplement.**
+
+Per AetherSDR Constitution Principle IV, the clean inputs are explicit and
+INCLUDE open-source references. `wfview` is open-source (GPLv3), so reading it is
+clean-room — it is a permitted reference alongside the public Icom CI-V reference
+guides, the radio manuals, and first-party wire captures. Principle IV's
+prohibition targets proprietary binaries: decompiling, disassembling, or
+reverse-engineering RS-BA1 — or transcribing/translating/paraphrasing such
+output — is forbidden regardless of license.
+
+The chosen posture for the Icom protocol work is: READ `wfview` to understand the
+wire format (session handshake, keepalive, sequence/retransmit, login token,
+CI-V/audio UDP framing), then write AetherSDR's OWN implementation. No verbatim
+copying. This keeps the implementation clean-room AND avoids entangling
+AetherSDR's copyright with `wfview`'s — GPLv3→GPLv3 would permit direct attributed
+reuse (preserving `wfview`'s notices + a `THIRD_PARTY_LICENSES` entry, making
+those files a derivative), but we are deliberately NOT doing that, to keep
+provenance simple.
+
+Off-limits: RS-BA1 (proprietary-binary) reverse-engineering; verbatim copying of
+`wfview` code.
 
 ---
 
@@ -35,9 +52,9 @@ carry CI-V, stream receive/transmit audio, and render the spectrum scope over a
 LAN or Wi-Fi link.
 
 This note covers **only** the licensing hazard, the clean-room methodology, the
-capture methodology, and the seed of publicly-known facts. The wire-format
-specification itself is produced *separately*, by the two-room process described
-in §4, and lives in its own independent spec document — not here.
+capture methodology, and the seed of known facts. The wire-format specification
+itself is produced *separately*, by the read-and-reimplement process described in
+§4, and lives in its own document — not here.
 
 Related work:
 
@@ -53,9 +70,9 @@ Related work:
 ## 2. Licensing Hazard
 
 There are two distinct third-party artifacts in this space, and the hazard from
-each is different. It is important to state the hazard **precisely**, because
-the naive framing ("wfview is GPLv3, so we can't use it") is not the actual
-problem here.
+each is different. It is important to state the hazard **precisely**, because the
+naive framing ("wfview is GPLv3, so we can't use it") is **not** the actual
+problem here — reading `wfview` is clean-room under Principle IV.
 
 ### 2.1 AetherSDR's own license
 
@@ -65,34 +82,33 @@ AetherSDR is licensed under the **GNU General Public License v3** (see
 `wfview`: GPLv3 code is, in the abstract, license-compatible with a GPLv3
 project.
 
-So the hazard is **not** "we may not combine with GPLv3." The hazards are the
-two below, and they bind regardless of AetherSDR's own license.
+So the hazard is **not** "we may not combine with GPLv3," and it is **not** "we
+may not read `wfview`." Per Principle IV, reading published open-source code is
+an explicitly clean input. The two genuine hazards are below.
 
-### 2.2 Hazard A — `wfview` (GPLv3): provenance, attribution, and Principle IV
+### 2.2 Hazard A — `wfview` (GPLv3): verbatim copying (a provenance choice)
 
 `wfview` is a mature, community-built Icom IP-remote client released under
 **GPLv3**. Its `udphandler` and `udpserver` classes are the community's most
-complete expression of the session/framing wrapper.
+complete expression of the session/framing wrapper. Because `wfview` is
+open-source, **reading it is clean-room** under Principle IV — it is a permitted
+reference (see §3), and we use it to understand the wire format.
 
-Even though the *licenses* are compatible, importing, porting, translating, or
-closely paraphrasing `wfview` source — including copying its magic constants,
-opcode enumerations, packet-struct field layouts, or retransmit state machine —
-is **forbidden** here, for these reasons:
+What we deliberately avoid is **verbatim copying** — importing, porting, or
+transcribing `wfview` source into our tree as if we wrote it. This is a
+**provenance choice**, not a Principle IV clean-room requirement:
 
-- **Constitution Principle IV** (§8) requires every contribution to be
-  clean-room *from start to finish*, built from the contributor's own design.
-  Code lifted from another project fails that standard on its face, and
-  Principle IV's "contamination travels" rule means anything written by reading
-  such code is also tainted.
-- **Copyright and attribution** remain with `wfview`'s authors. Absorbing their
-  authored code into AetherSDR without carrying its authorship and complying
-  with GPLv3's source/attribution obligations is a copyright problem *even
-  between two GPLv3 projects*. The right way to reuse GPLv3 code is to depend on
-  it as an attributed, separately-licensed component — not to silently
-  transcribe its internals into our tree as if we wrote them.
-- **Clean provenance is the deliverable of issue #10.** The whole point of this
-  gate is that AetherSDR's Icom protocol knowledge is traceable to first-party
-  captures and public docs, not to reading someone else's client.
+- GPLv3→GPLv3 reuse *would be permitted* — we could copy `wfview` code directly
+  if we preserved its authorship notices and added a `THIRD_PARTY_LICENSES`
+  entry, making those files an attributed derivative of `wfview`. The licenses
+  are compatible.
+- We choose **not** to do that. Writing AetherSDR's own implementation from an
+  understanding of the wire format keeps AetherSDR's copyright unentangled from
+  `wfview`'s and keeps provenance simple: our Icom code is our own authorship,
+  cross-checked against public docs and first-party captures.
+
+So the posture is **read-and-reimplement**: read `wfview` to learn the framing,
+then write our own code. No verbatim copying.
 
 ### 2.3 Hazard B — RS-BA1 (proprietary): reverse-engineering is forbidden
 
@@ -108,53 +124,60 @@ Observing RS-BA1 (or the mobile app) *from the outside* — i.e. capturing the
 packets it exchanges with hardware we own — is a different act and is
 **permitted** (see §5). We watch the wire; we do not open the binary.
 
-### 2.4 History of this protocol (context, not a source)
+### 2.4 History of this protocol (context and a permitted source)
 
 The Icom IP-remote protocol is **undocumented by Icom** at the framing level.
 Its public reverse-engineering lineage is community work (commonly credited to
 the `kappanhag` effort, later carried forward and completed in `wfview`). That
-history is context for *why* the framing is only "known" through GPLv3 code —
-which is exactly why we treat every framing detail as tainted until we
-re-derive it ourselves from capture. The lineage is **not** a permitted source:
-we do not read those repositories to fill in byte layouts.
+open-source lineage is a **permitted reference** — reading it is clean-room —
+though our authoritative cross-check for any specific detail remains first-party
+capture and the public Icom docs. We read the open-source code to understand the
+framing; we do not copy it verbatim.
 
 ### 2.5 Summary: forbidden vs permitted
 
 **Forbidden**
 
-- Copying, porting, translating, or closely paraphrasing any `wfview` source,
-  including `udphandler` / `udpserver`, their magic constants, opcode values,
-  packet field offsets, or retransmit/keepalive state machine.
-- Reading `wfview` (or `kappanhag`, or any port of them) to learn the framing
-  and then writing "our own" version of what we just read.
+- **Verbatim copying** of `wfview` source — importing, porting, or transcribing
+  its `udphandler` / `udpserver` code, magic constants, opcode values, packet
+  field offsets, or retransmit/keepalive state machine into our tree as our own
+  authorship. (License-permitted with attribution, but declined for provenance.)
 - Disassembling/decompiling RS-BA1 or the Icom mobile app, or using any output
   derived from doing so.
 
 **Permitted** (detailed in §3 and §5)
 
+- Reading `wfview` (or `kappanhag`, or other open-source clients) to understand
+  the wire format — open-source references are a clean Principle IV input.
 - Icom's own official public documentation (CI-V reference guides, user
   manuals).
 - Public standards (ITU-T G.711 for µ-law).
 - First-party packet captures of hardware **we own** exchanging traffic with
   Icom's own RS-BA1 / mobile app, observed from the outside.
-- AetherSDR's own original design and implementation built from an independent
-  spec.
+- AetherSDR's own original design and implementation.
 
 ---
 
-## 3. Permitted Public References
+## 3. Permitted References
 
-These are the clean inputs that may seed and cross-check the independent spec.
-Each is either published by Icom, a public standard, or a first-party capture.
+These are the clean inputs that may seed and cross-check the design. Each is
+published by Icom, a public standard, an open-source reference, or a first-party
+capture — all clean Principle IV inputs.
 
 | Reference | What it legitimately provides | What it does **not** provide |
 |---|---|---|
+| **`wfview`** source (GPLv3, open-source) | An open-source reference for the session/framing wrapper — handshake, keepalive, sequence/retransmit, login token, CI-V/audio UDP framing. Read to *understand*; reimplement in our own words | A source to copy verbatim — no importing/porting/transcribing (§2.2, a provenance choice) |
 | Icom **CI-V Reference Guide** PDFs (per model) | CI-V command/sub-command numbers; the structure of the `0x27` spectrum-scope waveform data command | The *UDP framing* that carries CI-V — CI-V guides describe the serial/CI-V command set, not the network wrapper |
 | Icom **user / instruction manuals** (per model) | The three UDP **port numbers** (see §6); Network-User / KNS remote-login setup steps and terminology | Packet layouts, sequence-number schemes, handshake opcodes |
 | **ITU-T G.711** | µ-law companding definition for the audio codec toward hardware | Icom's audio-session negotiation |
-| **First-party pcaps** (hardware we own) | Ground truth for everything else — the actual bytes on the wire | (this is the primary derivation source, see §5) |
+| **First-party pcaps** (hardware we own) | Ground truth for everything else — the actual bytes on the wire, and the authoritative cross-check for any framing detail | (see §5) |
 
 Notes on scope of each reference:
+
+- `wfview` is open-source (GPLv3); reading it is clean-room under Principle IV.
+  We read it to understand the wire format and then write our own
+  implementation. The one thing we do not do is copy it verbatim (§2.2). Where a
+  specific byte layout matters, we confirm it against a first-party capture.
 
 - The CI-V guides are published by Icom and describe the **CI-V command layer**
   only. They are safe for command numbers and for the `0x27` scope data-frame
@@ -169,37 +192,42 @@ Notes on scope of each reference:
 
 ---
 
-## 4. Clean-Room Methodology (Two-Room Discipline)
+## 4. Clean-Room Methodology (Read-and-Reimplement)
 
-Issue #10 mandates a **two-room** separation between deriving the protocol and
-implementing it. This is the standard clean-room firewall.
+Issue #10 mandates a **read-and-reimplement** discipline: we may read the clean
+inputs — including `wfview`'s open-source code — to *understand* the protocol,
+and then we write AetherSDR's own implementation. The one bright line is
+verbatim copying: no `wfview` source is imported/ported/transcribed into our
+tree (§2.2), and no RS-BA1 reverse-engineering output is used at all (§2.3).
 
-### 4.1 Room A — Spec authors
+### 4.1 Understanding the protocol
 
-Spec authors produce an **independent, written protocol specification** from
-**only** the permitted inputs in §3: first-party captures plus Icom public docs
-plus public standards. They may look at the raw pcaps and at Icom PDFs. They
-**may not** read `wfview` / `kappanhag` source or RS-BA1 disassembly, and they
-may not accept any protocol fact whose only provenance is that code.
+The permitted inputs in §3 — first-party captures, Icom public docs, public
+standards, and `wfview`'s open-source code — are all read to build an
+understanding of the wire format: session handshake, keepalive, sequence and
+retransmit, login token, and CI-V/audio UDP framing. Reading open-source code is
+clean-room; there is no firewall against it.
 
-The spec they write is the sole interface between the rooms. It describes the
-wire format in AetherSDR's own words and structures, derived from observed
-bytes — not copied from any client.
+Where it helps, an **independent written description** of the wire format may be
+produced in AetherSDR's own words and structures. It describes the protocol as
+we understand it — not copied verbatim from any client.
 
-### 4.2 Room B — Implementers
+### 4.2 Implementing AetherSDR's own code
 
-Implementers write AetherSDR code **from the Room A spec only**. They do not
-consult `wfview`, RS-BA1, or captures-plus-reverse-engineering; they consult the
-independent spec. If the spec is silent or ambiguous, the answer is to send the
-question back to Room A for re-derivation from capture — never to "just check
-wfview."
+Implementers write AetherSDR code that is **our own authorship**. Understanding
+may come from any clean input, but the code is written fresh — not by pasting or
+line-by-line transcribing `wfview`. Where a specific byte layout is load-bearing,
+confirm it against a first-party capture so the implementation is grounded in
+observed behavior as well as the open-source reference.
 
 ### 4.3 Provenance logging
 
-Every protocol fact that enters the spec carries a provenance tag, mirroring the
-"Source Provenance" discipline in
+Every non-trivial protocol fact carries a provenance tag, mirroring the "Source
+Provenance" discipline in
 [`docs/kiwisdr-cleanroom-design.md`](kiwisdr-cleanroom-design.md):
 
+- **`[wfview]`** — understood by reading `wfview`'s open-source (GPLv3) code.
+  Clean to record; the fact is reimplemented in our own code, not copied.
 - **`[icom-doc:<model> CI-V guide]`** — from an Icom CI-V reference PDF.
 - **`[icom-manual:<model>]`** — from an Icom user manual.
 - **`[std:G.711]`** — from the ITU-T standard.
@@ -207,26 +235,26 @@ Every protocol fact that enters the spec carries a provenance tag, mirroring the
   committed (redacted) capture.
 - **`[design]`** — AetherSDR's own original engineering decision.
 
-A fact with no clean provenance tag does not enter the spec. There is
-deliberately **no** `[wfview:…]` or `[rs-ba1:…]` provenance tag — those sources
-are not admissible.
+There is deliberately **no** `[rs-ba1:…]` provenance tag — RS-BA1
+reverse-engineering output is not admissible (§2.3).
 
-### 4.4 Handling "tainted" details
+### 4.4 Confirming details against capture
 
-A protocol detail is **tainted** if the only place it is currently "known" is
-GPLv3 `wfview` source or RS-BA1 disassembly. When Room A hits a tainted detail:
+For a session/framing detail understood from `wfview`, the authoritative
+cross-check is a first-party capture:
 
-1. **Re-derive it from first-party capture.** Design a capture that exercises
-   the behavior (e.g. force a retransmit by dropping a packet) and read the
-   answer off our own wire. Tag it `[capture:…]`.
-2. If it genuinely **cannot** be re-derived from capture yet, **leave it
-   unimplemented.** The spec records it as an open item ("unknown — derive from
-   capture"); Room B does not implement around a guess.
-3. **Never** import the tainted value "to unblock." A tainted constant that
-   enters the tree contaminates everything built on it and forces a rip-out.
+1. **Confirm it from first-party capture where it matters.** Design a capture
+   that exercises the behavior (e.g. force a retransmit by dropping a packet) and
+   read the answer off our own wire. Tag it `[capture:…]` alongside `[wfview]`.
+2. If a detail is still uncertain and cannot be confirmed from capture yet,
+   **leave it unimplemented** rather than guess. The design records it as an open
+   item ("unconfirmed — derive from capture").
+3. **Never** copy `wfview` code verbatim "to unblock" — reimplement it in our own
+   words, grounded in the open-source reference and confirmed by capture.
 
-The conservative rule throughout: **it is better to ship "unknown, derive from
-capture" than to guess — or import — a byte layout.**
+The conservative rule throughout: **it is better to ship "unconfirmed, derive
+from capture" than to guess a byte layout — and better to reimplement in our own
+words than to copy verbatim.**
 
 ---
 
@@ -282,13 +310,14 @@ Capture enough to characterize each layer independently:
 
 ---
 
-## 6. What Is Safely Known Publicly Today (Spec Seed)
+## 6. What Is Known Today (Design Seed)
 
-The following is the **only** protocol knowledge that may seed the spec without
-a fresh capture, because each item is documented by Icom, a public standard, or
-is a transport-level fact. Everything about the **session/framing wrapper** is
-explicitly deferred to capture — this document does **not** fill in byte
-layouts.
+The following protocol knowledge seeds the design. The items in §6.1 are
+documented by Icom, a public standard, or are transport-level facts. The
+**session/framing wrapper** in §6.2 is understood from `wfview`'s open-source
+code and confirmed against first-party capture; this document does not itself
+reproduce byte layouts, but they are no longer treated as off-limits — reading
+`wfview` for them is clean-room.
 
 ### 6.1 Known-good seed facts
 
@@ -302,31 +331,33 @@ layouts.
 | Audio codec toward hardware | **µ-law / PCM** (G.711), **not Opus** | `[std:G.711]` + `[icom-manual]` |
 | Spectrum scope delivery | via CI-V command **`0x27`** waveform data | `[icom-doc CI-V guide]` |
 
-### 6.2 Explicitly deferred — **TO BE DERIVED FROM CAPTURE (do not import)**
+### 6.2 Session/framing wrapper — **understand from `wfview`, confirm by capture**
 
 The following are the session/framing-wrapper details. Their byte layouts are
-**not** written here, because their only current "known" source is GPLv3 code.
-Each is an open item for Room A to derive from first-party capture:
+not reproduced in this note, but they are understood by reading `wfview`'s
+open-source code (`udphandler` / `udpserver`) and confirmed against first-party
+capture. Each is to be reimplemented in AetherSDR's own code — never copied
+verbatim:
 
-- Packet header layout of the 50001 control-port session wrapper — **TO BE
-  DERIVED FROM CAPTURE.**
+- Packet header layout of the 50001 control-port session wrapper — **understand
+  from `wfview`, confirm by capture.**
 - **Sequence numbers** — field position, width, endianness, wrap behavior —
-  **TO BE DERIVED FROM CAPTURE.**
+  **understand from `wfview`, confirm by capture.**
 - **Retransmit / missing-packet request** packets — trigger and structure —
-  **TO BE DERIVED FROM CAPTURE.**
+  **understand from `wfview`, confirm by capture.**
 - Session-state opcodes (the "are-you-there" / "are-you-ready" / "ping" /
-  idle-keepalive family) — **TO BE DERIVED FROM CAPTURE.**
+  idle-keepalive family) — **understand from `wfview`, confirm by capture.**
 - **Token / login exchange** — the KNS Network-User authentication handshake and
-  any session token lifecycle — **TO BE DERIVED FROM CAPTURE.**
+  any session token lifecycle — **understand from `wfview`, confirm by capture.**
 - How CI-V frames are *wrapped* inside 50002 datagrams (the framing around the
-  CI-V payload, as opposed to the CI-V payload itself) — **TO BE DERIVED FROM
-  CAPTURE.**
+  CI-V payload, as opposed to the CI-V payload itself) — **understand from
+  `wfview`, confirm by capture.**
 - Audio-session negotiation on 50003 — sample rate, packetization, RX vs TX
-  stream setup and teardown — **TO BE DERIVED FROM CAPTURE.**
+  stream setup and teardown — **understand from `wfview`, confirm by capture.**
 
-Do **not** fill any of these in from `wfview` (`udphandler` / `udpserver` or its
-constants) or from RS-BA1. They are derived from our own captures or they stay
-unimplemented.
+Reading `wfview` (`udphandler` / `udpserver` and its constants) for these is
+clean-room; **do not copy it verbatim**, and do not use RS-BA1
+reverse-engineering output for any of them.
 
 ---
 
@@ -335,24 +366,28 @@ unimplemented.
 Issue #10 blocks merge of #3/#4/#6/#7 until every box below is checked. This is
 the licensing sign-off gate.
 
-- [ ] **Independent protocol spec written** by Room A from first-party captures
-      + Icom public docs + public standards only, with per-fact provenance tags
-      (§4.3) and no `wfview`/RS-BA1-derived material.
+- [ ] **AetherSDR's own implementation written** from an understanding of the
+      clean inputs (first-party captures + Icom public docs + public standards +
+      `wfview`'s open-source code), with per-fact provenance tags (§4.3).
 - [ ] **Capture methodology documented** and first-party captures taken on
       owned hardware, with credentials redacted from anything committed (§5).
 - [ ] **Licensing sign-off recorded before** the transport (#3) or CI-V (#4)
       layers merge — no Icom transport/CI-V code lands ahead of this gate.
-- [ ] **`THIRD_PARTY_LICENSES` reviewed / updated** to reflect the Icom protocol
-      reference situation, in the same "protocol facts consulted, no code
-      incorporated" form already used for FlexLib and KiwiSDR.
-- [ ] **No `wfview`-derived material** — no ported code, no copied magic
-      constants, opcode values, or packet field offsets from `udphandler` /
-      `udpserver`; provenance log contains no `[wfview:…]` entries.
+- [ ] **`THIRD_PARTY_LICENSES` reviewed / updated** and authorship notices
+      accurate — reflecting that `wfview` was read as a reference and
+      reimplemented (no verbatim `wfview` code incorporated), consistent with the
+      form used for FlexLib and KiwiSDR.
+- [ ] **No verbatim `wfview` copying** — no ported code, no transcribed
+      `udphandler` / `udpserver` source, magic constants, opcode values, or
+      packet field offsets copied as-is; understood details are reimplemented in
+      our own code. (Reading `wfview` is permitted; `[wfview]` provenance tags
+      are fine.)
 - [ ] **No RS-BA1-derived material** — no disassembly output or anything
       transcribed/paraphrased from it; provenance log contains no `[rs-ba1:…]`
       entries.
-- [ ] **Every deferred item in §6.2** is either derived from a committed capture
-      or explicitly left unimplemented — none guessed or imported.
+- [ ] **Every session/framing item in §6.2** is reimplemented in our own code,
+      confirmed against a committed capture where load-bearing, or explicitly
+      left unimplemented — none copied verbatim from `wfview`, none guessed.
 
 Until all boxes are checked, the Icom transport, CI-V, audio, and scope PRs stay
 blocked.
@@ -367,25 +402,40 @@ This work is governed by the AetherSDR Constitution
 
 ### 8.1 Principle IV — Every Contribution Is Clean-Room
 
-Principle IV is the controlling principle for issue #10. It requires every
-contribution — code *and the protocol knowledge behind it* — to come from clean
-sources: public documentation, license-compatible open-source references,
-behavior observed on the wire, and the contributor's own design. It bars any
-code that is "decompiled, disassembled, or otherwise reverse-engineered from a
-proprietary binary — or transcribed, translated, or paraphrased from such
-output," and it states that contamination *travels to everything written by
-reading it*.
+Principle IV is the controlling principle for issue #10. Its text
+([`CONSTITUTION.md`](../CONSTITUTION.md) §IV):
+
+> Every contribution is clean-room from start to finish. Its code, and the
+> protocol knowledge behind it, must come from clean sources: public
+> documentation, open-source references, behavior observed on the wire, and the
+> contributor's own design and implementation. Code that is decompiled,
+> disassembled, or otherwise reverse-engineered from a proprietary binary — or
+> transcribed, translated, or paraphrased from such output — must never enter the
+> codebase, however correct or convenient it is.
+
+And, on what counts as clean:
+
+> The clean inputs are explicit. Reading FlexLib's published open-source code
+> (Principle I), capturing and studying the protocol as it actually behaves on
+> the wire, and reading official or public documentation are all clean-room.
+
+The clean inputs are explicit and **include open-source references**. The
+prohibition targets **proprietary binaries** (decompile / disassemble /
+reverse-engineer, or transcribe/translate/paraphrase such output).
 
 Applied here:
 
+- **Open-source references** — reading `wfview` (GPLv3) is an explicitly clean
+  input, on the same footing as reading FlexLib's published code. We read it to
+  understand the wire format (§3, §4).
 - **Observed-on-the-wire** captures of our own hardware are an explicitly clean
-  input — this is the §5 methodology.
+  input — this is the §5 methodology, and our authoritative cross-check.
 - **RS-BA1 disassembly** is the exact prohibited case (proprietary binary) —
   forbidden (§2.3).
-- **`wfview` porting/paraphrasing** fails the "contributor's own design" and
-  "contamination travels" standard, so it is refused at the door even though the
-  licenses are compatible (§2.2). Refusing it costs almost nothing now; undoing
-  contamination later means ripping out everything built on it.
+- **Verbatim `wfview` copying** is *not* a Principle IV violation (the licenses
+  are compatible and reading it is clean), but we decline it as a **provenance
+  choice** (§2.2): we reimplement in our own code to keep AetherSDR's copyright
+  unentangled from `wfview`'s.
 
 ### 8.2 Principle VII — Untrusted Input Is Validated At The Boundary
 
@@ -420,8 +470,9 @@ not shadow-persist settings that belong on the radio.
 
 ## 9. Non-Goals For This Note
 
-- This note does **not** contain the wire-format specification. That is the
-  independent Room A deliverable (§4) in its own document.
-- This note does **not** provide any session/framing byte layout — those are
-  deferred to capture (§6.2).
-- This note does **not** authorize reading `wfview` or RS-BA1 for any purpose.
+- This note does **not** contain the wire-format specification. That is produced
+  separately, from the clean inputs (§3, §4), in its own document.
+- This note does **not** reproduce any session/framing byte layout — those are
+  understood from `wfview` and confirmed by capture during implementation (§6.2).
+- This note does **not** authorize verbatim copying of `wfview` code, or any
+  reverse-engineering of RS-BA1. (Reading `wfview` is permitted and clean-room.)
