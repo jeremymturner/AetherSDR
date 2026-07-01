@@ -538,6 +538,16 @@ set(CORE_SOURCES
     src/core/KiwiSdrManager.cpp
     src/core/ReceivePresentationSync.cpp
     src/core/KiwiPublicDirectory.cpp
+    # Icom network-radio backend (epic #1): pure protocol/codec modules, the
+    # RadioBackend seam, and the session-transport scaffolding.
+    src/core/RadioBackend.cpp
+    src/core/IcomCivCodec.cpp
+    src/core/IcomAudioCodec.cpp
+    src/core/IcomScopeParser.cpp
+    src/core/IcomRadioCapabilities.cpp
+    src/core/IcomUdpTransport.cpp
+    src/core/IcomBackend.cpp
+    src/core/SecretStore.cpp
     src/core/WanConnection.cpp
     src/core/DxClusterClient.cpp
     src/core/WsjtxClient.cpp
@@ -1929,6 +1939,40 @@ add_executable(kiwi_sdr_protocol_test
 target_include_directories(kiwi_sdr_protocol_test PRIVATE src)
 target_link_libraries(kiwi_sdr_protocol_test PRIVATE Qt6::Core)
 add_test(NAME kiwi_sdr_protocol_test COMMAND kiwi_sdr_protocol_test)
+
+# --- Icom network-radio backend unit tests (epic #1) ----------------------
+# Pure protocol/codec modules; each links only its own source + Qt6::Core.
+add_executable(icom_civ_codec_test
+    tests/icom_civ_codec_test.cpp
+    src/core/IcomCivCodec.cpp
+)
+target_include_directories(icom_civ_codec_test PRIVATE src)
+target_link_libraries(icom_civ_codec_test PRIVATE Qt6::Core)
+add_test(NAME icom_civ_codec_test COMMAND icom_civ_codec_test)
+
+add_executable(icom_audio_codec_test
+    tests/icom_audio_codec_test.cpp
+    src/core/IcomAudioCodec.cpp
+)
+target_include_directories(icom_audio_codec_test PRIVATE src)
+target_link_libraries(icom_audio_codec_test PRIVATE Qt6::Core)
+add_test(NAME icom_audio_codec_test COMMAND icom_audio_codec_test)
+
+add_executable(icom_scope_parser_test
+    tests/icom_scope_parser_test.cpp
+    src/core/IcomScopeParser.cpp
+)
+target_include_directories(icom_scope_parser_test PRIVATE src)
+target_link_libraries(icom_scope_parser_test PRIVATE Qt6::Core)
+add_test(NAME icom_scope_parser_test COMMAND icom_scope_parser_test)
+
+add_executable(icom_capabilities_test
+    tests/icom_capabilities_test.cpp
+    src/core/IcomRadioCapabilities.cpp
+)
+target_include_directories(icom_capabilities_test PRIVATE src)
+target_link_libraries(icom_capabilities_test PRIVATE Qt6::Core)
+add_test(NAME icom_capabilities_test COMMAND icom_capabilities_test)
 
 add_executable(kiwi_sdr_trace_math_test
     tests/kiwi_sdr_trace_math_test.cpp
