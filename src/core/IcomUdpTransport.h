@@ -114,16 +114,26 @@ private:
     void setState(State s);
     void teardownSockets();
 
-    // --- Proprietary session codec seams (fill in from capture) ------------
-    // These four are the ONLY places the reverse-engineered wire format lives.
-    // TODO(cleanroom #10): implement from docs/icom-cleanroom-design.md, NOT
-    // from wfview.  Until then they are documented no-ops so the class links
-    // and the socket/state-machine scaffolding can be reviewed independently.
+    // --- Session codec seams --------------------------------------------
+    // These four are the ONLY places the wire format is touched; they now
+    // delegate to IcomSessionCodec (the pure, testable framing codec derived
+    // clean-room from open-source references — see IcomSessionCodec.h).  The
+    // signatures are preserved from the original scaffolding so the rest of
+    // the class is unchanged.
     QByteArray buildControlPacket(quint8 opcode, const QByteArray& body);
     void handleControlDatagram(const QByteArray& datagram);
     QByteArray wrapStreamPayload(quint16 port, const QByteArray& payload);
     QByteArray unwrapStreamPayload(quint16 port, const QByteArray& datagram,
                                    bool* ok);
+
+    // Emit our next control-port sequence number (post-increments m_txSeq).
+    quint16 nextControlSeq();
+    // Send the are-you-there opener (repeated until "I am here" arrives).
+    void sendAreYouThere();
+    // React to a decoded stream datagram: validate its sequence against the
+    // per-port counter, emit a sequenceGap on loss, and return the payload.
+    QByteArray trackStreamSequence(quint16 port, quint16 seq,
+                                   const QByteArray& payload);
 
     State m_state{State::Disconnected};
     ConnectParams m_params;
@@ -133,11 +143,24 @@ private:
     QUdpSocket* m_audioSocket{nullptr};
     QTimer* m_keepalive{nullptr};
 
-    // Session identifiers negotiated during the control handshake.
-    // TODO(cleanroom #10): populate from the real handshake.
+    // Session identifiers negotiated during the control handshake.  m_localId
+    // is a random 32-bit id we generate; m_remoteId is latched from the
+    // radio's "I am here" reply.
     quint32 m_localId{0};
     quint32 m_remoteId{0};
-    quint16 m_txSeq{0};
+    quint16 m_txSeq{0};        // our control-port sequence counter
+
+    // Per-stream outbound sub-sequence counters (big-endian on the wire).
+    quint16 m_civStreamSeq{0};
+    quint16 m_audioStreamSeq{0};
+
+    // Last inbound stream sequence seen per port, for gap detection.  -1 means
+    // "no packet yet" so the first datagram is never counted as a gap.
+    int m_civRxSeq{-1};
+    int m_audioRxSeq{-1};
+
+    // Are-you-there retry bookkeeping while in Connecting.
+    QTimer* m_areYouThereTimer{nullptr};
 
     quint64 m_civSeqGaps{0};
     quint64 m_audioSeqGaps{0};
