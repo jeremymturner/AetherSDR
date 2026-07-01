@@ -41,6 +41,7 @@ Q_LOGGING_CATEGORY(lcAx25,       "aether.ax25",        QtWarningMsg)
 Q_LOGGING_CATEGORY(lcWaveform,   "aether.waveform",    QtWarningMsg)
 Q_LOGGING_CATEGORY(lcKiwiSdr,    "aether.kiwisdr",     QtDebugMsg)
 Q_LOGGING_CATEGORY(lcKiwiSdrAudio, "aether.kiwisdr.audio", QtWarningMsg)
+Q_LOGGING_CATEGORY(lcIcom,       "aether.icom",        QtDebugMsg)
 Q_LOGGING_CATEGORY(lcAutomation, "aether.automation",  QtInfoMsg)
 
 LogManager::LogManager()
@@ -75,6 +76,7 @@ LogManager::LogManager()
         {"aether.waveform",   "Waveform",    "Docker waveform image install upload"},
         {"aether.kiwisdr",    "KiwiSDR",     "KiwiSDR remote RX antennas: connect, handshake, audio/waterfall negotiation, reconnect, profile lifecycle"},
         {"aether.kiwisdr.audio", "KiwiSDR Audio/DSP", "Verbose KiwiSDR receive audio: frame decode, resampler, jitter/FIFO under/overrun, mixing (high-rate; off by default)"},
+        {"aether.icom",       "Icom",        "Icom network radios: UDP session/handshake/keepalive, CI-V, scope, RX/TX audio (#1)"},
         {"aether.automation", "Automation Bridge", "Agent-drivable test bridge (#3646): QLocalServer verbs, widget snapshots, captures (AETHER_AUTOMATION only)"},
     };
 
