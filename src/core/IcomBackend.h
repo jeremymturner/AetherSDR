@@ -63,13 +63,40 @@ private slots:
     void onCivFrameReceived(const QByteArray& civFrame);
     void onAudioPayloadReceived(const QByteArray& payload);
 
+    // --- Pure, socket-free mapping helpers (unit-testable; see the test). ---
+public:
+    // Map a requested audio bandwidth (highHz - lowHz) to the nearest Icom
+    // discrete filter slot (FIL1/FIL2/FIL3) for a given mode.  Icom does not
+    // accept arbitrary Hz edges over CI-V, so a request is quantized to the
+    // closest slot by that slot's PROVISIONAL nominal width (widths are
+    // radio-configurable in the DSP menu — see the kProvisional* constants in
+    // the .cpp).  Returns one of IcomCiv::kFilterFil1/2/3.
+    static quint8 filterSlotForBandwidth(IcomCiv::CivMode mode, int bandwidthHz);
+
+    // Map a RadioBackend receiver index (0 = main, 1 = sub) to the scope
+    // stream id used by spectrum/waterfall signals.  For radios with a single
+    // scope, everything collapses onto the main stream.  `scopeCount` comes
+    // from icomCapsFor(modelKey).scopeCount.
+    static quint32 scopeStreamIdForReceiver(int receiver, int scopeCount);
+
+    // mode string <-> CivMode (exposed for tests; the wire layer stays in the
+    // codec).  Unknown strings default to USB, mirroring the RX-first glue.
+    static IcomCiv::CivMode civModeFromString(const QString& mode);
+    static QString civModeToString(IcomCiv::CivMode mode);
+
 private:
     void handleFrequency(quint64 hz);
     void handleMode(IcomCiv::CivMode mode, int filter);
     void handleScope(const QByteArray& civ27Payload);
 
-    // Single receiver for v1; dual-RX (7610/9700) maps receiver->streamId later.
-    static constexpr quint32 kScopeStreamId = 0;
+    // Select the target VFO/receiver on a dual-RX radio before a freq/mode
+    // command.  No-ops (returns false) for single-RX models or receiver 0.
+    bool selectReceiver(int receiver);
+
+    // Scope stream ids: main panadapter on 0, sub-RX panadapter on 1 so two
+    // panadapters can render independently.
+    static constexpr quint32 kScopeStreamIdMain = 0;
+    static constexpr quint32 kScopeStreamIdSub = 1;
 
     IcomUdpTransport* m_transport{nullptr};
     IcomConnectionProfile m_profile;
@@ -82,6 +109,11 @@ private:
     // Negotiated audio format.  PROVISIONAL default; the real value comes from
     // the transport's audio-session negotiation (#3/#7).
     IcomAudio::IcomAudioFormat m_audioFormat{IcomAudio::IcomAudioFormat::ULaw8};
+
+    // Last known operating mode, kept so setFilterBandwidth can re-send
+    // mode+filter (CI-V cmd 0x06 carries mode AND filter together) without
+    // clobbering the mode.  Updated by setMode() and by decoded mode replies.
+    IcomCiv::CivMode m_currentMode{IcomCiv::CivMode::Usb};
 
     bool m_connected{false};
 };
