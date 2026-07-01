@@ -38,6 +38,9 @@ constexpr int kSourceStaleRole = Qt::UserRole + 14;
 // Icom profile.  kRowIcomIdRole holds the profile id for Icom rows (#5).
 constexpr int kRowIsIcomRole = Qt::UserRole + 20;
 constexpr int kRowIcomIdRole = Qt::UserRole + 21;
+// Set on rows for swept-but-unsaved Icom radios; kRowIcomAddrRole holds the IP.
+constexpr int kRowIcomDetectedRole = Qt::UserRole + 22;
+constexpr int kRowIcomAddrRole = Qt::UserRole + 23;
 constexpr int kMaxRecentManualIps = 3;
 constexpr const char* kRecentManualIpsKey = "RecentConnectByIpAddresses";
 
@@ -967,6 +970,40 @@ void ConnectionPanel::reloadIcomProfiles()
     rebuildRadioList();
 }
 
+bool ConnectionPanel::icomAddressIsSaved(const QHostAddress& address) const
+{
+    for (const IcomConnectionProfile& p : m_icomProfiles) {
+        if (!p.address.isNull() && p.address.isEqual(address)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void ConnectionPanel::onIcomRadioDiscovered(const QHostAddress& address)
+{
+    for (const QHostAddress& a : m_icomDetected) {
+        if (a.isEqual(address)) {
+            return;  // already listed
+        }
+    }
+    m_icomDetected.append(address);
+    rebuildRadioList();
+    updateLocalPageState();
+}
+
+void ConnectionPanel::onIcomRadioLost(const QHostAddress& address)
+{
+    for (int i = 0; i < m_icomDetected.size(); ++i) {
+        if (m_icomDetected[i].isEqual(address)) {
+            m_icomDetected.removeAt(i);
+            break;
+        }
+    }
+    rebuildRadioList();
+    updateLocalPageState();
+}
+
 void ConnectionPanel::rebuildRadioList()
 {
     // Remember the current selection so a rebuild doesn't lose it.
@@ -993,6 +1030,19 @@ void ConnectionPanel::rebuildRadioList()
         auto* item = new QListWidgetItem(formatIcomRadioLabel(profile), m_radioList);
         item->setData(kRowIsIcomRole, true);
         item->setData(kRowIcomIdRole, profile.id);
+    }
+    // Swept-but-unsaved Icom radios (address only; model unknown pre-auth).
+    // Skip any already covered by a saved profile.
+    for (const QHostAddress& addr : m_icomDetected) {
+        if (icomAddressIsSaved(addr)) {
+            continue;
+        }
+        const QString label = tr("Icom radio (detected)\n%1 • tap Connect to set up")
+                                  .arg(addr.toString());
+        auto* item = new QListWidgetItem(label, m_radioList);
+        item->setData(kRowIsIcomRole, true);
+        item->setData(kRowIcomDetectedRole, true);
+        item->setData(kRowIcomAddrRole, addr.toString());
     }
 
     int restore = -1;
@@ -1071,7 +1121,8 @@ void ConnectionPanel::deleteSelectedIcom()
 
 void ConnectionPanel::updateLocalPageState()
 {
-    const bool hasRadios = !m_radios.isEmpty() || !m_icomProfiles.isEmpty();
+    const bool hasRadios = !m_radios.isEmpty() || !m_icomProfiles.isEmpty()
+                           || !m_icomDetected.isEmpty();
     m_localStateStack->setCurrentIndex(hasRadios ? 0 : 1);
 
     if (hasRadios && !m_radioList->currentItem())
@@ -1280,7 +1331,16 @@ void ConnectionPanel::onLocalConnectClicked()
         return;
     }
 
-    // Icom row → connect via the RadioBackend seam (#5).
+    // Detected-but-unsaved Icom row → open the editor pre-filled so the operator
+    // sets the model + credentials (the model is not knowable pre-auth).
+    if (auto* cur = m_radioList->currentItem();
+        cur != nullptr && cur->data(kRowIcomDetectedRole).toBool()) {
+        showIcomEditor(QString());
+        m_icomEditor->prefillNewForAddress(cur->data(kRowIcomAddrRole).toString());
+        return;
+    }
+
+    // Saved Icom row → connect via the RadioBackend seam (#5).
     const QString icomId = currentRowIcomId();
     if (!icomId.isEmpty()) {
         for (const IcomConnectionProfile& p : m_icomProfiles) {

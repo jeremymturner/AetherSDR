@@ -48,6 +48,12 @@ public slots:
     void onRadioUpdated(const RadioInfo& radio);
     void onRadioLost(const QString& serial);
 
+    // Active Icom LAN sweep results (#5): a detected radio (address only,
+    // model unknown pre-auth) appears in the unified list; connecting to one
+    // opens the editor pre-filled so the operator sets model + credentials.
+    void onIcomRadioDiscovered(const QHostAddress& address);
+    void onIcomRadioLost(const QHostAddress& address);
+
     // SmartLink
     void setSmartLinkClient(SmartLinkClient* client);
 
@@ -131,7 +137,10 @@ private:
     void deleteSelectedIcom();
     QString currentRowIcomId() const;  // empty when the current row is not Icom
 
+    bool icomAddressIsSaved(const QHostAddress& address) const;
+
     QVector<IcomConnectionProfile> m_icomProfiles;
+    QVector<QHostAddress> m_icomDetected;  // swept, not-yet-saved Icom radios
     IcomProfileEditor* m_icomEditor{nullptr};
     QPushButton* m_addIcomBtn{nullptr};
     QPushButton* m_editIcomBtn{nullptr};

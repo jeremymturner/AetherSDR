@@ -187,11 +187,20 @@ void MainWindow::wireDiscovery()
     });
     connect(&m_discovery, &RadioDiscovery::radioLost,
             m_connPanel, &ConnectionPanel::onRadioLost);
+
+    // Active Icom LAN sweep feeds the same unified list (#5).
+    connect(&m_icomDiscovery, &IcomDiscovery::icomRadioFound,
+            m_connPanel, &ConnectionPanel::onIcomRadioDiscovered);
+    connect(&m_icomDiscovery, &IcomDiscovery::icomRadioLost,
+            m_connPanel, &ConnectionPanel::onIcomRadioLost);
+
     connect(m_connPanel, &ConnectionPanel::retryDiscoveryRequested, this, [this] {
         m_connPanel->setStatusText("Searching your local network…");
         if (m_titleBar) m_titleBar->setDiscovering(true);
         m_discovery.stopListening();
         m_discovery.startListening();
+        m_icomDiscovery.stopSweeping();
+        m_icomDiscovery.startSweeping();
     });
     connect(m_connPanel, &ConnectionPanel::networkDiagnosticsRequested,
             this, &MainWindow::showNetworkDiagnosticsDialog);

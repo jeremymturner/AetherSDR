@@ -14,6 +14,7 @@
 #include "core/AppSettings.h"
 #include "core/CommandParser.h"   // MessageSeverity for onRadioMessage slot
 #include "core/RadioDiscovery.h"
+#include "core/IcomDiscovery.h"
 #include "core/AudioEngine.h"
 #include "core/ReceivePresentationSync.h"
 #include "core/CatPort.h"
@@ -648,6 +649,7 @@ private:
 
     // Core objects
     RadioDiscovery    m_discovery;
+    IcomDiscovery     m_icomDiscovery;  // active Icom LAN sweep (#5)
     // Radio sessions (#3445 Camp B / #3351). Each session owns the full
     // per-radio aggregate; today there is exactly one. The vector sits at
     // the old `RadioModel m_radioModel` member position so destruction

@@ -551,6 +551,7 @@ set(CORE_SOURCES
     src/core/IcomUdpTransport.cpp
     src/core/IcomBackend.cpp
     src/core/IcomProfileStore.cpp
+    src/core/IcomDiscovery.cpp
     src/core/SecretStore.cpp
     src/core/WanConnection.cpp
     src/core/DxClusterClient.cpp
@@ -1987,6 +1988,20 @@ add_executable(icom_session_codec_test
 target_include_directories(icom_session_codec_test PRIVATE src)
 target_link_libraries(icom_session_codec_test PRIVATE Qt6::Core)
 add_test(NAME icom_session_codec_test COMMAND icom_session_codec_test)
+
+# Icom LAN sweep — pure subnet-enumeration helper (icomSweepHosts).
+add_executable(icom_discovery_test
+    tests/icom_discovery_test.cpp
+    src/core/IcomDiscovery.cpp
+    src/core/IcomSessionCodec.cpp
+    src/core/LogManager.cpp
+    src/core/AsyncLogWriter.cpp
+    src/core/AppSettings.cpp
+)
+target_include_directories(icom_discovery_test PRIVATE src)
+target_link_libraries(icom_discovery_test PRIVATE Qt6::Core Qt6::Network)
+set_target_properties(icom_discovery_test PROPERTIES AUTOMOC ON)
+add_test(NAME icom_discovery_test COMMAND icom_discovery_test)
 
 # Icom connection-profile persistence (pure JSON helpers; QHostAddress needs Network).
 add_executable(icom_profile_store_test

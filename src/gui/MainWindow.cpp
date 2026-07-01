@@ -1878,6 +1878,7 @@ MainWindow::MainWindow(QWidget* parent)
     // Start discovery — show amber indicator while waiting for connection
     if (m_titleBar) m_titleBar->setDiscovering(true);
     m_discovery.startListening();
+    m_icomDiscovery.startSweeping();  // active Icom LAN sweep (#5)
 
     const bool autoConnectToLastRadio =
         AppSettings::instance().value("AutoConnectToLastRadio", "True").toString() == "True";

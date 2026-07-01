@@ -96,6 +96,13 @@ void IcomProfileEditor::clearForm()
     m_pass->clear();
 }
 
+void IcomProfileEditor::prefillNewForAddress(const QString& ip)
+{
+    clearForm();
+    m_host->setText(ip);
+    m_name->setFocus();
+}
+
 void IcomProfileEditor::loadProfile(const IcomConnectionProfile& profile,
                                     const QString& password)
 {

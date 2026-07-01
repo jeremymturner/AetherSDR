@@ -26,6 +26,9 @@ public:
     // clear to a blank "new profile" form.
     void loadProfile(const IcomConnectionProfile& profile, const QString& password);
     void clearForm();
+    // Start a new profile pre-filled with a detected radio's IP (#5 sweep):
+    // the operator just picks the model and enters credentials.
+    void prefillNewForAddress(const QString& ip);
 
 signals:
     // Emitted on Save with a valid form.  `profile.id` is stable (reused when
