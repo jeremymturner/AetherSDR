@@ -334,11 +334,33 @@ void IcomBackend::refreshState()
     m_transport->sendCivFrame(IcomCiv::readMode(m_civAddr));
 }
 
+void IcomBackend::enableScope()
+{
+    if (m_civAddr == 0) {
+        return;
+    }
+    const IcomModelCaps caps = icomCapsFor(m_profile.modelKey);
+    if (caps.scopeCount < 1) {
+        return;
+    }
+    // Turn the main spectrum scope ON and enable its waveform data output over
+    // CI-V (confirmed against a real IC-705).  0x27 0x10 <main=00> <on=01> and
+    // 0x27 0x11 <on=01>.  The radio then streams 0x27 0x00 waveform frames,
+    // which onCivFrameReceived routes to handleScope().
+    m_transport->sendCivFrame(IcomCiv::encodeFrame(
+        m_civAddr, IcomCiv::kControllerAddress, IcomCiv::kCmdScopeWaveform,
+        QByteArray::fromHex("100001")));
+    m_transport->sendCivFrame(IcomCiv::encodeFrame(
+        m_civAddr, IcomCiv::kControllerAddress, IcomCiv::kCmdScopeWaveform,
+        QByteArray::fromHex("1101")));
+}
+
 void IcomBackend::onTransportConnected()
 {
     m_connected = true;
     emit connected();
     refreshState();
+    enableScope();
 }
 
 void IcomBackend::onTransportDisconnected()

@@ -89,6 +89,10 @@ private:
     void handleMode(IcomCiv::CivMode mode, int filter);
     void handleScope(const QByteArray& civ27Payload);
 
+    // Turn the spectrum scope + CI-V waveform output on (called on connect for
+    // radios with a scope).  See enableScope() in the .cpp for the wire detail.
+    void enableScope();
+
     // Select the target VFO/receiver on a dual-RX radio before a freq/mode
     // command.  No-ops (returns false) for single-RX models or receiver 0.
     bool selectReceiver(int receiver);

@@ -35,12 +35,26 @@ ScopeMode modeFromByte(quint8 modeByte)
 {
     switch (modeByte) {
     case kModeCenterByte:
+    case kModeScrollCByte:   // scroll-centre behaves like centre for geometry
         return ScopeMode::Center;
     case kModeFixedByte:
+    case kModeScrollFByte:   // scroll-fixed behaves like fixed for geometry
         return ScopeMode::Fixed;
     default:
         return ScopeMode::Unknown;
     }
+}
+
+// Decode a packed-BCD count byte (e.g. 0x11 -> 11), as Icom encodes the
+// division sequence numbers. Non-BCD nibbles fall back to the raw value.
+int bcdCount(quint8 b)
+{
+    const int hi = (b >> 4) & 0x0f;
+    const int lo = b & 0x0f;
+    if (hi > 9 || lo > 9) {
+        return b;
+    }
+    return hi * 10 + lo;
 }
 
 } // namespace
@@ -61,10 +75,10 @@ std::optional<ScopeWaveformHeader> parseWaveformHeader(
     }
 
     ScopeWaveformHeader header;
-    header.currentDivision = static_cast<quint8>(
-        civ27Payload[kProvisionalCurrentDivisionOffset]);
-    header.totalDivisions = static_cast<quint8>(
-        civ27Payload[kProvisionalTotalDivisionsOffset]);
+    header.currentDivision = bcdCount(static_cast<quint8>(
+        civ27Payload[kProvisionalCurrentDivisionOffset]));
+    header.totalDivisions = bcdCount(static_cast<quint8>(
+        civ27Payload[kProvisionalTotalDivisionsOffset]));
 
     // A zero or absurd division count is malformed.
     if (header.currentDivision < kProvisionalFirstDivisionIndex
@@ -106,6 +120,8 @@ std::optional<ScopeWaveformHeader> parseWaveformHeader(
 
     header.centerOrLowFreqHz = *firstFreq;
     header.spanOrHighFreqHz = *secondFreq;
+    header.outOfRange =
+        (static_cast<quint8>(civ27Payload[kProvisionalOorOffset]) != 0);
     header.valid = true;
     return header;
 }
@@ -125,10 +141,11 @@ ScopeGeometry scopeGeometry(const ScopeWaveformHeader& header)
 
     switch (header.mode) {
     case ScopeMode::Center: {
-        // first = center, second = span.
-        const double halfSpan = second / 2.0;
-        geometry.lowMhz = first - halfSpan;
-        geometry.highMhz = first + halfSpan;
+        // first = centre, second = the ±half-span (confirmed against a real
+        // radio + wfview): the display runs centre-span .. centre+span, so the
+        // total width is 2×span.
+        geometry.lowMhz = first - second;
+        geometry.highMhz = first + second;
         break;
     }
     case ScopeMode::Fixed:

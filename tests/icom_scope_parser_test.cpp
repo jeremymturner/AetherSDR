@@ -41,18 +41,21 @@ QByteArray freqToLittleEndianBcd(quint64 hz, int numBytes = 5)
 
 // Build a first-division 0x27 payload (sub-command + division indicators +
 // header + optional samples). mixes the documented provisional layout.
+// Confirmed layout: subcmd, main/sub selector, current/total division, mode,
+// two BCD freq fields, out-of-range flag, then samples.
 QByteArray firstDivisionPayload(quint8 modeByte, int totalDivisions,
                                 quint64 firstFreqHz, quint64 secondFreqHz,
                                 const QByteArray& samples)
 {
     QByteArray payload;
     payload.append(static_cast<char>(0x00));            // sub-command
+    payload.append(static_cast<char>(0x00));            // main/sub selector
     payload.append(static_cast<char>(0x01));            // current division = 1
     payload.append(static_cast<char>(totalDivisions));  // total divisions
     payload.append(static_cast<char>(modeByte));        // scope mode
-    payload.append(static_cast<char>(0x00));            // wave-info byte
     payload.append(freqToLittleEndianBcd(firstFreqHz));
     payload.append(freqToLittleEndianBcd(secondFreqHz));
+    payload.append(static_cast<char>(0x00));            // out-of-range flag
     payload.append(samples);
     return payload;
 }
@@ -62,7 +65,8 @@ QByteArray continuationPayload(int currentDivision, int totalDivisions,
                                const QByteArray& samples)
 {
     QByteArray payload;
-    payload.append(static_cast<char>(0x00));
+    payload.append(static_cast<char>(0x00));            // sub-command
+    payload.append(static_cast<char>(0x00));            // main/sub selector
     payload.append(static_cast<char>(currentDivision));
     payload.append(static_cast<char>(totalDivisions));
     payload.append(samples);
@@ -94,9 +98,11 @@ int main()
         return fail("center-mode first-division header parse is wrong");
     }
 
+    // Centre mode: the span field is the ±half-width, so total span is 2×.
+    // centre 14.1 MHz, span field 200 kHz -> 13.9 .. 14.3 MHz.
     const ScopeGeometry centerGeometry = scopeGeometry(*centerHeader);
-    if (!nearlyEqual(centerGeometry.lowMhz, 14.0)
-        || !nearlyEqual(centerGeometry.highMhz, 14.2)) {
+    if (!nearlyEqual(centerGeometry.lowMhz, 13.9)
+        || !nearlyEqual(centerGeometry.highMhz, 14.3)) {
         return fail("center-mode geometry math is wrong");
     }
 
@@ -138,17 +144,17 @@ int main()
         || parseWaveformHeader(QByteArray::fromHex("0001")).has_value()) {
         return fail("too-short payloads must return nullopt");
     }
-    // Wrong sub-command.
-    if (parseWaveformHeader(QByteArray::fromHex("010103")).has_value()) {
+    // Wrong sub-command (byte 0 != 0x00).
+    if (parseWaveformHeader(QByteArray::fromHex("01000103")).has_value()) {
         return fail("non-waveform sub-command must return nullopt");
     }
-    // Zero / inverted division counts.
-    if (parseWaveformHeader(QByteArray::fromHex("000003")).has_value()
-        || parseWaveformHeader(QByteArray::fromHex("000302")).has_value()) {
+    // Zero / inverted division counts (subcmd, main/sub, curDiv, total).
+    if (parseWaveformHeader(QByteArray::fromHex("00000003")).has_value()
+        || parseWaveformHeader(QByteArray::fromHex("00000302")).has_value()) {
         return fail("invalid division counts must return nullopt");
     }
     // First division claiming header but truncated before the frequencies.
-    if (parseWaveformHeader(QByteArray::fromHex("00010100")).has_value()) {
+    if (parseWaveformHeader(QByteArray::fromHex("0000010100")).has_value()) {
         return fail("truncated first-division header must return nullopt");
     }
     // First division with an unknown mode byte.
@@ -176,13 +182,14 @@ int main()
     }
 
     // --- samplesToDbm range mapping ----------------------------------------
-    const QByteArray sampleBytes = QByteArray::fromHex("00ff80");
+    // Amplitude bytes run 0x00 (bottom) to 0xA0 (160, top); 0xff clamps to top.
+    const QByteArray sampleBytes = QByteArray::fromHex("00a08080ff");
     const QVector<float> dbm = samplesToDbm(sampleBytes, -20.0f, 100.0f);
-    if (dbm.size() != 3
-        || !nearlyEqual(dbm[0], -120.0f)                 // byte 0   -> ref-range
-        || !nearlyEqual(dbm[1], -20.0f)                  // byte 255 -> ref
-        || !nearlyEqual(dbm[2], -20.0f - 100.0f
-                                   + (128.0f / 255.0f) * 100.0f)) {
+    if (dbm.size() != 5
+        || !nearlyEqual(dbm[0], -120.0f)                 // byte 0    -> ref-range
+        || !nearlyEqual(dbm[1], -20.0f)                  // byte 0xA0 -> ref
+        || !nearlyEqual(dbm[2], -120.0f + (128.0f / 160.0f) * 100.0f)  // 0x80
+        || !nearlyEqual(dbm[4], -20.0f)) {               // 0xff clamps to ref
         return fail("samplesToDbm range mapping is wrong");
     }
     if (!samplesToDbm(QByteArray()).isEmpty()) {

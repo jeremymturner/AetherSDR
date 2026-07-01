@@ -2044,6 +2044,7 @@ add_executable(icom_live_connect
     src/core/IcomUdpTransport.cpp
     src/core/IcomSessionCodec.cpp
     src/core/IcomCivCodec.cpp
+    src/core/IcomScopeParser.cpp
     src/core/LogManager.cpp
     src/core/AsyncLogWriter.cpp
     src/core/AppSettings.cpp

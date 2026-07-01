@@ -54,30 +54,36 @@ inline constexpr int kFreqBcdBytes = 5;
 // structure with the most commonly reported layout; they are flagged
 // PROVISIONAL and MUST be verified per docs/icom-cleanroom-design.md.
 
-// PROVISIONAL: byte offsets within a de-framed 0x27 payload.
+// CONFIRMED byte offsets within a de-framed 0x27 payload (verified against a
+// real IC-705 over LAN — the earlier provisional layout was missing the
+// main/sub selector byte and the out-of-range flag):
 //   [0]        sub-command (0x00 waveform data)
-//   [1]        "wave information" / current-division index (1-based)
-//   [2]        total-division count
+//   [1]        main/sub scope selector (0 = main, 1 = sub)
+//   [2]        current-division index (BCD, 1-based)
+//   [3]        total-division count  (BCD)
 //   For the FIRST division only, a header follows:
-//   [3]        scope mode (0 = center, 1 = fixed)
-//   [4]        waveform-info byte (reserved / data-length hint)
+//   [4]        scope mode (0 = center, 1 = fixed, 2 = scroll-C, 3 = scroll-F)
 //   [5..9]     center (Center mode) or low edge (Fixed mode) freq, LE BCD
 //   [10..14]   span  (Center mode) or high edge (Fixed mode) freq, LE BCD
-//   [15..]     amplitude sample bytes (if any share the first frame)
+//   [15]       out-of-range flag (1 = signal out of scope range)
+//   [16..]     amplitude sample bytes (0x00 bottom .. 0xA0 top)
 // For subsequent divisions the amplitude sample bytes start right after the
 // division indicators (offset kProvisionalSampleOffsetContinuation).
+// Over LAN the whole sweep arrives as a single "division 1 of 1" frame.
 inline constexpr int kProvisionalSubCmdOffset = 0;
-inline constexpr int kProvisionalCurrentDivisionOffset = 1;
-inline constexpr int kProvisionalTotalDivisionsOffset = 2;
-inline constexpr int kProvisionalModeOffset = 3;
-inline constexpr int kProvisionalWaveInfoOffset = 4;
+inline constexpr int kProvisionalMainSubOffset = 1;
+inline constexpr int kProvisionalCurrentDivisionOffset = 2;
+inline constexpr int kProvisionalTotalDivisionsOffset = 3;
+inline constexpr int kProvisionalModeOffset = 4;
 inline constexpr int kProvisionalFirstFreqOffset = 5;
 inline constexpr int kProvisionalSecondFreqOffset =
     kProvisionalFirstFreqOffset + kFreqBcdBytes;               // 10
+inline constexpr int kProvisionalOorOffset =
+    kProvisionalSecondFreqOffset + kFreqBcdBytes;             // 15
 inline constexpr int kProvisionalHeaderEndOffset =
-    kProvisionalSecondFreqOffset + kFreqBcdBytes;              // 15
+    kProvisionalOorOffset + 1;                                // 16
 inline constexpr int kProvisionalSampleOffsetContinuation =
-    kProvisionalTotalDivisionsOffset + 1;                     // 3
+    kProvisionalTotalDivisionsOffset + 1;                     // 4
 
 // PROVISIONAL: the first division index Icom uses is 1 (1-based counting).
 inline constexpr int kProvisionalFirstDivisionIndex = 1;
@@ -92,11 +98,11 @@ inline constexpr int kProvisionalMaxDivisions = 64;
 inline constexpr int kProvisionalSampleCountUsb = 475;
 inline constexpr int kProvisionalSampleCountLan = 689;
 
-// PROVISIONAL: amplitude sample bytes span 0..kProvisionalMaxSampleByte.
-// Icom scope amplitude bytes are single-byte levels; the real byte->dBm curve
-// is model-specific and empirical, so samplesToDbm takes ref/range params and
-// maps linearly across the full 0..255 byte range as a documented placeholder.
-inline constexpr int kProvisionalMaxSampleByte = 255;
+// Amplitude sample bytes span 0..kProvisionalMaxSampleByte. Confirmed against a
+// real radio: Icom scope amplitude bytes run 0x00 (display bottom) to 0xA0 (160,
+// display top). The real byte->dBm curve is still model-specific/empirical, so
+// samplesToDbm takes ref/range params and maps linearly across this range.
+inline constexpr int kProvisionalMaxSampleByte = 0xA0;  // 160
 
 // Default reference/range for samplesToDbm when a caller has no calibration.
 // PROVISIONAL: pending a first-party capture these are display placeholders,
@@ -110,6 +116,11 @@ enum class ScopeMode {
     Unknown,
 };
 
+// Scope mode bytes (public CI-V spec). Scroll-C/Scroll-F behave like Center/
+// Fixed for geometry purposes.
+inline constexpr quint8 kModeScrollCByte = 0x02;
+inline constexpr quint8 kModeScrollFByte = 0x03;
+
 // Parsed first-division header (or the division indicators of a continuation
 // frame, in which case only the division fields are populated).
 struct ScopeWaveformHeader {
@@ -122,6 +133,9 @@ struct ScopeWaveformHeader {
     // (See ScopeGeometry for the derived low/high MHz pair.)
     quint64 centerOrLowFreqHz{0};
     quint64 spanOrHighFreqHz{0};
+    // True when the radio flags the signal as outside the scope's amplitude
+    // range for this sweep (the waveform bytes are meaningless / zeroed).
+    bool outOfRange{false};
     bool valid{false};
 };
 
