@@ -9,18 +9,25 @@ namespace AetherSDR {
 //
 // Maintainer decision (epic #1): prefer the OS keychain when available
 // (macOS Keychain / Windows Credential Store / libsecret / KWallet, via
-// QtKeychain when built with HAVE_QTKEYCHAIN); otherwise fall back to
-// encrypted AppSettings.
+// QtKeychain when built with HAVE_KEYCHAIN); otherwise fall back to holding
+// the secret in memory for the session only.
 //
-// INTERIM (this build): the keychain backend is a documented seam (QtKeychain
-// is not yet a build dependency — tracked in #12) and the encrypted-AppSettings
-// fallback is NOT implemented, because doing crypto without a vetted dependency
-// would be worse than not persisting at all.  Until one of those lands, the
-// fallback keeps secrets IN MEMORY for the session only and never writes a
-// password to disk.  `usingKeychain()` reports the active backend so the
-// connection UI can warn "password not remembered" when it is false.  Do NOT
-// add a plaintext-to-disk fallback here — that is the trap this class exists to
-// avoid (Constitution: boundary/secret handling).
+// KEYCHAIN BACKEND (#12): when the build defines HAVE_KEYCHAIN, QtKeychain is
+// linked (same dependency SmartLinkClient uses) and setSecret/secret/
+// removeSecret drive QtKeychain jobs to durable OS storage.  SmartLinkClient
+// uses these jobs asynchronously against its own event loop; SecretStore
+// exposes a synchronous API, so it drives each job to completion with a local
+// QEventLoop (the tradeoff: the calling thread blocks briefly on the keychain
+// round-trip — acceptable for the low-frequency, user-initiated save/connect
+// paths this class serves).  A keychain error is logged via lcIcom and falls
+// back to the in-memory store; it never crashes.
+//
+// IN-MEMORY FALLBACK: when HAVE_KEYCHAIN is NOT defined, the fallback keeps
+// secrets IN MEMORY for the session only and never writes a password to disk.
+// `usingKeychain()` reports the active backend so the connection UI can warn
+// "password not remembered" when it is false.  Do NOT add a plaintext-to-disk
+// fallback here — that is the trap this class exists to avoid (Constitution:
+// boundary/secret handling).
 class SecretStore {
 public:
     static SecretStore& instance();
