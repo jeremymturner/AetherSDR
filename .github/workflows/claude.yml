@@ -46,6 +46,21 @@ jobs:
       group: claude-mention-${{ github.event.issue.number || github.event.pull_request.number }}
       cancel-in-progress: false
     steps:
+      # Immediate 👀 on the triggering comment so the author knows Claude saw
+      # it (the action's own "working…" comment only appears once the agent
+      # has booted). PR reviews are skipped: the API has no reactions
+      # endpoint for review bodies.
+      - name: Acknowledge with eyes reaction
+        if: github.event_name != 'pull_request_review'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "${{ github.event_name }}" = "issue_comment" ]; then
+            endpoint="repos/${{ github.repository }}/issues/comments/${{ github.event.comment.id }}/reactions"
+          else
+            endpoint="repos/${{ github.repository }}/pulls/comments/${{ github.event.comment.id }}/reactions"
+          fi
+          gh api "$endpoint" -f content=eyes --silent || true
       - uses: actions/checkout@v4
       - uses: anthropics/claude-code-action@v1
         with:
