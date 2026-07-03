@@ -81,7 +81,7 @@ const QVector<IcomModelCaps>& icomModelTable()
         IcomModelCaps{
             QStringLiteral("IC-7300MK2"),
             QStringLiteral("Icom IC-7300MK2"),
-            static_cast<quint8>(0x94),
+            static_cast<quint8>(0xB6),
             IcomTransport::Ethernet,
             /*receiverCount=*/1,
             /*scopeCount=*/1,
