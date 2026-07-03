@@ -1,0 +1,68 @@
+name: Claude
+
+# Any "@claude …" comment on an issue or PR (or in a PR review) from a
+# collaborator is answered by an interactive Claude Code agent.
+#
+# Prerequisites (one-time, repo admin):
+#   1. The Claude GitHub App installed on this repo (https://github.com/apps/claude).
+#   2. Auth secret: CLAUDE_CODE_OAUTH_TOKEN (a Claude subscription token — same
+#      setup as partyhamslogger). To use a pay-as-you-go API key instead, set
+#      ANTHROPIC_API_KEY and replace the `claude_code_oauth_token:` line with
+#      `anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}`.
+
+on:
+  issue_comment:
+    types: [created]
+  pull_request_review_comment:
+    types: [created]
+  pull_request_review:
+    types: [submitted]
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+  id-token: write  # the action exchanges a GitHub OIDC token for a Claude-App token
+
+jobs:
+  # Respond to "@claude …" mentions — but only from users with write access
+  # (OWNER/MEMBER/COLLABORATOR). The action enforces this too, so without the
+  # gate a non-collaborator's @claude produces a *failed* run; gating here
+  # makes it skip cleanly instead.
+  mention:
+    if: |
+      (github.event_name == 'issue_comment' &&
+        contains(github.event.comment.body, '@claude') &&
+        contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)) ||
+      (github.event_name == 'pull_request_review_comment' &&
+        contains(github.event.comment.body, '@claude') &&
+        contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)) ||
+      (github.event_name == 'pull_request_review' &&
+        contains(github.event.review.body, '@claude') &&
+        contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.review.author_association))
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    concurrency:
+      group: claude-mention-${{ github.event.issue.number || github.event.pull_request.number }}
+      cancel-in-progress: false
+    steps:
+      # Immediate 👀 on the triggering comment so the author knows Claude saw
+      # it (the action's own "working…" comment only appears once the agent
+      # has booted). PR reviews are skipped: the API has no reactions
+      # endpoint for review bodies.
+      - name: Acknowledge with eyes reaction
+        if: github.event_name != 'pull_request_review'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "${{ github.event_name }}" = "issue_comment" ]; then
+            endpoint="repos/${{ github.repository }}/issues/comments/${{ github.event.comment.id }}/reactions"
+          else
+            endpoint="repos/${{ github.repository }}/pulls/comments/${{ github.event.comment.id }}/reactions"
+          fi
+          gh api "$endpoint" -f content=eyes --silent || true
+      - uses: actions/checkout@v4
+      - uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          claude_args: --max-turns 50 --model claude-opus-4-8 --allowedTools Bash,Edit,Write,Read,Glob,Grep,WebFetch,TodoWrite
