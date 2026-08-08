@@ -86,16 +86,22 @@ static constexpr const char* kLabelStyle =
 static constexpr const char* kDimLabelStyle =
     "QLabel { color: #8090a0; font-size: 10px; }";
 
-static constexpr const char* kInsetValueStyle =
-    "QLabel { font-size: 10px; background: #0a0a18; border: 1px solid #1e2e3e; "
-    "border-radius: 3px; padding: 1px 2px; color: #c8d8e8; }";
-
 static constexpr const char* kInsetEditStyle =
     "QLineEdit { font-size: 10px; background: #0a0a18; border: 1px solid #1e2e3e; "
     "border-radius: 3px; padding: 1px 2px; color: #c8d8e8; }"
     "QLineEdit:focus { border: 1px solid #00b4d8; }";
 
 static constexpr float kAlcGaugeFloorDbfs = -20.0f;
+
+// Mouse-over readout formatter for the ALC gauges — one decimal of dBFS so a
+// transmitting operator can read the exact SSB-peak level off the bar rather
+// than eyeballing it against the -20…0 scale. (#3936)
+static HGauge::HoverValueFormatter alcHoverFormatter()
+{
+    return [](float v) {
+        return QStringLiteral("%1 dBFS").arg(QString::number(v, 'f', 1));
+    };
+}
 
 
 // ── PhoneCwApplet ────────────────────────────────────────────────────────────
@@ -124,6 +130,61 @@ PhoneCwApplet::PhoneCwApplet(QWidget* parent)
 
 // ── Phone sub-panel (existing P/CW controls) ────────────────────────────────
 
+void PhoneCwApplet::setSelectableMicInputs(bool selectable)
+{
+    if (!m_micSourceCombo)
+        return;
+    // Rebuild rather than disable: a greyed-out MIC entry still reads as "this
+    // radio has a mic input we could use", which is exactly the wrong thing to
+    // tell someone whose transmission is silent because the radio is listening
+    // to its network port. PC is the only source we can actually feed.
+    const QString wanted = selectable ? m_micSourceCombo->currentText()
+                                      : QStringLiteral("PC");
+    const QStringList items = selectable
+        ? QStringList{"MIC", "BAL", "LINE", "ACC", "PC"}
+        : QStringList{"PC"};
+    QStringList existing;
+    for (int i = 0; i < m_micSourceCombo->count(); ++i)
+        existing << m_micSourceCombo->itemText(i);
+    if (existing == items) {
+        return;   // idempotent: capabilitiesChanged fires on every edge
+    }
+    const bool wasUpdating = m_updatingFromModel;
+    m_updatingFromModel = true;   // rebuilding must not look like an operator choice
+    m_micSourceCombo->clear();
+    m_micSourceCombo->addItems(items);
+    const int idx = m_micSourceCombo->findText(wanted);
+    m_micSourceCombo->setCurrentIndex(idx >= 0 ? idx : 0);
+    m_updatingFromModel = wasUpdating;
+
+    // On a radio with one possible source, SAY so rather than presenting a
+    // one-entry dropdown that looks broken.
+    // TELL THE MODEL. Rebuilding the combo deliberately suppresses the
+    // operator-intent path, which left TransmitModel still reporting "MIC"
+    // while the screen showed PC — and radiocert reads the model, so it warned
+    // that transmit audio capture was not running on a radio where that is
+    // simply not how audio gets there.
+    if (!selectable && m_model) {
+        m_model->applyMicSelectionState(QStringLiteral("PC"));
+    }
+
+    m_micSourceCombo->setEnabled(selectable);
+    m_micSourceCombo->setToolTip(
+        selectable ? QString()
+                   : QStringLiteral(
+                         "This radio takes transmit audio from this computer. "
+                         "Its own input selection is made on the radio."));
+}
+
+void PhoneCwApplet::setMicLevelMeterAvailable(bool available)
+{
+    if (m_micLevelMeterAvailable == available)
+        return;   // idempotent: this rides capabilitiesChanged, which repeats
+    m_micLevelMeterAvailable = available;
+    if (m_levelGauge)
+        m_levelGauge->setVisible(available);
+}
+
 void PhoneCwApplet::buildPhonePanel()
 {
     m_phonePanel = new QWidget;
@@ -137,6 +198,11 @@ void PhoneCwApplet::buildPhonePanel()
         nullptr, -10.0f);
     m_levelGauge->setAccessibleName("Microphone level gauge");
     m_levelGauge->setAccessibleDescription("Microphone input level in dBFS");
+    // Mouse-over readout: exact mic peak in dB. (#3936)
+    m_levelGauge->setHoverValueFormatter([](float v) {
+        return QStringLiteral("%1 dB").arg(QString::number(v, 'f', 1));
+    });
+    m_levelGauge->setHoverValuePopupEnabled(true);
     vbox->addWidget(m_levelGauge);
 
     // ── Compression gauge (dB: -25 to 0, fills right-to-left) ───────────
@@ -145,6 +211,12 @@ void PhoneCwApplet::buildPhonePanel()
     m_compGauge->setReversed(true);
     m_compGauge->setAccessibleName("Compression gauge");
     m_compGauge->setAccessibleDescription("Speech compression amount in dB");
+    // Mouse-over readout: the gauge stores compression as a negative offset
+    // (-25…0); report it as a positive "amount of compression" in dB. (#3936)
+    m_compGauge->setHoverValueFormatter([](float v) {
+        return QStringLiteral("%1 dB").arg(QString::number(-v, 'f', 1));
+    });
+    m_compGauge->setHoverValuePopupEnabled(true);
     vbox->addWidget(m_compGauge);
 
     // ── ALC gauge (post-SW-ALC SSB-peak, dBFS) ──────────────────────────
@@ -157,6 +229,8 @@ void PhoneCwApplet::buildPhonePanel()
     m_alcGaugePhone->setValueImmediate(kAlcGaugeFloorDbfs);
     m_alcGaugePhone->setAccessibleName("ALC gauge (Phone)");
     m_alcGaugePhone->setAccessibleDescription("Automatic level control — post-software-ALC SSB peak (dBFS)");
+    m_alcGaugePhone->setHoverValueFormatter(alcHoverFormatter());
+    m_alcGaugePhone->setHoverValuePopupEnabled(true);
     vbox->addWidget(m_alcGaugePhone);
     vbox->addSpacing(4);
 
@@ -188,6 +262,8 @@ void PhoneCwApplet::buildPhonePanel()
         m_micSourceCombo->setAccessibleDescription("Select microphone input source");
         AetherSDR::applyComboStyle(m_micSourceCombo);
         m_micSourceCombo->addItems({"MIC", "BAL", "LINE", "ACC", "PC"});
+        // The full list is FlexRadio's connectors; setSelectableMicInputs()
+        // narrows it to PC on a radio whose input this client cannot choose.
         connect(m_micSourceCombo, QOverload<int>::of(&QComboBox::currentIndexChanged),
                 this, [this](int) {
             if (!m_updatingFromModel && m_model) {
@@ -379,6 +455,8 @@ void PhoneCwApplet::buildCwPanel()
     m_alcGaugeCw->setValueImmediate(kAlcGaugeFloorDbfs);
     m_alcGaugeCw->setAccessibleName("ALC gauge (CW)");
     m_alcGaugeCw->setAccessibleDescription("Automatic level control — post-software-ALC SSB peak (dBFS)");
+    m_alcGaugeCw->setHoverValueFormatter(alcHoverFormatter());
+    m_alcGaugeCw->setHoverValuePopupEnabled(true);
     vbox->addWidget(m_alcGaugeCw);
     vbox->addSpacing(2);
 
@@ -683,6 +761,25 @@ void PhoneCwApplet::setTransmitModel(TransmitModel* model)
             idx = m_micProfileCombo->findText(current);
             if (idx >= 0) m_micProfileCombo->setCurrentIndex(idx);
         }
+        m_updatingFromModel = false;
+    });
+
+    // Host-modulating backend: PC is the only possible source, so show it and
+    // take the choice away rather than offering jacks that do not exist.
+    connect(m_model, &TransmitModel::hostModulationChanged, this, [this](bool on) {
+        if (!m_micSourceCombo) return;
+        m_updatingFromModel = true;
+        const QSignalBlocker blocker(m_micSourceCombo);
+        if (on) {
+            m_micSourceCombo->clear();
+            m_micSourceCombo->addItem(QStringLiteral("PC"));
+            m_micSourceCombo->setCurrentIndex(0);
+        }
+        m_micSourceCombo->setEnabled(!on);
+        m_micSourceCombo->setToolTip(
+            on ? tr("This radio is modulated by AetherSDR, so the PC microphone "
+                    "is the only input. The other sources are FlexRadio jacks.")
+               : QString());
         m_updatingFromModel = false;
     });
 

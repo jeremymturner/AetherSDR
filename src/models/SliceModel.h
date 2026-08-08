@@ -6,6 +6,8 @@
 #include <QMap>
 #include <QTimer>
 
+#include "core/backends/SliceDelta.h"
+
 namespace AetherSDR {
 
 // A "slice" in SmartSDR terminology is an independent receive channel.
@@ -23,6 +25,7 @@ class SliceModel : public QObject {
 
 public:
     explicit SliceModel(int id, QObject* parent = nullptr);
+    ~SliceModel() override;
 
     // Getters
     int     sliceId()    const { return m_id; }
@@ -40,6 +43,19 @@ public:
     QStringList modeList() const { return m_modeList; }
     int     filterLow()  const { return m_filterLow; }   // Hz offset
     int     filterHigh() const { return m_filterHigh; }
+    // Monotonic counter bumped ONLY by setFilterWidth() (operator preset/drag),
+    // never by applyAdaptiveFilter() or status echoes. Lets the adaptive engine
+    // recognise a genuine manual filter edit without value-guessing. RFC #3878.
+    quint64 userFilterEpoch() const { return m_userFilterEpoch; }
+    // Getters — Adaptive RX filter (client-side ESSB auto-fit; RFC #3878)
+    bool    adaptiveFilterEnabled() const { return m_adaptiveFilterEnabled; }
+    int     adaptiveMinLowCut()     const { return m_adaptiveMinLowCut; }  // Hz
+    int     adaptiveMaxHighCut()    const { return m_adaptiveMaxHighCut; } // Hz
+    int     adaptiveMinSnr()        const { return m_adaptiveMinSnr; }   // 0=Sensitive,1=Normal,2=Strong
+    int     adaptiveResponse()      const { return m_adaptiveResponse; } // 0=Fast,1=Normal,2=Slow
+    int     adaptiveSplatter()      const { return m_adaptiveSplatter; } // 0=Tight,1=Normal,2=Wide
+    bool    adaptiveHetReject()     const { return m_adaptiveHetReject; } // opt-in edge-het cut
+    bool    adaptiveActive()        const { return m_adaptiveActive; }
     bool    isActive()   const { return m_active; }
     bool    isTxSlice()  const { return m_txSlice; }
     float   rfGain()     const { return m_rfGain; }
@@ -110,11 +126,44 @@ public:
     int     receiveSquelchLevel() const { return m_externalReceiveAudioReplacement
                                               ? m_externalReceiveSquelchLevel
                                               : m_squelchLevel; }
+    // Last manual-mode threshold the operator chose for THIS slice,
+    // independent of squelchLevel() (which Auto mode also overwrites with
+    // its own computed threshold each update). RxApplet restores Manual
+    // mode's slider from this when it reattaches to a slice, so switching
+    // the active slice doesn't pull in another slice's threshold (#3326).
+    int     manualSquelchLevel() const { return m_manualSquelchLevel; }
+    void    setManualSquelchLevel(int level) { m_manualSquelchLevel = qBound(0, level, 100); }
+    // Whether a radio-echoed squelch_level for this slice should be taken as
+    // the operator's manual choice.  Driven by whichever surface owns the
+    // slice's SQL mode (RxApplet), and true only while that mode is Manual:
+    //   Manual — the echo is a genuine manual level (the operator's own
+    //            edit, another Multi-Flex client, or session restore) and
+    //            must update the manual memory.
+    //   Auto   — the level is algorithm-computed and re-pushed every tick.
+    //   Off    — the mode push sends sqlManualLevel(), but nothing keeps a
+    //            disabled squelch's level pinned, so an echo here is not a
+    //            threshold the operator chose either.
+    // Adopting the last two would silently overwrite the threshold the
+    // operator actually chose (#4592) — the same silent-overwrite class
+    // #3326 fixed, reached via the status-echo path rather than a direct
+    // client write.  Defaults true so a slice with no surface attached (a
+    // non-active VFO flag, a slice reclaimed from a previous session) still
+    // tracks genuine manual changes — the leak #4592 part 1 set out to close.
+    void    setSquelchEchoIsManual(bool isManual) { m_squelchEchoIsManual = isManual; }
     bool    ritOn()       const { return m_ritOn; }
     int     ritFreq()     const { return m_ritFreq; }
     bool    xitOn()       const { return m_xitOn; }
     int     xitFreq()     const { return m_xitFreq; }
     int     stepHz()      const { return m_stepHz; }
+    // HOST-BANK MEMORY RECALL ONLY — do not call this on a radio that owns its
+    // slots. Step size is radio-authoritative (AGENTS.md, Principle II): on a
+    // Flex it arrives as `slice` status and the client must never assert it, or
+    // the two fight on reconnect. On a backend with no command plane there is no
+    // radio opinion to defer to, the host bank owns the channel, and a recalled
+    // step would otherwise never take because the wire command that normally
+    // round-trips it is dropped. Named for its one caller so the exception stays
+    // visible; see RadioModel::recallLocalMemory().
+    void    applyRecalledStepHz(int hz);
     QVector<int> stepList() const { return m_stepList; }
     int     daxChannel()  const { return m_daxChannel; }
     int     rttyMark()        const { return m_rttyMark; }
@@ -141,12 +190,31 @@ public:
     void tuneAndRecenter(double mhz);      // slice tune — recenters pan (band changes)
     void setMode(const QString& mode);
     void setFilterWidth(int low, int high);
+    // Adaptive RX filter (client-side; the toggle/bounds send no radio
+    // command — the engine drives the passband via applyAdaptiveFilter()).
+    void setAdaptiveFilterEnabled(bool on);
+    void setAdaptiveMinLowCut(int hz);
+    void setAdaptiveMaxHighCut(int hz);
+    void setAdaptiveMinSnr(int level);     // 0=Sensitive,1=Normal,2=Strong
+    void setAdaptiveResponse(int level);   // 0=Fast,1=Normal,2=Slow
+    void setAdaptiveSplatter(int level);   // 0=Tight,1=Normal,2=Wide
+    void setAdaptiveHetReject(bool on);    // opt-in edge-het cut
+    void setAdaptiveActive(bool on);
+    // Engine-driven passband write: same wire command as setFilterWidth, but
+    // a distinct entry point so the engine can recognise its own writes (vs
+    // a user preset/drag) when tracking the manual baseline. RFC #3878.
+    void applyAdaptiveFilter(int low, int high);
     void setAudioGain(float gain);
     void setRfGain(float gain);
     void setAudioPan(int pan);
     void setAudioMute(bool mute);
     void setExternalReceiveAudioReplacementMute(bool active,
                                                 bool restoreMute = false);
+    // A FLEX band-stack recall persists the slice's current audio_mute value.
+    // Temporarily restore the pre-replacement Flex mute before the band command
+    // so the KiwiSDR suppression mute is never written into the outgoing slot.
+    // The external receive presentation remains active throughout.
+    void prepareExternalReceiveAudioReplacementBandRecall(bool restoreMute);
     void setExternalReceiveAutoSquelch(bool on);
     bool externalReceiveReplacementActive() const
     {
@@ -199,6 +267,14 @@ public:
     void setAgcThreshold(int value);
     void setAgcOffLevel(int value);
     void setSquelch(bool on, int level);
+    // For genuine operator-driven manual squelch input only (a VFO flag's
+    // own SQL controls, a controller-mapped squelch knob) — setSquelch()
+    // plus recording the level as the operator's manual choice, in one
+    // call so no caller can push a manual level and forget the second half
+    // (#4592). Algorithm-driven writes (Auto mode) must keep calling plain
+    // setSquelch() — routing them here would silently overwrite the
+    // operator's last manual choice with the auto-computed value.
+    void setManualSquelch(bool on, int level);
     void setRit(bool on, int hz);
     void setXit(bool on, int hz);
     void setDaxChannel(int ch);
@@ -221,8 +297,11 @@ public:
     void setTxOffsetFreq(double mhz);
     void setFmDeviation(int hz);
 
-    // Apply a batch of KV pairs from a status message.
-    void applyStatus(const QMap<QString, QString>& kvs);
+    // Apply a normalized, typed slice delta from the backend
+    // (IRadioBackend::sliceChanged). Vendor-neutral fields only — the Flex wire
+    // decode lives in FlexBackend::decodeSliceStatus. Applies only the fields the
+    // delta has engaged (present-only). (aetherd RFC 2.3.)
+    void applyChanges(const SliceDelta& delta);
 
     // Force a re-emit of letterChanged() with the current letter — used
     // when a global display preference (e.g. AppSettings
@@ -236,9 +315,74 @@ public:
 signals:
     void letterChanged(const QString& newLetter);
     void frequencyChanged(double mhz);
+    // Emitted after a local setter has issued a frequency command. Unlike
+    // frequencyChanged, radio-status application does not emit this signal.
+    void frequencyCommandIssued(double mhz);
+    // Filter change originating from the OPERATOR, not from radio status.
+    // filterChanged() fires for both, so it must not be used to drive a command
+    // back at the radio; that would echo the radio's own state as a request
+    // (Principle II). Mirrors frequencyCommandIssued.
+    void filterCommandIssued(int lowHz, int highHz);
+    // Operator-issued AGC change. Distinct from agcModeChanged/
+    // agcThresholdChanged, which ALSO fire when radio status is applied —
+    // driving a command off those would echo the radio's own state back at it
+    // as a request (Principle II). Emitted only from setAgcMode()/
+    // setAgcThreshold(), and always carries BOTH values because a backend
+    // configuring a DSP AGC needs the pair to act on either.
+    void agcCommandIssued(const QString& mode, int thresholdDb);
+
+    // RECEIVE DSP THE RADIO RUNS. Same contract as the signals above: emitted
+    // only by the operator-facing setters, never by status application, so a
+    // radio's own echo can never come back as a fresh command (Principle II).
+    //
+    // These exist because every one of these controls used to emit FlexRadio
+    // wire text and nothing else. On a Flex that string IS the command; on any
+    // other backend it was discarded, and there was no seam verb for a backend
+    // to implement instead — so declaring hasRadioSideDsp bought nothing and
+    // the control moved while the radio never heard about it.
+    //
+    // Enable and level travel TOGETHER because a radio that has a level
+    // register generally needs both to make either meaningful, and because the
+    // two arriving separately is how a toggle lands before the level it implies.
+    void noiseReductionCommandIssued(bool on, int level);
+    void noiseBlankerCommandIssued(bool on, int level);
+    void autoNotchCommandIssued(bool on);
+    void squelchCommandIssued(bool on, int level);
+    // Receive and transmit incremental tuning.
+    void ritCommandIssued(bool on, int hz);
+    void xitCommandIssued(bool on, int hz);
+    // Operator-issued per-slice AUDIO changes, same discipline as the three
+    // above: audioMuteChanged/audioGainChanged/audioPanChanged also fire when
+    // radio status is applied, so driving a command off those would echo the
+    // radio's own state back as a request (Principle II).
+    //
+    // These exist because a Flex mixes its slices ON THE RADIO and these
+    // controls are wire commands to it, while a host-mixing backend (HL2)
+    // demodulates every receiver here and has to apply them in its own mixer.
+    // Without them the operator's mute moved the model and the fader, and the
+    // audio kept playing.
+    void audioMuteCommandIssued(bool mute);
+    void audioGainCommandIssued(int gainPercent);
+    void audioPanCommandIssued(int panPercent);      // 0=left, 50=centre, 100=right
+    // Operator asked for THIS slice to own transmit. A radio with one
+    // transmitter and several receivers has to move it rather than set a flag.
+    void txSliceCommandIssued();
+    // Operator selected THIS slice as the one the shared controls act on.
+    // Separate from activeChanged, which also fires when radio status is
+    // applied — driving a command off that would echo the radio's own state
+    // back as a request (Principle II).
+    void activeSliceCommandIssued();
     void panIdChanged(const QString& panId);
     void modeChanged(const QString& mode);
     void filterChanged(int low, int high);
+    void adaptiveFilterEnabledChanged(bool on);
+    void adaptiveMinLowCutChanged(int hz);
+    void adaptiveMaxHighCutChanged(int hz);
+    void adaptiveMinSnrChanged(int level);
+    void adaptiveResponseChanged(int level);
+    void adaptiveSplatterChanged(int level);
+    void adaptiveHetRejectChanged(bool on);
+    void adaptiveActiveChanged(bool on);
     void activeChanged(bool active);
     void txSliceChanged(bool tx);
     void audioGainChanged(float gain);
@@ -306,16 +450,48 @@ signals:
     void playOnChanged(bool on);
     void playEnabledChanged(bool enabled);
     void commandReady(const QString& cmd);  // ready to send to radio
+    // aetherd RFC 2.3 encode template: express intent instead of building the
+    // wire string. RadioModel routes this to FlexBackend::setSliceMode, whose
+    // output goes through the TX-inhibit-guarded slice sink. (The other slice
+    // commands still use commandReady until they convert.)
+    void modeChangeRequested(const QString& mode);
+    void digitalVoiceSliceDisplaced(int sliceId, const QString& previousMode);
+
+public:
+    // Filter polarity families (#3434): the single mode→family mapping every
+    // polarity decision uses. Public/static so capture paths (memories) can
+    // mirror back to the wire form without duplicating the mode list.
+    static bool filterPolarityUsbFamily(const QString& mode);
+    static bool filterPolarityLsbFamily(const QString& mode);
+    // Modes whose passband must straddle the carrier (AM/SAM/DSB/DRM/FM...).
+    static bool filterCarrierStraddlingFamily(const QString& mode);
 
 private:
+    // Sign-guarded, idempotent (lo,hi)→(-hi,-lo) mirror of the stored filter
+    // when its polarity is wrong for m_mode; true if it changed anything.
+    bool normalizeFilterPolarity();
+
     int     m_id{0};
     QString m_letter;          // per-client display letter from `index_letter`
     QString m_panId;           // panadapter assignment (e.g. "0x40000000")
     double  m_frequency{0.0};
     QString m_mode{"USB"};
+    QString m_modeBeforeDigitalVoice;
     QStringList m_modeList;
     int     m_filterLow{-1500};
     int     m_filterHigh{1500};
+    quint64 m_userFilterEpoch{0};   // bumped only by setFilterWidth() (RFC #3878)
+    // Adaptive RX filter — client-side config + runtime state (RFC #3878).
+    // The filter edges themselves stay radio-authoritative (never persisted);
+    // only enabled + the two bounds are persisted by the GUI.
+    bool    m_adaptiveFilterEnabled{false};
+    int     m_adaptiveMinLowCut{0};      // Hz, one of {0,50,100,200}
+    int     m_adaptiveMaxHighCut{4000};  // Hz, one of {3000,3500,4000,6000}
+    int     m_adaptiveMinSnr{1};         // 0=Sensitive,1=Normal,2=Strong
+    int     m_adaptiveResponse{1};       // 0=Fast,1=Normal,2=Slow
+    int     m_adaptiveSplatter{1};       // 0=Tight,1=Normal,2=Wide
+    bool    m_adaptiveHetReject{false};  // opt-in edge-het cut
+    bool    m_adaptiveActive{false};     // a confident live fit is applied
     bool    m_active{false};
     bool    m_txSlice{false};
     float   m_rfGain{0.0f};
@@ -331,6 +507,7 @@ private:
     bool    m_qsk{false};
     bool    m_audioMute{false};
     bool    m_externalReceiveAudioReplacement{false};
+    bool    m_externalReceiveFlexAudioSuppressed{false};
     bool    m_externalReceiveAudioMute{false};
     float   m_externalReceiveAudioGain{70.0f};
     int     m_externalReceiveAudioPan{50};
@@ -372,6 +549,8 @@ private:
     int     m_agcOffLevel{10};
     bool    m_squelchOn{false};
     int     m_squelchLevel{20};
+    int     m_manualSquelchLevel{20};
+    bool    m_squelchEchoIsManual{true};
     int     m_stepHz{100};
     QVector<int> m_stepList;
     bool    m_ritOn{false};
@@ -385,7 +564,7 @@ private:
     // Flex firmware's `profile global` snapshot does not persist
     // speex_nr_level — on recall the radio reports the firmware default of
     // 50, even when the user set a different value before saving. Cache the
-    // user's explicit choice so applyStatus() can re-push it when the radio
+    // user's explicit choice so applyChanges() can re-push it when the radio
     // comes back at 50 with no user-initiated change to that value.
     int     m_nrsLevelUser{50};
     bool    m_nrsLevelUserOverride{false};

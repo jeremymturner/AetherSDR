@@ -40,6 +40,9 @@
 #include "core/PipeWireAudioBridge.h"
 #endif
 #include "core/AppSettings.h"
+#include "core/DigitalVoiceFeature.h"
+#include "core/DigitalVoiceWaveformProcess.h"
+#include "core/DigitalVoiceWaveformSettings.h"
 #include "core/aprs/AprsSettings.h"
 #include "core/LogManager.h"
 #include "core/WfmDemodulator.h"
@@ -56,6 +59,33 @@
 #include <cmath>
 
 namespace AetherSDR {
+
+void MainWindow::scheduleDigitalVoiceAutoStart()
+{
+    if (!kLocalDigitalVoiceWaveformAvailable
+        || !DigitalVoiceWaveformSettings::autoStart()) {
+        return;
+    }
+
+    QTimer::singleShot(3000, this, [this] {
+        // The helper must reach the radio directly; a SmartLink/WAN session's
+        // advertised LAN address is not a usable transport endpoint.
+        if (!m_radioModel.isConnected() || m_radioModel.isWan()) {
+            return;
+        }
+        m_radioModel.dstarModel().start(
+            m_radioModel.radioAddress(), m_radioModel.callsign());
+    });
+}
+
+void MainWindow::stopDigitalVoiceService(bool waitForExit)
+{
+    if (waitForExit) {
+        DigitalVoiceWaveformProcess::instance().stopAndWait();
+    } else {
+        DigitalVoiceWaveformProcess::instance().stop();
+    }
+}
 
 void MainWindow::showAx25HfPacketDecodeDialog()
 {
@@ -74,7 +104,7 @@ void MainWindow::showAx25HfPacketDecodeDialog()
         dlg->setFramelessMode(
             AppSettings::instance().value("FramelessWindow", "True").toString() == "True");
         m_ax25HfPacketDecodeDialog = dlg;
-        m_persistentDialogs.append(QPointer<PersistentDialog>(dlg));
+        trackPersistentDialog(dlg);
     }
     m_ax25HfPacketDecodeDialog->setAttachedSlice(slice);
 #ifdef HAVE_MQTT
@@ -107,10 +137,44 @@ void MainWindow::startKissTncOnStartupIfConfigured()
     dlg->setFramelessMode(
         AppSettings::instance().value("FramelessWindow", "True").toString() == "True");
     m_ax25HfPacketDecodeDialog = dlg;
-    m_persistentDialogs.append(QPointer<PersistentDialog>(dlg));
+    trackPersistentDialog(dlg);
 #ifdef HAVE_MQTT
     m_ax25HfPacketDecodeDialog->setMqttClient(m_mqttClient);
 #endif
+}
+
+Ax25HfPacketDecodeDialog* MainWindow::ensureAx25HfPacketDecodeDialog()
+{
+    if (m_ax25HfPacketDecodeDialog)
+        return m_ax25HfPacketDecodeDialog.data();
+
+    // Construct hidden and persistent, exactly as
+    // startKissTncOnStartupIfConfigured() does. The automation bridge must be
+    // able to drive the modem on a headless soak box where nobody ever opened
+    // the window; the dialog is a service host, not just a view.
+    TncSettings::migrateLegacy();
+    auto* dlg = new Ax25HfPacketDecodeDialog(m_audio, &m_radioModel, activeSlice(), this);
+    dlg->setFramelessMode(
+        AppSettings::instance().value("FramelessWindow", "True").toString() == "True");
+    m_ax25HfPacketDecodeDialog = dlg;
+    trackPersistentDialog(dlg);
+#ifdef HAVE_MQTT
+    dlg->setMqttClient(m_mqttClient);
+#endif
+    return dlg;
+}
+
+QJsonObject MainWindow::automationModemCommand(const QString& verb,
+                                               const QString& action,
+                                               const QString& value)
+{
+    Ax25HfPacketDecodeDialog* dlg = ensureAx25HfPacketDecodeDialog();
+    if (!dlg) {
+        return QJsonObject{
+            {QStringLiteral("ok"), false},
+            {QStringLiteral("error"), QStringLiteral("could not construct the AetherModem window")}};
+    }
+    return dlg->automationCommand(verb, action, value);
 }
 
 // External-controller methods (FlexControl, HID encoders / RC-28 / TMate 2 /
@@ -128,6 +192,9 @@ void MainWindow::routeRttyDecoderOutput()
     if (target == m_rttyDecoderApplet) return;
 
     if (m_rttyDecoderApplet) {
+        // Keep the old pan from retaining a visible RTTY dock when startup
+        // status ordering or a slice switch moves decoder ownership (#4409).
+        m_rttyDecoderApplet->setRttyPanelVisible(false);
         disconnect(&m_rttyDecoder, &RttyDecoder::textDecoded,
                    m_rttyDecoderApplet, &PanadapterApplet::appendRttyText);
         disconnect(&m_rttyDecoder, &RttyDecoder::statsUpdated,
@@ -173,8 +240,8 @@ void MainWindow::refreshRttyDecodeState()
     // the panel manually via the slice context menu (future work).
     const bool isRtty = s && s->mode() == "RTTY";
 
-    if (m_rttyDecoderApplet)
-        m_rttyDecoderApplet->setRttyPanelVisible(isRtty);
+    setDecoderPanelVisibleOnly(m_rttyDecoderApplet, isRtty,
+                               &PanadapterApplet::setRttyPanelVisible);
 
     if (!isRtty) {
         if (m_rttyDecoder.isRunning()) m_rttyDecoder.stop();
@@ -210,6 +277,51 @@ void MainWindow::activateRADE(int sliceId)
 
     auto* s = m_radioModel.slice(sliceId);
     if (!s) return;
+
+    // RADE's receive path is DAX channel audio (PanadapterStream::daxAudioReady),
+    // and only a Flex backend owns a PanadapterStream — RadioModel leaves
+    // panStream() null for every other family. The connect() further down
+    // dereferenced it bare, so selecting RADE on a Hermes-Lite 2 was a SEGFAULT,
+    // not a decline. Same shape as the null-deref that crashed every HL2 connect
+    // three seconds in (HERMES.md §6 gap 1) and as the startDax() guard, which
+    // this deliberately mirrors.
+    //
+    // Checked HERE rather than at the connect: everything between this point and
+    // there mutates real station state — it moves the TX-slice badge, installs a
+    // PTT-off hook on TransmitModel, calls setRadeMode() and opens mic capture.
+    // Guarding only the connect would leave a radio that is half in RADE mode
+    // with no receive path and an intercepted unkey, which is worse than the
+    // crash because it looks like it worked.
+    //
+    // Declining is the honest answer, not merely the safe one. A backend that
+    // demodulates in-process could carry RADE over the seam one day, but nothing
+    // routes modem audio there today, so there is no path to take.
+    if (!m_radioModel.panStream()) {
+        qCWarning(lcRade) << "MainWindow: RADE needs DAX audio, which this radio"
+                          << "does not provide — refusing to activate on slice"
+                          << sliceId;
+        // Un-stick the control that asked. RADE is selected by a TOGGLE
+        // (RxApplet/VfoWidget::radeActivated), not by the slice mode — it runs
+        // on an ordinary DIGU/DIGL slice — so the slice's mode is the
+        // operator's choice and is deliberately left alone. What must be reset
+        // is the toggle, which has already drawn itself active; the same three
+        // setters deactivateRADE() uses, so a decline and a teardown leave the
+        // UI in the identical state.
+        if (auto* sw = spectrumForSlice(s)) {
+            if (auto* vfo = sw->vfoWidget(sliceId))
+                vfo->setRadeActive(false);
+        }
+        if (m_appletPanel) {
+            m_appletPanel->phoneCwApplet()->setRadeActive(false);
+            if (auto* applet = m_appletPanel->radeApplet())
+                applet->setRadeActive(false);
+        }
+        QMessageBox::warning(this, tr("RADE Unavailable"),
+            tr("RADE needs DAX audio, which this radio does not provide.\n\n"
+               "RADE's modem receives on a DAX channel, and only a FlexRadio "
+               "offers one."));
+        return;
+    }
 
     // Capture TX slice owner before potentially moving the badge, so the
     // failure path can restore it.  -1 means no TX slice existed.
@@ -418,38 +530,46 @@ void MainWindow::activateRADE(int sliceId)
     connect(m_radeEngine, &RADEEngine::rxSpeechReady,
             m_audio, &AudioEngine::feedDecodedSpeech, Qt::QueuedConnection);
 
-    // If TCI or another path already registered a stream — RADE rides it.
+    // Hold the RADE slice's DAX channel via the centralized manager (#3305).
+    // It creates the radio-side stream only if no other consumer (TCI, the
+    // DAX bridge) already holds the channel; registration comes from
+    // RadioModel's central status path — RADE's old private registration hook
+    // had no client_handle filter and could adopt a foreign client's stream.
     {
         SliceModel* radeSlice = m_radioModel.slice(sliceId);
         int daxCh = radeSlice ? radeSlice->daxChannel() : 0;
         if (daxCh >= 1 && daxCh <= 4) {
-            quint32 existing = m_radioModel.panStream()->daxStreamIdForChannel(daxCh);
-            if (existing) {
-                // TCI or another path already registered a stream — RADE rides it.
-                qCDebug(lcRade) << "MainWindow: RADE reusing existing dax_rx ch" << daxCh
-                                << "stream" << Qt::hex << existing;
-            } else {
-                m_radeDaxStreamConn = connect(
-                    &m_radioModel, &RadioModel::statusReceived,
-                    this, [this, daxCh](const QString& obj, const QMap<QString,QString>& kvs) {
-                        if (!obj.startsWith("stream ")) return;
-                        if (kvs.value("type") != "dax_rx") return;
-                        quint32 streamId = obj.mid(7).toUInt(nullptr, 16);
-                        int ch = kvs.value("dax_channel").toInt();
-                        if (streamId && ch == daxCh) {
-                            m_radioModel.panStream()->registerDaxStream(streamId, ch);
-                            m_radeDaxStreamId = streamId;
-                            disconnect(m_radeDaxStreamConn);
-                            qCDebug(lcRade) << "MainWindow: RADE registered dax_rx ch" << ch
-                                            << "stream" << Qt::hex << streamId;
-                        }
-                    });
-                m_radioModel.sendCommand(
-                    QString("stream create type=dax_rx dax_channel=%1").arg(daxCh));
-            }
+            m_radeDaxChannel = daxCh;
+            m_radioModel.acquireDaxChannel(
+                daxCh, PanadapterStream::DaxConsumer::Rade);
         } else {
             qWarning() << "MainWindow: RADE slice" << sliceId
                        << "has no DAX channel assigned — RX audio will not flow";
+        }
+        // Follow mid-session dax= changes on the RADE slice: RADE stays active
+        // across a channel edit (only a mode change deactivates it), and its
+        // RX filter already retargets live via s->daxChannel() — so the Rade
+        // hold must move with it or the old channel's stream leaks and the
+        // new one is never created. Independent of the DAX bridge's
+        // reconciler, which is Bridge-only and absent on Windows.
+        // (PR #4017 review item 2)
+        if (radeSlice) {
+            m_radeDaxReconcileConn = connect(
+                radeSlice, &SliceModel::daxChannelChanged,
+                this, [this](int newCh) {
+                auto* ps = m_radioModel.panStream();
+                if (!ps) return;
+                const int oldCh = m_radeDaxChannel;
+                m_radeDaxChannel = (newCh >= 1 && newCh <= 4) ? newCh : 0;
+                if (m_radeDaxChannel)
+                    ps->acquireDaxChannel(m_radeDaxChannel,
+                                          PanadapterStream::DaxConsumer::Rade);
+                if (oldCh >= 1 && oldCh <= 4 && oldCh != m_radeDaxChannel)
+                    ps->releaseDaxChannel(oldCh,
+                                          PanadapterStream::DaxConsumer::Rade);
+                qCInfo(lcRade) << "MainWindow: RADE dax hold moved"
+                               << oldCh << "->" << m_radeDaxChannel;
+            });
         }
     }
 
@@ -583,28 +703,16 @@ void MainWindow::deactivateRADE()
                    this, nullptr);
         disconnect(m_radeEngine, &RADEEngine::eooCallsignReceived,
                    this, nullptr);
-        if (m_radeDaxStreamId) {
-            // Only send stream remove if TCI has no active clients. If TCI is
-            // connected it may have borrowed this stream — removing it would
-            // silently kill TCI audio. Leave TCI responsible for cleanup in
-            // that case. TODO: replace with proper ref-counting in PanadapterStream
-            // so any creator/borrower can safely release independently (#stream-lifecycle).
-            bool tciActive = tciServer() && tciServer()->clientCount() > 0;
-            bool daxBridgeActive = false;
-#if defined(Q_OS_MAC) || defined(HAVE_PIPEWIRE)
-            daxBridgeActive = (m_daxBridge != nullptr);
-#endif
-            if (!tciActive && !daxBridgeActive) {
-                m_radioModel.panStream()->unregisterDaxStream(m_radeDaxStreamId);
-                if (m_radioModel.isConnected()) {
-                    m_radioModel.sendCommand(
-                        QString("stream remove 0x%1")
-                            .arg(m_radeDaxStreamId, 8, 16, QChar('0')));
-                }
-            }
-            m_radeDaxStreamId = 0;
+        disconnect(m_radeDaxReconcileConn);
+        if (m_radeDaxChannel >= 1 && m_radeDaxChannel <= 4) {
+            // Release RADE's hold; the centralized manager removes the
+            // radio-side stream only when the LAST holder (TCI / DAX bridge /
+            // RADE) releases — the ref-counting the old TODO here asked for
+            // (#3305).
+            m_radioModel.releaseDaxChannel(
+                m_radeDaxChannel, PanadapterStream::DaxConsumer::Rade);
+            m_radeDaxChannel = 0;
         }
-        disconnect(m_radeDaxStreamConn);
         // Stop on the worker thread, then shut down the thread
         QMetaObject::invokeMethod(m_radeEngine, &RADEEngine::stop,
                                   Qt::BlockingQueuedConnection);
@@ -854,6 +962,21 @@ void MainWindow::showFreeDvReporter()
         connect(m_freedvClient, &FreeDvClient::stationRemoved,
                 m_freedvReporterDialog, &FreeDvReporterDialog::onStationRemoved,
                 Qt::QueuedConnection);
+        // Status message (#4231) — the client lives on m_spotThread, so the
+        // send hops threads via invokeMethod (mirrors the SpotHub wiring in
+        // MainWindow_Menus.cpp), and the enable/disable state comes back over
+        // a queued connection.
+        connect(m_freedvReporterDialog, &FreeDvReporterDialog::messageChanged,
+                this, [this](const QString& msg) {
+            QMetaObject::invokeMethod(m_freedvClient,
+                                      [this, msg] { m_freedvClient->updateMessage(msg); });
+        });
+        connect(m_freedvClient, &FreeDvClient::reportingStateChanged,
+                m_freedvReporterDialog, &FreeDvReporterDialog::setReportingActive,
+                Qt::QueuedConnection);
+        // Seed: reporting may already be on when the dialog is first opened.
+        m_freedvReporterDialog->setReportingActive(
+            m_freedvClient->isReportingEnabled());
         if (auto* s = activeSlice())
             m_freedvReporterDialog->setActiveSlice(s);
         // Seed with current state — bulk_update fires at connect time, before the
@@ -877,6 +1000,9 @@ void MainWindow::showFreeDvReporter()
             grid = m_freedvClient->myGrid();
         m_freedvReporterDialog->setMyGrid(grid);
     }
+    // Re-read the message every open so an edit made in SpotHub's FreeDV tab
+    // (same FreeDvMyMessage setting) doesn't leave this field stale (#4231).
+    m_freedvReporterDialog->reloadMessage();
     m_freedvReporterDialog->show();
     m_freedvReporterDialog->raise();
     m_freedvReporterDialog->activateWindow();
@@ -887,6 +1013,17 @@ void MainWindow::showFreeDvReporter()
 bool MainWindow::startDax()
 {
     if (m_daxBridge) return true;
+
+    // DAX rides PanadapterStream's VITA-49 audio, which only a Flex backend
+    // owns — RadioModel leaves panStream() null for every other family (see
+    // its makeBackend/Flex-adapter step). Bail before creating the bridge so a
+    // non-Flex session can't reach the acquireDaxChannel() calls below on a
+    // null stream. Without this, connecting to an HL2 with AutoStartDAX=True
+    // segfaults ~3 s later from the auto-start timer in onConnectionStateChanged.
+    if (!m_radioModel.panStream()) {
+        qCDebug(lcDax) << "MainWindow: DAX unavailable — backend has no PanadapterStream";
+        return false;
+    }
 
 #ifdef Q_OS_MAC
     // Only start if the macOS HAL driver bundle is installed.
@@ -911,42 +1048,11 @@ bool MainWindow::startDax()
         return false;
     }
 
-    // Listen for DAX stream status messages to register them in PanadapterStream.
-    // The radio sends "stream 0xNNNNNNNN type=dax_rx dax_channel=N" status lines
-    // in response to our stream create commands.
-    connect(&m_radioModel, &RadioModel::statusReceived,
-            m_daxBridge, [this](const QString& obj, const QMap<QString,QString>& kvs) {
-        if (!obj.startsWith("stream ")) return;
-        const QStringList parts = obj.split(QLatin1Char(' '), Qt::SkipEmptyParts);
-        if (parts.size() < 2) return;
-        bool ok = false;
-        quint32 streamId = parts[1].toUInt(&ok, 0);
-        if (!ok) return;
-        const bool removed = parts.contains(QStringLiteral("removed")) || kvs.contains(QStringLiteral("removed"));
-        if (removed) {
-            m_radioModel.panStream()->unregisterDaxStream(streamId);
-            qCDebug(lcDax) << "MainWindow: unregistered removed DAX RX stream"
-                           << "0x" + QString::number(streamId, 16);
-            return;
-        }
-        QString type = kvs.value("type");
-        if (type == "dax_rx") {
-            if (!streamStatusBelongsToUs(kvs, m_radioModel.ourClientHandle())) {
-                qCDebug(lcDax) << "MainWindow: ignoring DAX RX stream for another client"
-                                << "stream=0x" + QString::number(streamId, 16)
-                                << "owner=" << kvs.value("client_handle");
-                return;
-            }
-            int ch = kvs.value("dax_channel").toInt();
-            if (streamId && ch >= 1 && ch <= 4) {
-                m_radioModel.panStream()->registerDaxStream(streamId, ch);
-                qCDebug(lcDax) << "MainWindow: registered DAX RX ch" << ch
-                                << "stream=0x" + QString::number(streamId, 16);
-            }
-        }
-    });
+    // Stream status registration now lives in ONE place —
+    // RadioModel::handleDaxRxStreamRegistry (#3305) — instead of per-consumer
+    // statusReceived hooks with divergent filtering.
 
-    // Create DAX RX streams only for channels with slices assigned.
+    // Acquire DAX channels only for slices with a channel assigned.
     // FlexLib creates streams on demand, not all 4 unconditionally.
     // Creating unused streams causes the radio to round-robin audio
     // across all of them, starving the active channels.
@@ -955,8 +1061,8 @@ bool MainWindow::startDax()
         int ch = s->daxChannel();
         m_daxSliceLastCh[s->sliceId()] = ch;
         if (ch >= 1 && ch <= 4) {
-            m_radioModel.sendCommand(
-                QString("stream create type=dax_rx dax_channel=%1").arg(ch));
+            m_radioModel.acquireDaxChannel(
+                ch, PanadapterStream::DaxConsumer::Bridge);
         }
     }
 
@@ -984,6 +1090,20 @@ bool MainWindow::startDax()
         if (s->daxChannel() >= 1 && s->daxChannel() <= 4) {
             onDaxChannelChanged(s, s->daxChannel());
         }
+    }));
+    // A slice removed out from under us (pan close, foreign client, profile
+    // load) never fires daxChannelChanged — release its channel here or the
+    // bridge holds it until stopDax (a silent radio-side orphan, #3305).
+    m_daxSliceConns.append(connect(&m_radioModel, &RadioModel::sliceRemoved,
+                                   this, [this](int sliceId) {
+        if (!m_daxBridge) return;
+        const int ch = m_daxSliceLastCh.take(sliceId);
+        if (ch < 1 || ch > 4) return;
+        for (auto* s : m_radioModel.slices()) {
+            if (s && s->daxChannel() == ch) return;  // channel hopped slices
+        }
+        m_radioModel.releaseDaxChannel(
+            ch, PanadapterStream::DaxConsumer::Bridge);
     }));
 
     // Wire DAX RX: PanadapterStream routes registered DAX streams here
@@ -1055,38 +1175,19 @@ void MainWindow::stopDax()
     }
     m_daxSliceConns.clear();
     m_daxSliceLastCh.clear();
-    m_daxPendingRxRemoval.clear();  // drop deferred teardowns; streams handled below (#3626)
 
     disconnect(m_radioModel.panStream(), &PanadapterStream::daxAudioReady,
                m_daxBridge, nullptr);
     disconnect(m_daxBridge, &DaxBridge::txAudioReady,
                this, nullptr);
 
-    // Remove DAX RX streams from the radio — but only channels no other
-    // consumer still needs. TCI borrows bridge-created streams (#1331/#1439)
-    // and RADE may hold one; unconditionally removing every registered stream
-    // here silenced WSJT-X / RADE the instant the DAX bridge (or mute) was
-    // toggled off — the #3363 / #2886 failure. Mirror the ownership guard in
-    // onDaxChannelChanged(); full refcounting is tracked in #3305.
-    auto* ps = m_radioModel.panStream();
-    for (int ch = 1; ch <= 4; ++ch) {
-        const quint32 id = ps->daxStreamIdForChannel(ch);
-        if (id == 0) continue;
-        const bool tciUsing = tciServer() && tciServer()->ownsDaxChannel(ch);
-#ifdef HAVE_RADE
-        const bool radeUsing = (id == m_radeDaxStreamId);
-#else
-        const bool radeUsing = false;
-#endif
-        if (tciUsing || radeUsing) {
-            qCInfo(lcDax) << "MainWindow: keeping DAX RX stream"
-                          << "0x" + QString::number(id, 16) << "for channel" << ch
-                          << "— still used by" << (tciUsing ? "TCI" : "RADE") << "(#3363)";
-            continue;
-        }
-        m_radioModel.sendCommand(QString("stream remove 0x%1").arg(id, 0, 16));
-        ps->unregisterDaxStream(id);
-    }
+    // Release every channel the bridge holds. PanadapterStream removes a
+    // radio-side stream only when the LAST holder releases, so a channel TCI
+    // or RADE still uses survives a bridge teardown — the #3363/#2886 failure
+    // class, now enforced structurally instead of by cross-consumer peeking
+    // (#3305).
+    m_radioModel.releaseAllDaxChannels(
+        PanadapterStream::DaxConsumer::Bridge);
 
     // Restore original mic selection
     if (!m_savedMicSelection.isEmpty() && m_savedMicSelection != "PC")
@@ -1112,8 +1213,22 @@ void MainWindow::wireDaxSlice(SliceModel* slice)
 
 // Handle a slice's DAX channel transitioning. daxChannelChanged only fires on
 // an actual value change (SliceModel guards equality), and arrives from both
-// the local UI setter and the radio status echo — both are safe here because
-// the stream create is made idempotent by the daxStreamIdForChannel() guard.
+// the local UI setter and the radio status echo.
+//
+// #3305/#4009: this reconciler translates slice→channel transitions into
+// refcounted acquire/release on PanadapterStream and NOTHING ELSE. It must
+// never send commands itself: the radio answers a re-assert of a live binding
+// with a transient unbind/rebind dax=0/dax=<ch> status pair
+// (state-machines.md §7.4), so any command emitted from this echo path feeds
+// a self-sustaining storm — the ~12-15 Hz `slice set dax` loop of #4009 and
+// the create/remove churn of #3626. Acquire/release are idempotent and the
+// manager's grace window absorbs the transient pair, so this path is
+// loop-free by construction. The #1439 dax_clients re-assert still exists in
+// RadioModel::handleDaxRxStreamRegistry; it fires from the dax_rx status echo,
+// but a per-stream one-shot (m_nudgedDaxStreams, cleared only on `stream
+// remove`) gates it to fire at most once per create so the radio's own
+// transient unbind echo cannot re-trigger it — see #4383 (which reopened #4009
+// because that gate was originally missing).
 void MainWindow::onDaxChannelChanged(SliceModel* slice, int newCh)
 {
     if (!slice || !m_daxBridge) return;
@@ -1123,108 +1238,29 @@ void MainWindow::onDaxChannelChanged(SliceModel* slice, int newCh)
     const int sliceId = slice->sliceId();
     const int oldCh = m_daxSliceLastCh.value(sliceId, 0);
     if (oldCh == newCh) return;
+    // Record every transition, including 0: the tracker mirrors the slice's
+    // channel so a genuine off→on retoggle is seen as 0→N and re-acquires.
     m_daxSliceLastCh[sliceId] = newCh;
 
-    // 0 -> 1..4 (or 1..4 -> different 1..4): ensure the new channel has a
-    // radio-registered DAX RX stream. The stream status echo will register the
-    // stream id in PanadapterStream via the dax_rx handler wired in startDax().
-    if (newCh >= 1 && newCh <= 4) {
-        if (ps->daxStreamIdForChannel(newCh) == 0) {
-            m_radioModel.sendCommand(
-                QString("stream create type=dax_rx dax_channel=%1").arg(newCh));
-            qCInfo(lcDax) << "MainWindow: creating DAX RX stream for channel"
-                          << newCh << "(slice" << sliceId << ", #2895)";
-        }
-        // Re-assert slice -> DAX mapping so the radio registers our stream as a
-        // client. Without this dax_clients stays 0 and the radio sends silence
-        // (the #1439 workaround, mirrored from TciServer::ensureDaxForTci).
-        // This is sent unconditionally (even when newCh is unchanged), so on the
-        // dax=<ch> rebroadcast edge it re-emits a same-value `slice set`. That
-        // does NOT re-enter this reconciler only because SliceModel's status
-        // path drops same-value echoes (`if (m_daxChannel != ch)` in
-        // SliceModel::applyStatus) — that equality guard is load-bearing for the
-        // #3626 storm fix; relaxing it would reopen the loop via this edge.
-        m_radioModel.sendCommand(
-            QString("slice set %1 dax=%2").arg(sliceId).arg(newCh));
-    }
-
-    // <old>:1..4 -> released or moved. Don't tear the stream down inline: on the
-    // FLEX-8600M every `stream create` provokes a transient dax=0 rebroadcast
-    // (see scheduleDaxRxStreamRemoval) that would read here as a de-assignment
-    // and start a create/remove storm. Defer + re-validate instead. (#3626)
-    if (oldCh >= 1 && oldCh <= 4)
-        scheduleDaxRxStreamRemoval(oldCh);
-}
-
-// #3626: On the FLEX-8600M (and likely other 8000-series radios), issuing
-// `stream create type=dax_rx dax_channel=<ch>` while the bound slice already
-// has dax=<ch> makes the radio momentarily detach the stream and re-broadcast
-// `slice <id> dax=0` immediately followed by `slice <id> dax=<ch>` again.
-// SliceModel mirrors every echo into daxChannelChanged (SliceModel.cpp ~846),
-// so the inline reconciler above would read the transient dax=0 as a real
-// de-assignment, remove the stream, then re-create it on the dax=<ch> that
-// lands ~80 ms later — a self-sustaining create/remove storm (observed at
-// 12-25 Hz in #3626 logs). The churn floods the radio's TCP command channel and
-// resets the DAX VITA-49 sequence every cycle, inflating packetErrorCount until
-// the network-quality monitor falls to POOR ("connection drops to red").
-//
-// Fix: defer the teardown and re-validate at fire time. The dax=<ch>
-// rebroadcast lands long before the grace window elapses, so a slice is back on
-// the channel and the removal is declined — the loop never starts. A genuine
-// user de-assignment has no follow-up rebroadcast, so the channel stays
-// unwanted and the stream is removed after the grace window. Full DAX RX
-// stream refcounting is tracked separately in #3305.
-void MainWindow::scheduleDaxRxStreamRemoval(int ch)
-{
-    if (ch < 1 || ch > 4) return;
-    if (m_daxPendingRxRemoval.contains(ch)) return;  // already pending — don't stack timers
-    m_daxPendingRxRemoval.insert(ch);
-
-    static constexpr int kDaxRxRemovalGraceMs = 1500;  // ≫ the ~80 ms rebroadcast cycle
-    QTimer::singleShot(kDaxRxRemovalGraceMs, this, [this, ch]() {
-        // QSet::remove() returns false when the key is gone, which means
-        // stopDax() cleared the pending set after this timer was armed — i.e. a
-        // stale fire from a previous DAX-bridge generation (off→on toggle inside
-        // the grace window). Treat the cleared set as an authoritative cancel so
-        // we never act against a freshly-recreated bridge's streams. (#3626)
-        if (!m_daxPendingRxRemoval.remove(ch)) return;
-        if (!m_daxBridge) return;  // bridge torn down — stopDax() already cleared streams
-        auto* ps = m_radioModel.panStream();
-        if (!ps) return;
-
-        // Re-validate: if any slice still wants this channel, the transient
-        // dax=0 has already been undone by the dax=<ch> rebroadcast — keep it.
+    if (newCh >= 1 && newCh <= 4)
+        ps->acquireDaxChannel(newCh, PanadapterStream::DaxConsumer::Bridge);
+    if (oldCh >= 1 && oldCh <= 4) {
+        // The Bridge's hold is per-channel, not per-slice: only release when
+        // no slice references the old channel anymore (a channel can hop
+        // between slices, and the moves can arrive in either order).
+        bool stillWanted = false;
         for (auto* s : m_radioModel.slices()) {
-            if (s && s->daxChannel() == ch) return;
+            if (s && s->daxChannel() == oldCh) { stillWanted = true; break; }
         }
-
-        const quint32 id = ps->daxStreamIdForChannel(ch);
-        if (id == 0) return;
-        // Ownership guard: the PanadapterStream DAX map is shared across every
-        // DAX consumer — the bridge, TCI (which borrows bridge-created streams,
-        // #1331/#1439), and RADE. Removing a stream another consumer still uses
-        // would silence WSJT-X or RADE audio (the mirror image of #3270). (#2895)
-        const bool tciUsing = tciServer() && tciServer()->ownsDaxChannel(ch);
-#ifdef HAVE_RADE
-        const bool radeUsing = (id == m_radeDaxStreamId);
-#else
-        const bool radeUsing = false;
-#endif
-        if (tciUsing || radeUsing) {
-            qCInfo(lcDax) << "MainWindow: keeping DAX RX stream"
-                          << "0x" + QString::number(id, 16)
-                          << "for channel" << ch
-                          << "— still used by" << (tciUsing ? "TCI" : "RADE")
-                          << "(#3626)";
-            return;
-        }
-        m_radioModel.sendCommand(QString("stream remove 0x%1").arg(id, 0, 16));
-        ps->unregisterDaxStream(id);
-        qCInfo(lcDax) << "MainWindow: removed DAX RX stream"
-                      << "0x" + QString::number(id, 16)
-                      << "for channel" << ch << "(#3626 deferred)";
-    });
+        if (!stillWanted)
+            ps->releaseDaxChannel(oldCh, PanadapterStream::DaxConsumer::Bridge);
+    }
 }
+
+// (#3626's deferred-removal + revalidation and #2895's cross-consumer
+// ownership guards were absorbed into PanadapterStream's refcounted DAX
+// channel manager — grace-window removal at last-holder release, per-consumer
+// holds instead of tciUsing/radeUsing peeking. #3305)
 #endif
 
 // registerMidiParams() lives in MainWindow_Controllers.cpp (#3351 Phase 1a).
@@ -1272,18 +1308,25 @@ void MainWindow::activateWFM(int sliceId)
     m_wfmSliceId = sliceId;
 
     // Centre the pan (and with it the DAX IQ stream) on the slice — once.
-    // applyPanStatus updates the local model immediately so offsets computed
-    // before the radio echoes the new centre are already correct.
-    auto centerPanAtSlice = [this, s]() {
+    // requestPanCenter() updates the local model as it puts the command on the
+    // wire, so offsets computed before the radio echoes the new centre are
+    // already correct — and during a profile load it defers the write instead of
+    // letting it be dropped, which would have left the DAX IQ stream centred
+    // somewhere the client no longer believed it was (#4142).
+    // Returns whether the pan is centred on the slice NOW — a deferred
+    // recenter (profile-load hold) is a promise, not a fact, and the NCO
+    // must not be programmed as if it already happened.
+    auto centerPanAtSlice = [this, s]() -> bool {
         const QString panId = s->panId();
-        if (panId.isEmpty()) return;
+        if (panId.isEmpty()) return false;
         const double freq = s->frequency();
         auto* pan = m_radioModel.panadapter(panId);
-        if (pan && qFuzzyCompare(pan->centerMhz(), freq)) return;
-        const QString freqStr = QString::number(freq, 'f', 6);
-        if (pan) pan->applyPanStatus({{"center", freqStr}});
-        m_radioModel.sendCommand(
-            QString("display pan set %1 center=%2").arg(panId, freqStr));
+        // Effective (pending-else-model) compare suppresses re-requesting a
+        // recenter already deferred in flight; "centred now" is only true
+        // when the MODEL (radio truth) agrees (#4142).
+        if (pan && qFuzzyCompare(m_radioModel.effectivePanCenterMhz(panId), freq))
+            return qFuzzyCompare(pan->centerMhz(), freq);
+        return m_radioModel.requestPanCenter(panId, freq);
     };
     centerPanAtSlice();
 
@@ -1321,9 +1364,18 @@ void MainWindow::activateWFM(int sliceId)
             (sliceFreqMhz - pan->centerMhz()) * 1e6);
         if (qAbs(offsetHz) <= m_wfmDemod->maxFreqOffsetHz()) {
             m_wfmDemod->setFreqOffsetHz(offsetHz);
-        } else {
-            centerPanAtSlice();
+        } else if (centerPanAtSlice()) {
             m_wfmDemod->setFreqOffsetHz(0.0f);
+        } else {
+            // The recenter is deferred (profile-load hold) or could not be
+            // dispatched — the DAX IQ stream is still centred where the radio
+            // is. A zero offset here would tune the demod to the WRONG
+            // frequency; keep best-effort audio at the clamped edge of the IQ
+            // window instead. The deferred recenter self-heals at flush, and
+            // the next frequencyChanged converges the offset. (#4142)
+            const float maxOffsetHz = m_wfmDemod->maxFreqOffsetHz();
+            m_wfmDemod->setFreqOffsetHz(
+                std::clamp(offsetHz, -maxOffsetHz, maxOffsetHz));
         }
     });
 }
@@ -1371,11 +1423,12 @@ void MainWindow::reflectWfmButtons(bool on, int sliceId)
 void MainWindow::showPskReporterMapDialog()
 {
     if (!m_pskReporterMapDialog) {
-        auto* dlg = new PskReporterMapDialog(&m_radioModel, m_propForecast, this);
+        auto* dlg = new PskReporterMapDialog(
+            m_audio, &m_radioModel, m_propForecast, this);
         dlg->setFramelessMode(
             AppSettings::instance().value("FramelessWindow", "True").toString() == "True");
         m_pskReporterMapDialog = dlg;
-        m_persistentDialogs.append(QPointer<PersistentDialog>(dlg));
+        trackPersistentDialog(dlg);
     }
     m_pskReporterMapDialog->show();
     m_pskReporterMapDialog->raise();

@@ -37,8 +37,7 @@ public:
             const bool settled = !m_smooth.tick(m_animElapsed.restart());
             if (settled)
                 m_animTimer.stop();
-            if (settled || m_smooth.shouldRepaint())
-                update();
+            update();
         });
     }
 
@@ -95,13 +94,6 @@ const QString kEnableStyle =
     "QPushButton:checked {"
     "  background: #006040; color: #00ff88; border: 1px solid #00a060;"
     "}";
-
-constexpr const char* kEditStyle =
-    "QPushButton {"
-    "  background: #1a2a3a; border: 1px solid #205070; border-radius: 3px;"
-    "  color: #c8d8e8; font-size: 11px; padding: 2px 10px;"
-    "}"
-    "QPushButton:hover { background: #204060; }";
 
 } // namespace
 

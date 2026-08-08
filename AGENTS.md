@@ -9,13 +9,13 @@ tool. Each tool has its own well-known file at a different path
 project-wide lives in **this** file.
 
 If you are an AI assistant: read this file end-to-end before writing
-code or recommending merges. The file is ~440 lines; that's the cost
+code or recommending merges. The file is ~830 lines; that is the cost
 of doing the job right on this codebase.
 
 ## Project Goal
 
 Replicate the **Windows-only FlexRadio SmartSDR client** (written in C#) as a
-**Linux-native C++ application** using Qt6 and C++20. The aim is to mirror the
+**native, cross-platform C++ application** using Qt6 and C++20. The aim is to mirror the
 look, feel, and every function SmartSDR is capable of. The reference radio is a
 **FLEX-8600 running firmware 4.2.18**, which speaks **SmartSDR protocol v1.4.0.0**.
 
@@ -32,6 +32,9 @@ When helping with AetherSDR:
 - Flag any proposal that would break slice 0 RX flow
 - If unsure about protocol behavior → ask for logs/wireshark captures first
 - **Use `AppSettings`, never `QSettings`** — see "Settings Persistence" below
+- **New engine code goes in `libaethercore`** (`src/core/` or `src/models/`),
+  exposed to the UI through models — never via a new gui→core header include.
+  See "Build targets" and "In-flight: aetherd" under Architecture Overview.
 - **Read `CONTRIBUTING.md`** for full contributor guidelines, coding conventions,
   and the AI-to-AI debugging protocol (open a GitHub issue for cross-agent coordination)
 - **Sign every commit you author.** `main` enforces `required_signatures`, so a
@@ -166,18 +169,73 @@ cmake --build build -j$(nproc)
 ./build/AetherSDR
 ```
 
+**Optional — DFNR (DeepFilterNet3) noise reduction.** Run
+`scripts/setup/setup-deepfilter.sh` (Windows: `setup-deepfilter.ps1`)
+*once before* `cmake` to fetch the prebuilt `libdeepfilter` for your
+platform; configure will otherwise report `DFNR ... disabled — library
+not found` and gate the feature off. CI runs this step automatically
+(cached) in the release-build workflows, so shipped binaries always
+include DFNR; it is a manual prereq only for local dev builds. NR still
+works without it — RN2 (RNNoise) is bundled and always built, needing no
+setup.
+
 Full dependency list is in `README.md` — don't duplicate it here.
 
-Current version: **26.6.5** (set in both `CMakeLists.txt` and `README.md`).
+Current version: **26.8.1**.
 Versioning scheme is **CalVer** (`YY.M.patch[.hotfix]`) starting from v26.5.1,
 the 1.0-equivalent. Hotfix sub-patches use a 4th component (e.g. 26.5.2.1).
 Earlier tags used semver through v0.9.8.
+
+The version is stated in **five** places, and a release is not prepped until
+all five agree. This list is spelled out because it was previously described as
+"both `CMakeLists.txt` and `README.md`" — and v26.7.4.1 duly shipped with the
+other three stale:
+
+| file | what to change |
+|---|---|
+| `CMakeLists.txt` | `project(AetherSDR VERSION …)` — the only one that reaches the binary |
+| `README.md` | the **Current version:** line |
+| `AGENTS.md` | this line |
+| `CHANGELOG.md` | a new section at the top, under `## [Unreleased]` |
+| `packaging/linux/io.github.aethersdr.aethersdr.metainfo.xml` | a new `<release …/>` entry — AppStream and Flathub read this, not the git tag |
+
+`ROADMAP.md`'s "Current cycle" heading names the release too.
+
+Leave every *historical* mention alone. "shipped v26.7.4" and "(v26.7.4)" are
+statements about when something landed and stay true forever, so a blanket
+find-and-replace across a version bump silently corrupts them.
+
+### `CHANGELOG.md` is a release-prep file. Do not touch it in a feature PR.
+
+The table above is the **only** reason to edit `CHANGELOG.md`: a new version
+section, at release prep. An ordinary PR — a fix, a feature, a refactor —
+**must not add an entry**, however user-visible the change is. Describe it in
+the PR body and the commit message instead; those are where the reasoning
+belongs and neither one conflicts with anything. At release prep, the section
+is written *from* those PR bodies — `gh pr list --state merged --search
+'merged:>=<last-tag-date>'` is the source of truth for what shipped.
+
+This is a mechanical rule, not a stylistic preference. Every entry is prepended
+to the top of the same `## [Unreleased]` list, so **any two PRs that both add
+one conflict with each other**, and every PR still open when one of them merges
+goes stale and needs a manual resolution. With a queue of concurrent agent PRs
+that is not an occasional annoyance — it is a conflict on essentially every
+pair. The file is append-mostly by nature and merges terribly by construction,
+so the fix is to stop writing to it outside the one moment that needs it.
+
+Reviewers: do not ask for a `CHANGELOG.md` entry, and flag one as a change to
+remove if a PR adds it. There has never been a written rule requiring per-PR
+entries — `CONTRIBUTING.md` has never mentioned the file at all — but the habit
+propagated anyway, by agents reading `git log` and copying what they saw. When
+this rule landed it sat at 45% of recent merges (18 of the last 40, measured
+2026-08-02), which is the worst of both worlds: not a convention anyone can
+rely on, and enough churn to conflict constantly.
 
 ---
 
 ## CI/CD Workflow
 
-CI runs in Docker image `ghcr.io/ten9876/aethersdr-ci:latest` (~3.5 min builds).
+CI runs in Docker image `ghcr.io/aethersdr/aethersdr-ci:latest` (~5 min builds).
 **If you add a new `find_package(...)` to CMakeLists.txt, also add the
 corresponding `-dev` package to `.github/docker/Dockerfile` and push.** The
 `docker-ci-image.yml` workflow rebuilds the image automatically (~3 min); wait
@@ -215,6 +273,11 @@ Key source directories: `src/core/` (protocol, audio, DSP), `src/models/`
   TUs; new feature code goes in a sibling, NOT `MainWindow.cpp` — see
   [Adding code to MainWindow](#adding-code-to-mainwindow)
 - `PanadapterStream` — VITA-49 UDP parsing, routes FFT/waterfall/audio/meters
+- `CrossNeedleMeterGeometry` — PWR applet's cross-needle power/SWR face math.
+  **Before touching the response model, SWR-contour construction, or label
+  placement, read [`docs/cross-needle-meter-math.md`](docs/cross-needle-meter-math.md)** —
+  the authoritative model + decision record (it exists because these formulas
+  have churned when edited without a shared spec).
 
 **Threading:** up to 12 threads — see `docs/architecture/pipelines.md` for the
 full thread diagram, data flow, cross-thread signal map, and GPU rendering notes.
@@ -222,6 +285,145 @@ full thread diagram, data flow, cross-thread signal map, and GPU rendering notes
 **Design principle:** RadioModel owns all sub-models on the main thread.
 Worker threads communicate exclusively via auto-queued signals. Never hold
 a mutex in the audio callback.
+
+### In-flight: aetherd engine/UI decoupling (RFC accepted 2026-07-04)
+
+The accepted RFC at
+[`docs/aetherd-headless-engine-design.md`](docs/aetherd-headless-engine-design.md)
+(tracking issue #3849) splits this codebase into an engine library
+(`libaethercore`), a headless engine daemon (`aetherd`), and thin UI
+clients, with pluggable radio backends (`IRadioBackend`). Implementation
+follows the RFC's §10 staged order; **step 1 (`libaethercore`) and the
+step-2 seam have landed** — the engine is a static library, and
+`IRadioBackend` (`src/core/backends/`) now has **three** implementors,
+selected at connect time by a `family` string through `makeBackend()`:
+
+| Family | Backend | Notes |
+|---|---|---|
+| `flex` | `FlexBackend` (`src/core/backends/flex/`) | SmartSDR wire stack; the Panadapter / Slice / Meter / Transmit / Amp / Tuner status+command paths decode behind it (2.2b–2.4) |
+| `hl2` | `Hl2Backend` (`src/core/backends/hl2/`) | Hermes-Lite 2, shipped v26.7.4 — Metis/HPSDR transport, raw-IQ RX/TX DSP done in-client |
+| `sim` | `SimBackend` (`src/core/backends/sim/`) | Synthetic demo backend, shipped v26.7.4 — generates its own audio + spectrum, RX-only by construction (Principle VI) |
+
+The versioned protocol (step 3+) has not landed — UI code still consumes
+models directly, and that remains correct.
+
+**Backends that demodulate in-process double-feed the sink if you let
+them.** `IRadioBackend::audioFrameReady` has two possible routes to
+`AudioEngine::feedAudioData` — the `RadioModel::backendAudioFrameReady`
+relay, and a direct connect in `wireBackendSeam()`. `FlexBackend` is
+structurally immune because it never emits `audioFrameReady` at all (audio
+rides `PanadapterStream`/VITA-49), so the "no double-feed" reasoning that
+holds for Flex stops holding for any in-process backend. Gate the relay on
+`backendOwnsRxAudio()`. `Qt::UniqueConnection` does **not** protect you here
+— they are two different signals arriving at the same slot, so nothing looks
+duplicate to Qt. The same shape exists on the spectrum side.
+
+**Build targets (post-RFC step 1):**
+
+| Target | Contents | May link |
+|---|---|---|
+| `libaethercore` (`aethercore`) | `src/core/` + `src/models/` — the engine | Qt Core/Network/Multimedia/WebSockets/SerialPort/DBus, the DSP + third-party libs. **Never `gui/`; QtWidgets only via the tracked-legacy files below, shrinking to zero** |
+| `AetherSDR` | `src/gui/` + `main.cpp` — the desktop app | `aethercore` + Qt Widgets + qgeoview + QRhi private |
+
+The dependency direction is CI-enforced (`tools/check_engine_boundary.py`,
+`static-checks.yml`, `--strict`) by three ratchets:
+- **EB1** — no `core/`/`models/` file may include a `gui/` header (now
+  zero; any finding is an error).
+- **EB2** — no `core/`/`models/` file may use QtWidgets (a shrinking
+  tracked-legacy set warns, new usage errors).
+- **EB3** — no file **above the radio seam** (all of `src/gui/`,
+  `src/core/`, `src/models/` **except** the backend tree
+  `src/core/backends/`) may include a **vendor header** — the
+  family-specific wire classes the RFC keeps behind `IRadioBackend`
+  (SmartSDR/FlexLib + KiwiSDR; the headers tagged `vendor(...)` in
+  `docs/architecture/aetherd-touchpoint-tags.json`). Only `vendor(...)` is
+  EB3-gated: a standalone *accessory* device's own transport (the 4O3A
+  antenna switch, the Tgxl/Pgxl direct sockets) is `peripheral(...)`, a
+  USB input surface is `ui-support`, and a generic device model fused with
+  vendor relay (e.g. `TunerModel`) is `mixed(flex)` — none of those are
+  `vendor`, so none are EB3-gated. Today's coupling is
+  frozen as a per-file, shrink-only baseline; a **new** above-seam vendor
+  include, or an **increase** in a tracked file, errors. (RFC step 2.4;
+  see "Engine boundary ratchet — EB3" below.)
+
+If your change trips any of these, restructure the change — do not move
+the file, weaken the check, or add an exemption. Engine code that needs a
+UI callback defines a gui-free interface in `core/` (e.g.
+`IConnectionAutomation`) that the gui implements — never a `gui/` include.
+
+**Until migration rules appear in this file, nothing changes for you.**
+Do not pre-emptively restructure code toward the RFC — no new engine/UI
+seams, no backend interfaces, no speculative library targets. Each
+migration step lands together with an update to this file stating the new
+rules (pre-drafted in
+[`docs/aetherd-agents-md-staging.md`](docs/aetherd-agents-md-staging.md));
+if a rule isn't in this file, its step hasn't landed. Architecture changes
+ahead of the RFC steps remain maintainer-only (see Autonomous Agent
+Boundaries above). The CI-enforced rules so far are EB1/EB2/EB3 above
+(`tools/check_engine_boundary.py`, warning for tracked baselines, error
+for new violations).
+
+**Engine boundary ratchet — EB3 (vendor includes).** As of RFC step 2.4,
+`check_engine_boundary.py` also enforces that nothing above the radio seam
+reaches around `IRadioBackend` to a vendor wire class. What this means for
+you:
+
+- **Nothing was relocated.** Step 2.4 is *ratchet-only*: the vendor
+  headers stay where they are (`src/core/…`, `src/models/…`) for now. EB3
+  just makes the existing boundary enforceable *in place*, so the
+  decoupling can proceed without new coupling piling up behind it.
+- **The rule.** Each tracked file's baseline row is the exact **set** of
+  vendor headers it may include. Adding a vendor `#include` (e.g.
+  `KiwiSdrManager.h`, `RadioConnection.h`, `StreamStatus.h`) to a `gui/`,
+  `core/`, or `models/` file that isn't tracked — or adding a header not
+  in a tracked file's set, *including a lateral swap that keeps the count
+  flat* (drop `RadioConnection.h`, add `KiwiSdrManager.h`) — fails the
+  check. The per-file baseline (`KNOWN_VENDOR_INCLUDE_BASELINE`) lives at
+  the top of `tools/check_engine_boundary.py`; the vendor vocabulary is
+  **derived at runtime from the touchpoint audit**
+  (`docs/architecture/aetherd-touchpoint-tags.json`, the single source of
+  truth), so a header newly tagged `vendor` there is enforced without
+  editing the checker.
+- **Adding a radio feature?** Don't include the vendor class above the
+  seam. Put the wire code in the family backend
+  (`src/core/backends/<family>/`) and surface it through `IRadioBackend`
+  (a canonical verb/signal, or the namespaced
+  `invokeExtension`/`extensionStatus` channel for vendor-specifics), then
+  consume *that* from the model/UI. Backend code (under
+  `src/core/backends/`) and the vendor translation units themselves may
+  include vendor headers freely — they're below the seam.
+- **Removing coupling (the goal).** When you convert a file's radio access
+  to the seam and drop a vendor include, **remove that stem from the
+  file's row** in `KNOWN_VENDOR_INCLUDE_BASELINE` (delete the row when it
+  empties). The set only shrinks — never add a stem or a row to make a
+  build pass. If EB3 blocks you and the include is genuinely unavoidable,
+  that's a design conversation for a maintainer, not a baseline edit.
+- **`src/gui/**` is in the CI trigger** for `static-checks.yml` now
+  (EB3 guards gui files), so a gui-only PR that adds vendor coupling is
+  still caught.
+
+**Where radio-facing code goes now that the seam exists.** Route by kind:
+
+| Your change | Goes |
+|---|---|
+| Code speaking a vendor wire protocol (commands, discovery, stream parsing) | that family's backend under `src/core/backends/<family>/`, behind `IRadioBackend` — never in `gui/`, and increasingly not in the models (they're being decoupled from the wire over 2.2b–2.4) |
+| A new radio family | a new `IRadioBackend` implementation under `src/core/backends/<family>/` — requires an approved design doc naming its open protocol authority (Constitution Principles I & IV apply per backend) |
+| A new engine feature | `libaethercore`, exposed through models — never via a new gui→core header |
+
+Do **not** reroute existing model↔wire code through `FlexBackend`
+wholesale — the per-touchpoint conversion is staged work
+(`docs/architecture/aetherd-touchpoints.md`). The five `mixed` models
+(Radio/Slice/Transmit/Panadapter/Meter) have been split (2.3): their
+SmartSDR status decode now lives in `FlexBackend` behind typed deltas, and
+the models apply normalized signals. The amp (PGXL) and tuner (TGXL)
+accessory models followed in 2.4 — `AmpModel` was extracted from
+`RadioModel`, and their status decode and command encode now route through
+`FlexBackend` too (#4099, #4101, #4113, #4192, #4200). The remaining vendor
+headers are **not** relocated yet — step 2.4 landed the EB3 ratchet (above) that
+freezes today's above-seam vendor coupling and lets it be decoupled
+subsystem-by-subsystem. Converting a touchpoint still follows the claim
+protocol + before/after `tools/verify_slice0_rx.py` recipe; a converted
+file drops its vendor include and lowers its EB3 baseline.
 
 ---
 
@@ -300,9 +502,11 @@ granularity, then **stop**: if tempted to subdivide one subsystem into several
 thin TUs, extract a real class instead (the #3557 direction) — that's the only
 move that actually decouples.
 
-Sibling TUs must **carry their includes explicitly** — the Linux CI floor is
-Qt 6.4.2; don't rely on transitive includes (this broke #3532). When you move
-the last user of a header out of `MainWindow.cpp`, drop that `#include` too.
+Sibling TUs must **carry their includes explicitly** — the Linux CI image is on
+Qt 6.8.3 while macOS runs 6.11.x, so a header that resolves transitively on the
+newer Qt need not on 6.8.3; don't rely on transitive includes (this broke
+#3532). When you move the last user of a header out of `MainWindow.cpp`, drop
+that `#include` too.
 
 Full map + decision guide:
 **[`docs/architecture/mainwindow-decomposition.md`](docs/architecture/mainwindow-decomposition.md)**.
@@ -339,16 +543,101 @@ document why.
 ### Settings Persistence (AppSettings — NOT QSettings)
 
 **IMPORTANT:** Do NOT use `QSettings` anywhere in AetherSDR. All client-side
-settings are stored via `AppSettings` (`src/core/AppSettings.h`), which writes
-an XML file at `~/.config/AetherSDR/AetherSDR.settings`. Key names use
-PascalCase (e.g. `LastConnectedRadioSerial`, `DisplayFftAverage`). Boolean
+settings are stored via `AppSettings` (`src/core/AppSettings.h`), which
+persists to a **SQLite database** at `~/.config/AetherSDR/AetherSDR.db`
+(RFC #4603; design doc: `docs/settings-store-sqlite-design.md`). Key names use
+PascalCase (e.g. `LastConnectedRadioSerial`, `DisplayFftFillColor`). Boolean
 values are stored as `"True"` / `"False"` strings.
 
 ```cpp
 auto& s = AppSettings::instance();
 s.setValue("MyFeatureEnabled", "True");
 bool on = s.value("MyFeatureEnabled", "False").toString() == "True";
+s.save();   // commits the dirty rows in one transaction (cheap; still required)
 ```
+
+Rules that come with the store:
+
+- **Never include `sqlite3.h` outside `src/core/SettingsDatabase.cpp`** — the
+  engine is a single-point seam (see `third_party/sqlite/README.md`).
+- **Credentials never go in the settings store.** QtKeychain (service
+  `"AetherSDR"`) is the only persistent credential store; without keychain
+  support a credential is session-only via
+  `AppSettings::setSessionCredential()`. The known credential names live in
+  ONE table — `src/core/SettingsCredentialPolicy.h` — shared by the import
+  exodus, the export sanitizer, the `setValue()` seam guard, and the CLI, so
+  add new credentials THERE (the seam then enforces the policy for you).
+  Follow the patterns in
+  `MqttSettings`/`AutomationBridgeSettings`/`CopyAssistSettings`.
+- The legacy XML file (`AetherSDR.settings`) is a **frozen snapshot** from the
+  one-time import — never write to it, never delete it outside Reset Settings.
+- Pre-`QApplication` code reads via `SettingsBootstrap::readValue()` and paths
+  come from `SettingsPaths` — never hand-build a config path.
+- The `AetherSDR --config <list|get|set|unset|export|features|path>` CLI inspects and
+  repairs the store without starting the GUI (the recovery path when a stored
+  value breaks startup).
+
+### Radio-Scoped Feature Documents (`radio_settings`)
+
+Radio-scoped configuration — state that belongs to one physical radio or one
+backend family — does NOT go in flat `AppSettings` keys. It goes in the
+`radio_settings` table as **one versioned JSON document per feature per scope**
+(Constitution Principle V, realized in the store):
+
+```cpp
+const RadioSettingsScope scope = m_radioModel.settingsScope();  // (family, serial)
+// Read-modify-write uses the EXACT row (no family-wide fallback — you must
+// not clone the family default into a per-radio row), and the write result
+// is checked: a refused write that the UI repaints over is the worst
+// failure shape.
+QJsonObject doc = scope.featureExact("MyFeature");
+doc.insert("field", newValue);
+if (!scope.setFeature("MyFeature", kMySchemaVersion, doc)) {
+    qWarning() << "MyFeature: settings write did not persist";
+}
+// (scope.feature() — exact → family-wide → {} — is for CONSUMERS reading
+// effective config, not for writers.)
+```
+
+- Identity comes from `RadioModel::settingsScope()` (Flex serial / HL2 MAC /
+  Kiwi UUID) — never re-derive it yourself. An empty `radio_id` row is the
+  family-wide default; guard against writing one by accident when the serial
+  isn't known yet (see `BandStackSettings` for the pattern).
+- **Check the write result.** `setFeature()` can refuse (read-only store,
+  reset in progress); a mutation that silently doesn't persist while the UI
+  repaints from the store is the worst failure shape (PR #4621 review). Log
+  loudly at minimum.
+- Writers judging the row they're about to replace use the **exact** read
+  (`featureExact()`), not the fallback-composed one; and never overwrite a
+  document whose `schema_version` is newer than yours — refuse and log
+  (see `RadioStateMemory::store()` for the canonical shape).
+- Shipped precedents: the HL2 `OperatingState` document (per-band drive/LNA
+  maps in its extension), the `Identity` nickname document, and `BandStack`
+  (#4621), and the shared memory bank at `(local, '', MemoryBank)` (#4623).
+
+### Client-Side Radio State Memory (capture/restore)
+
+For radios that persist nothing themselves, the client is the radio's memory —
+but only through the one sanctioned pipeline:
+
+- A backend declares WHICH state the client owns via
+  `RadioCapabilities::clientSettingsDomains` (typed per-domain flags; empty =
+  restore nothing). **Flex and Sim declare explicitly empty** — a CI test
+  guards this, because a non-empty Flex declaration would re-introduce the
+  #2465/#4126/#4261 re-assert-stale-state bug class.
+- `RadioStateMemory` is the ONLY reader/writer of the `OperatingState`
+  document; engagement is `shouldEngage(caps)` — capability-shaped, **never a
+  family-name check**. `RadioModel` hands restored state to the backend
+  unconditionally before `connectRadio()` (an empty state is the reset that
+  prevents same-family radio-swap bleed), and debounces capture (2 s trailing
+  + 10 s max-wait) with an explicit flush on disconnect AND in
+  `MainWindow::closeEvent()` (quit doesn't pump the queued path).
+- The backend validates everything it restores at its own boundary
+  (Principle VII) and **restore never keys transmit** (Principle VI) —
+  restored values are setpoints; the TX gate is untouched.
+- The extension document's top level is domain-named sub-objects gated
+  per-domain by the engine; the CONTENTS of each sub-object are the backend's
+  own (opaque above the seam).
 
 ### Settings Migration
 
@@ -364,25 +653,67 @@ if (s.contains("OldKey") && !s.contains("NewKey")) {
 }
 ```
 
-Run once at app or feature startup, not on every access.
+Run once at app or feature startup, not on every access. (The XML→SQLite store
+migration itself is automatic inside `AppSettings::load()` — feature code never
+touches it.)
 
-### Radio-Authoritative Settings Policy
+**Migrating a legacy side file into scoped documents** follows the
+claim-and-freeze pattern (precedents: `Hl2Discovery` nicknames and
+`BandStackSettings`, `LocalMemoryBank`):
 
-**The radio is always authoritative for any setting it stores** (Constitution
-Principles II & III). AetherSDR must never save, recall, or override radio-side
-settings from client-side persistence. Only save client-side settings for things
-the radio does NOT save.
+- Claim lazily, per scope, on first access — the document needs the radio's
+  FAMILY, which only the live scope knows.
+- The document's existence is the migration marker; a **present-but-empty**
+  document blocks re-import (an operator who emptied a store must not have it
+  resurrected by a restored backup).
+- The legacy source stays **frozen** (or per-section-pruned, for multi-radio
+  files) as the downgrade snapshot — never rewritten with new data.
+- Memoize only *settled* states (document exists, claim succeeded, section
+  confirmed absent); every retryable condition (file missing, unparseable,
+  write refused) must retry on the next access, not be latched away.
 
-**Radio-authoritative (do NOT persist):** frequency, mode, filter, step size,
-AGC, squelch, DSP flags, antennas, TX power, panadapter *count* and per-pan
-state (center, bandwidth, min/max dBm, etc.).
+### Settings Authority Policy (radio-authoritative vs client-owned)
 
-**Client-authoritative (persist in AppSettings):** window geometry, layout
-arrangement (`PanadapterLayout`, applet order/visibility), client-side DSP
-(NR2/RN2/NR4/DFNR), UI preferences, display preferences, spot settings.
+**The radio is always authoritative for any setting it can store** (Constitution
+Principles II & III) — and the deciding test is Constitution III's own:
+*whether THIS radio can save and restore the value*, which since RFC #4603 is a
+**declared capability, not a family assumption**:
 
-**Why:** When both persist the same setting, they fight on reconnect. The
-radio's GUIClientID session restore is always more current than our saved state.
+- **On a radio that persists its own state (Flex)**: never save, recall, or
+  override radio-side settings from client-side persistence. The lists below
+  apply verbatim, and `clientSettingsDomains` is declared EMPTY.
+- **On a radio that persists nothing and declares so (HL2 today)**: the
+  client IS the radio's memory — for exactly the domains the backend declares
+  in `RadioCapabilities::clientSettingsDomains` (Sim deliberately declares
+  none: a synthetic scene has nothing worth remembering), persisted ONLY through
+  `RadioStateMemory`'s `OperatingState` document (see "Client-Side Radio State
+  Memory" above). Never in flat `AppSettings` keys, and never via ad-hoc code
+  paths — the one pipeline is what keeps the Flex guarantees provable.
+
+**Radio-authoritative on Flex (do NOT persist client-side):** frequency, mode,
+filter, step size, AGC, squelch, DSP flags, antennas, TX power, panadapter
+*count* and per-pan state (center, bandwidth, min/max dBm, FFT
+average/FPS/weighted-average, and waterfall line duration).
+
+**Client-authoritative everywhere (persist in AppSettings):** window geometry,
+layout arrangement (`PanadapterLayout`, applet order/visibility), client-side
+DSP (NR2/RN2/NR4/DFNR), UI preferences, client-only display appearance
+preferences, spot settings.
+
+**Why (the Flex half):** when both the client and a self-persisting radio
+store the same setting, they fight on reconnect — the radio's GUIClientID
+session restore is always more current than our saved copy. On a declared-
+domain radio there is no second store to fight with, which is exactly why the
+client may hold the state there and only there.
+
+**Anti-pattern (recurring — see #4261):** Do not write a radio-echoed status
+value into a setter that *also* persists it to `AppSettings`. That makes the
+client re-assert stale state on reconnect / profile load and fight the radio —
+the exact class of bug behind #2465, #4126, #4081, #4083, and #4261. For a
+radio-authoritative field, route status straight to the display (a plain member
++ signal) and never call `AppSettings::setValue()` in its setter. When a display
+setter genuinely persists (e.g. waterfall *appearance*: color gain, black
+level), that value must be client-only — never a value the radio also echoes.
 
 ### GUI↔Radio Sync (No Feedback Loops)
 
@@ -489,7 +820,7 @@ on every value-change method, `QAccessibleInterface` subclass for any
 with `QPushButton` or add keyboard activation).
 
 CI enforcement: [`tools/check_a11y.py`](tools/check_a11y.py) runs on every
-PR via [`.github/workflows/a11y-check.yml`](.github/workflows/a11y-check.yml)
+PR via [`.github/workflows/static-checks.yml`](.github/workflows/static-checks.yml)
 and emits inline diff annotations for the patterns above. Warning-only
 (`exit 0`); never blocks a build.
 
@@ -523,3 +854,15 @@ JSON schemas, targeting rules, recipes, gotchas — in
 **[`docs/automation-bridge.md`](docs/automation-bridge.md)**. This is the
 deterministic, cross-OS way to do "snapshot → act → assert" on the native UI
 (issue [#3646](https://github.com/aethersdr/AetherSDR/issues/3646)).
+
+**MCP server (for AI assistants).** The same bridge is also exposed over the
+**Model Context Protocol**, so an MCP-capable assistant can drive AetherSDR
+through schema-validated tools instead of raw JSON. It's enabled from a Radio
+Setup toggle and guarded by token auth; the common verbs (tune, slice, pan,
+connect, record, mark, menu, floors, streams, capture_audio, …) are surfaced as
+first-class typed tools, alongside robustness helpers (`wait_for`,
+`assert_state`, fuzzy `did_you_mean` target resolution), a guided
+`validate_ui_change` prompt, and read-only live-state resources. The same TX
+gate applies — keying verbs stay behind `AETHER_AUTOMATION_ALLOW_TX`. Regenerate
+the verb→tool tables with `tools/gen_bridge_docs.py` (a CI check fails on drift).
+See `docs/automation-bridge.md` for setup and the tool catalog.

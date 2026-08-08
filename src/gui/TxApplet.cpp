@@ -134,6 +134,12 @@ void TxApplet::buildUI()
         this, 80.0f);
     m_fwdGauge->setAccessibleName("Forward power gauge");
     m_fwdGauge->setAccessibleDescription("RF forward power in watts");
+    // Mouse-over readout: exact watts, so the operator isn't left estimating
+    // between the 40 W tick marks while transmitting. (#3936)
+    static_cast<HGauge*>(m_fwdGauge)->setHoverValueFormatter([](float v) {
+        return QStringLiteral("%1 W").arg(QString::number(std::lround(v)));
+    });
+    static_cast<HGauge*>(m_fwdGauge)->setHoverValuePopupEnabled(true);
     vbox->addWidget(m_fwdGauge);
 
     // ── SWR gauge (1.0–3.0, red > 2.5) ─────────────────────────────────────
@@ -142,6 +148,11 @@ void TxApplet::buildUI()
         this, 2.0f);
     m_swrGauge->setAccessibleName("SWR gauge");
     m_swrGauge->setAccessibleDescription("Standing wave ratio");
+    // Mouse-over readout: exact ratio in the conventional N.N:1 form.
+    static_cast<HGauge*>(m_swrGauge)->setHoverValueFormatter([](float v) {
+        return QStringLiteral("%1:1").arg(QString::number(v, 'f', 2));
+    });
+    static_cast<HGauge*>(m_swrGauge)->setHoverValuePopupEnabled(true);
     vbox->addWidget(m_swrGauge);
 
     // ── RF Power slider ─────────────────────────────────────────────────────
@@ -329,6 +340,14 @@ void TxApplet::buildUI()
         m_apdRow = new QWidget;
         m_apdRow->setLayout(row);
         vbox->addWidget(m_apdRow);
+        // Apply the initial state instead of leaving the row in QWidget's
+        // default-visible state. m_apdConfigurable starts false — no radio has
+        // said otherwise — and until this call neither of updateApdVisibility()'s
+        // two inputs had fired, so a cold launch showed a live-looking APD button
+        // and Active/Cal/Avail indicators with nothing behind them. That also made
+        // cold start disagree with post-disconnect, where resetState() clears
+        // apdConfigurable and the row correctly goes away.
+        updateApdVisibility();
     }
 
     outer->addWidget(body);
@@ -339,11 +358,15 @@ void TxApplet::buildUI()
         if (!m_updatingFromModel && m_model)
             m_model->setRfPower(v);
     });
+    connect(m_rfPowerSlider, &QSlider::sliderReleased,
+            this, &TxApplet::syncFromModel);
     connect(m_tunePowerSlider, &QSlider::valueChanged, this, [this](int v) {
         m_tunePowerLabel->setText(QString::number(v));
         if (!m_updatingFromModel && m_model)
             m_model->setTunePower(v);
     });
+    connect(m_tunePowerSlider, &QSlider::sliderReleased,
+            this, &TxApplet::syncFromModel);
 
     // Profile dropdown → load command
     connect(m_profileCombo, QOverload<int>::of(&QComboBox::currentIndexChanged),
@@ -476,8 +499,40 @@ void TxApplet::setTransmitModel(TransmitModel* model)
         m_updatingFromModel = false;
     });
 
+    // Whether this radio has an ATU at all. A Hermes-Lite 2 does not, and a
+    // live-looking ATU button on a radio with no tuner is worse than a missing
+    // one: pressing it KEYS THE TRANSMITTER (markTxKeying above) to run a tune
+    // cycle that nothing will answer.
+    connect(m_model, &TransmitModel::hasTunerChanged, this, [this](bool present) {
+        m_radioHasTuner = present;
+        updateAtuAvailability();
+    });
+    m_radioHasTuner = m_model->hasTuner();
+
     syncFromModel();
     syncAtuIndicators();
+    updateAtuAvailability();
+}
+
+void TxApplet::updateAtuAvailability()
+{
+    if (!m_atuBtn || !m_memBtn)
+        return;
+    const bool enabled = m_radioHasTuner && !m_tgxlOperate;
+    m_atuBtn->setEnabled(enabled);
+    m_memBtn->setEnabled(enabled);
+
+    // The radio-has-no-tuner reason is checked FIRST because it is the more
+    // fundamental one: with no ATU fitted, what the TGXL is doing is beside the
+    // point, and "Disabled — TGXL is in OPERATE mode" would send the operator
+    // looking at the wrong box.
+    QString tip;
+    if (!m_radioHasTuner)
+        tip = tr("This radio has no antenna tuner");
+    else if (m_tgxlOperate)
+        tip = tr("Disabled — TGXL is in OPERATE mode");
+    m_atuBtn->setToolTip(tip);
+    m_memBtn->setToolTip(tip);
 }
 
 void TxApplet::setTunerModel(TunerModel* tuner)
@@ -488,12 +543,8 @@ void TxApplet::setTunerModel(TunerModel* tuner)
         // When TGXL is in Operate, disable only the internal ATU controls.
         // TUNE stays enabled — it sends a carrier through the TGXL for
         // power/SWR checks, matching SmartSDR behavior (#443).
-        bool tgxlOperate = tuner->isPresent() && tuner->isOperate() && !tuner->isBypass();
-        m_atuBtn->setEnabled(!tgxlOperate);
-        m_memBtn->setEnabled(!tgxlOperate);
-        QString tip = tgxlOperate ? "Disabled — TGXL is in OPERATE mode" : "";
-        m_atuBtn->setToolTip(tip);
-        m_memBtn->setToolTip(tip);
+        m_tgxlOperate = tuner->isPresent() && tuner->isOperate() && !tuner->isBypass();
+        updateAtuAvailability();
     };
 
     connect(tuner, &TunerModel::stateChanged, this, updateButtons);
@@ -507,12 +558,16 @@ void TxApplet::syncFromModel()
 
     m_updatingFromModel = true;
 
-    if (m_rfPowerSlider->value() != m_model->rfPower())
+    if (!m_rfPowerSlider->isSliderDown()
+        && m_rfPowerSlider->value() != m_model->rfPower()) {
         m_rfPowerSlider->setValue(m_model->rfPower());
+    }
     m_rfPowerLabel->setText(QString::number(m_model->rfPower()));
 
-    if (m_tunePowerSlider->value() != m_model->tunePower())
+    if (!m_tunePowerSlider->isSliderDown()
+        && m_tunePowerSlider->value() != m_model->tunePower()) {
         m_tunePowerSlider->setValue(m_model->tunePower());
+    }
     m_tunePowerLabel->setText(QString::number(m_model->tunePower()));
 
     // Active profile — update combo selection
@@ -572,11 +627,14 @@ void TxApplet::syncAtuIndicators()
     }
 }
 
-void TxApplet::updateMeters(float fwdPower, float swr)
+void TxApplet::updateMeters(float fwdPower, float swr, bool swrValid)
 {
     m_smoothedPower = fwdPower;
     static_cast<HGauge*>(m_fwdGauge)->setValue(fwdPower);
-    static_cast<HGauge*>(m_swrGauge)->setValue(swr);
+    // Absent SWR parks the gauge at its 1.0 rest position; a raw 0.0 would
+    // read as an off-scale value, and holding the last ratio is exactly the
+    // stale display #4533 removed.
+    static_cast<HGauge*>(m_swrGauge)->setValue(swrValid ? swr : 1.0f);
 }
 
 void TxApplet::updatePeakPower(float fwdPowerInstant)

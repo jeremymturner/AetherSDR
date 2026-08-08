@@ -27,8 +27,12 @@ constexpr int kMinZoomPercent = 100;
 constexpr int kMaxZoomPercent = 600;
 constexpr int kDefaultZoomPercent = 170;
 constexpr int kMinFps = 5;
-constexpr int kMaxFps = 30;
-constexpr int kDefaultFps = 24;
+constexpr int kMaxFps = 60;
+// Default 25 fps — a calm, low-overhead cadence matching the usual radio
+// panadapter rate. The slider still reaches 60 for users who want a faster
+// scope. Users who previously saved an explicit WAVE FPS keep it — the default
+// is only applied when the WAVE setting key is absent.
+constexpr int kDefaultFps = 25;
 // Discrete window steps for the WaveApplet drawer's "Window" slider.
 // First three notches give sub-second detail (240 ms, 480 ms, 1 s); the
 // rest are 1-second increments out to 10 s.  Index-based so each notch
@@ -209,6 +213,8 @@ void WaveApplet::buildSettingsDrawer()
         row->addWidget(makeSettingLabel("View:", m_settingsDrawer));
 
         m_viewCombo = new GuardedComboBox(m_settingsDrawer);
+        m_viewCombo->setObjectName(QStringLiteral("waveViewCombo"));
+        m_viewCombo->setAccessibleName(QStringLiteral("WAVE view mode"));
         applyComboStyle(m_viewCombo);
         m_viewCombo->setFixedHeight(20);
         m_viewCombo->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Fixed);
@@ -239,6 +245,8 @@ void WaveApplet::buildSettingsDrawer()
         row->addWidget(makeSettingLabel("Zoom:", m_settingsDrawer));
 
         m_zoomSlider = new GuardedSlider(Qt::Horizontal, m_settingsDrawer);
+        m_zoomSlider->setObjectName(QStringLiteral("waveZoomSlider"));
+        m_zoomSlider->setAccessibleName(QStringLiteral("WAVE zoom"));
         m_zoomSlider->setRange(kMinZoomPercent, kMaxZoomPercent);
         m_zoomSlider->setSingleStep(10);
         m_zoomSlider->setPageStep(50);
@@ -273,6 +281,8 @@ void WaveApplet::buildSettingsDrawer()
         row->addWidget(makeSettingLabel("FPS:", m_settingsDrawer));
 
         m_refreshSlider = new GuardedSlider(Qt::Horizontal, m_settingsDrawer);
+        m_refreshSlider->setObjectName(QStringLiteral("waveFpsSlider"));
+        m_refreshSlider->setAccessibleName(QStringLiteral("WAVE FPS"));
         m_refreshSlider->setRange(kMinFps, kMaxFps);
         m_refreshSlider->setSingleStep(5);
         m_refreshSlider->setPageStep(10);
@@ -307,6 +317,8 @@ void WaveApplet::buildSettingsDrawer()
         row->addWidget(makeSettingLabel("Window:", m_settingsDrawer));
 
         m_windowSlider = new GuardedSlider(Qt::Horizontal, m_settingsDrawer);
+        m_windowSlider->setObjectName(QStringLiteral("waveWindowSlider"));
+        m_windowSlider->setAccessibleName(QStringLiteral("WAVE window"));
         m_windowSlider->setRange(0, windowStepsMs().size() - 1);
         m_windowSlider->setSingleStep(1);
         m_windowSlider->setPageStep(1);
@@ -386,18 +398,8 @@ void WaveApplet::appendScopeSamples(const QByteArray& monoFloat32Pcm,
                                     int sampleRate,
                                     bool tx)
 {
-    if (!m_active)
-        return;  // lean mode: drop the feed so the scope never repaints
     if (m_waveform)
         m_waveform->appendScopeSamples(monoFloat32Pcm, sampleRate, tx);
-}
-
-void WaveApplet::setActive(bool on)
-{
-    if (m_active == on)
-        return;
-    m_active = on;
-    setVisible(on);
 }
 
 void WaveApplet::setTransmitting(bool tx)

@@ -4,10 +4,15 @@
 // every QMenu/QAction in the menu bar, their enable/disable wiring, and the
 // inline lambdas they trigger (~70 connects).
 //
-// Pure code motion from MainWindow.cpp — same class, no header changes.
+// The community-credits subsystem lives in Contribute.cpp; this TU retains
+// only the About-dialog button and its connection.
 
 #include "MainWindow.h"
 
+#ifdef AETHER_ASR_ENABLED
+#include "CopyAssistController.h"
+#include "CopyAssistPanel.h"
+#endif
 #include "AppletPanel.h"
 #include "DaxApplet.h"
 #include "PanadapterApplet.h"
@@ -15,6 +20,7 @@
 #include "RadioSetupDialog.h"
 #include "TciApplet.h"
 #include "ClientChainApplet.h"
+#include "Contribute.h"
 #include "DxClusterDialog.h"
 #include "HelpDialog.h"
 #include "MainWindowHelpers.h"
@@ -22,6 +28,7 @@
 #include "PersistentDialog.h"
 #include "RC28MappingDialog.h"
 #include "ShortcutDialog.h"
+#include "RadioHealthDialog.h"
 #include "SliceTroubleshootingDialog.h"
 #include "SpectrumWidget.h"
 #include "SupportDialog.h"
@@ -29,6 +36,7 @@
 #include "MidiMappingDialog.h"
 #include "ProfileImportExportDialog.h"
 #include "ProfileManagerDialog.h"
+#include "SettingsBrowserDialog.h"
 #include "ThemeEditorDialog.h"
 #include "TxBandDialog.h"
 #include "UlanziDialMapperDialog.h"
@@ -43,19 +51,24 @@
 #include "models/SliceModel.h"
 
 #include <QActionGroup>
+#include <QColor>
 #include <QCoreApplication>
 #include <QCheckBox>
+#include <QDesktopServices>
 #include <QFrame>
 #include <QJsonDocument>
+#include <QJsonObject>
 #include <QLabel>
 #include <QMenuBar>
 #include <QNetworkAccessManager>
 #include <QNetworkReply>
+#include <QNetworkRequest>
 #include <QPushButton>
 #include <QScrollArea>
 #include <QScrollBar>
 #include <QShortcut>
 #include <QTimer>
+#include <QUrl>
 #include <QVBoxLayout>
 #include <QWidgetAction>
 
@@ -63,11 +76,18 @@
 
 namespace AetherSDR {
 
+namespace {
+// Stall timeout for the About dialog's GitHub contributor fetch (#4688 §6).
+constexpr int kTransferTimeoutMs = 15000;
+} // namespace
+
 void MainWindow::buildMenuBar()
 {
     auto* fileMenu = menuBar()->addMenu("&File");
 
     auto* waveformsAct = fileMenu->addAction("Waveforms...");
+    m_waveformsAction = waveformsAct;   // hidden by applyCapabilitiesToUi()
+                                       // on a radio with no installable waveforms
     waveformsAct->setMenuRole(QAction::NoRole);
     connect(waveformsAct, &QAction::triggered, this, [this] {
         showOrRaisePersistent(m_waveformsDialog, &m_radioModel);
@@ -97,7 +117,7 @@ void MainWindow::buildMenuBar()
         showOrRaisePersistent(m_radioSetupDialog,
                               &m_radioModel, m_audio,
                               &m_tgxlConn, &m_pgxlConn, &m_antennaGenius,
-                              m_kiwiSdrManager);
+                              m_kiwiSdrManager, &m_acomConn);
         if (wasFresh && m_radioSetupDialog)
             wireRadioSetupDialogSignals(m_radioSetupDialog, prevComp);
     });
@@ -295,7 +315,7 @@ void MainWindow::buildMenuBar()
         showOrRaisePersistent(m_radioSetupDialog,
                               &m_radioModel, m_audio,
                               &m_tgxlConn, &m_pgxlConn, &m_antennaGenius,
-                              m_kiwiSdrManager);
+                              m_kiwiSdrManager, &m_acomConn);
         if (wasFresh && m_radioSetupDialog)
             wireRadioSetupDialogSignals(m_radioSetupDialog, prevComp);
         if (m_radioSetupDialog)
@@ -345,11 +365,20 @@ void MainWindow::buildMenuBar()
     connect(spotsAction, &QAction::triggered, this, [this] {
         const bool wasFresh = !m_spotHubDialog;
         showOrRaisePersistent(m_spotHubDialog, m_dxCluster, m_rbnClient, m_wsjtxClient,
-                              m_spotCollectorClient, m_potaClient,
+                              m_spotCollectorClient, m_potaClient, m_eibiClient, m_n1mmSpotClient,
 #ifdef HAVE_WEBSOCKETS
                               m_freedvClient,
 #endif
                               &m_radioModel, &m_dxccProvider);
+#ifdef HAVE_WEBSOCKETS
+        // Every open, not just the first: this dialog is a persistent
+        // singleton, so without this the field would only ever show
+        // whatever FreeDvMyMessage was at first construction, silently
+        // reverting anything sent from the FreeDV Reporter panel since
+        // (#4231 review).
+        if (m_spotHubDialog)
+            m_spotHubDialog->reloadFreedvMessage();
+#endif
         if (!wasFresh || !m_spotHubDialog) return;
         auto* dlg = m_spotHubDialog.data();
         dlg->setTotalSpots(m_radioModel.spotModel().spots().size());
@@ -376,6 +405,7 @@ void MainWindow::buildMenuBar()
                 sw->setSpotBgColor(bgColor);
                 sw->setSpotBgOpacity(bgOpacity);
                 sw->setSpotShowLines(s.value("IsSpotsLinesEnabled", "True").toString() == "True");
+                sw->setKiwiDxSpotsEnabled(s.value("ShowKiwiDxSpots", "False").toString() == "True");
                 sw->setSHistorySnapToStep(
                     s.value("SHistorySnapToStep", "False").toString() == "True");
             }
@@ -383,7 +413,12 @@ void MainWindow::buildMenuBar()
             // Memories feed toggle, apply immediately without mutating the cache.
             m_radioModel.spotModel().refresh();
         };
-        connect(dlg, &DxClusterDialog::settingsChanged, this, refreshSpots);
+        connect(dlg, &DxClusterDialog::settingsChanged, this, [this, refreshSpots] {
+            refreshSpots();
+            if (m_eibiClient) {
+                QMetaObject::invokeMethod(m_eibiClient, &EibiClient::updateActiveSpots, Qt::QueuedConnection);
+            }
+        });
         // Signal/QRM History Markers live exclusively on the SpotHub
         // Display tab (no View-menu duplicate, by design — a single UI
         // surface with no risk of state drift).
@@ -408,34 +443,52 @@ void MainWindow::buildMenuBar()
         });
         connect(dlg, &DxClusterDialog::connectRequested,
                 this, [this](const QString& host, quint16 port, const QString& call) {
-            QMetaObject::invokeMethod(m_dxCluster, [=] { m_dxCluster->connectToCluster(host, port, call); });
+            QMetaObject::invokeMethod(m_dxCluster, [=, this] { m_dxCluster->connectToCluster(host, port, call); });
         });
         connect(dlg, &DxClusterDialog::disconnectRequested,
-                this, [this] { QMetaObject::invokeMethod(m_dxCluster, [=] { m_dxCluster->disconnect(); }); });
+                this, [this] { QMetaObject::invokeMethod(m_dxCluster, [=, this] { m_dxCluster->disconnect(); }); });
         connect(dlg, &DxClusterDialog::rbnConnectRequested,
                 this, [this](const QString& host, quint16 port, const QString& call) {
-            QMetaObject::invokeMethod(m_rbnClient, [=] { m_rbnClient->connectToCluster(host, port, call); });
+            QMetaObject::invokeMethod(m_rbnClient, [=, this] { m_rbnClient->connectToCluster(host, port, call); });
         });
         connect(dlg, &DxClusterDialog::rbnDisconnectRequested,
-                this, [this] { QMetaObject::invokeMethod(m_rbnClient, [=] { m_rbnClient->disconnect(); }); });
+                this, [this] { QMetaObject::invokeMethod(m_rbnClient, [=, this] { m_rbnClient->disconnect(); }); });
         connect(dlg, &DxClusterDialog::wsjtxStartRequested,
                 this, [this](const QString& addr, quint16 port) {
-            QMetaObject::invokeMethod(m_wsjtxClient, [=] { m_wsjtxClient->startListening(addr, port); });
+            QMetaObject::invokeMethod(m_wsjtxClient, [=, this] { m_wsjtxClient->startListening(addr, port); });
         });
         connect(dlg, &DxClusterDialog::wsjtxStopRequested,
-                this, [this] { QMetaObject::invokeMethod(m_wsjtxClient, [=] { m_wsjtxClient->stopListening(); }); });
+                this, [this] { QMetaObject::invokeMethod(m_wsjtxClient, [=, this] { m_wsjtxClient->stopListening(); }); });
         connect(dlg, &DxClusterDialog::spotCollectorStartRequested,
                 this, [this](quint16 port) {
-            QMetaObject::invokeMethod(m_spotCollectorClient, [=] { m_spotCollectorClient->startListening(port); });
+            QMetaObject::invokeMethod(m_spotCollectorClient, [=, this] { m_spotCollectorClient->startListening(port); });
         });
         connect(dlg, &DxClusterDialog::spotCollectorStopRequested,
-                this, [this] { QMetaObject::invokeMethod(m_spotCollectorClient, [=] { m_spotCollectorClient->stopListening(); }); });
+                this, [this] { QMetaObject::invokeMethod(m_spotCollectorClient, [=, this] { m_spotCollectorClient->stopListening(); }); });
         connect(dlg, &DxClusterDialog::potaStartRequested,
                 this, [this](int interval) {
-            QMetaObject::invokeMethod(m_potaClient, [=] { m_potaClient->startPolling(interval); });
+            QMetaObject::invokeMethod(m_potaClient, [=, this] { m_potaClient->startPolling(interval); });
         });
         connect(dlg, &DxClusterDialog::potaStopRequested,
-                this, [this] { QMetaObject::invokeMethod(m_potaClient, [=] { m_potaClient->stopPolling(); }); });
+                this, [this] { QMetaObject::invokeMethod(m_potaClient, [=, this] { m_potaClient->stopPolling(); }); });
+        connect(dlg, &DxClusterDialog::eibiStartRequested,
+                this, [this] {
+            QMetaObject::invokeMethod(m_eibiClient, [this] { m_eibiClient->setEnabled(true); });
+        });
+        connect(dlg, &DxClusterDialog::eibiStopRequested,
+                this, [this] {
+            QMetaObject::invokeMethod(m_eibiClient, [this] { m_eibiClient->setEnabled(false); });
+        });
+        connect(dlg, &DxClusterDialog::eibiUpdateNowRequested,
+                this, [this] {
+            QMetaObject::invokeMethod(m_eibiClient, &EibiClient::forceUpdate, Qt::QueuedConnection);
+        });
+        connect(dlg, &DxClusterDialog::n1mmStartRequested,
+                this, [this](quint16 port) {
+            QMetaObject::invokeMethod(m_n1mmSpotClient, [=, this] { m_n1mmSpotClient->startListening(port); });
+        });
+        connect(dlg, &DxClusterDialog::n1mmStopRequested,
+                this, [this] { QMetaObject::invokeMethod(m_n1mmSpotClient, [=, this] { m_n1mmSpotClient->stopListening(); }); });
 #ifdef HAVE_WEBSOCKETS
         connect(dlg, &DxClusterDialog::freedvStartRequested,
                 this, [this] { QMetaObject::invokeMethod(m_freedvClient, [this] { m_freedvClient->startConnection(); }); });
@@ -487,6 +540,8 @@ void MainWindow::buildMenuBar()
         connect(dlg, &QDialog::finished, this, refreshSpots);  // refresh on close
     });
     auto* multiFlexAction = settingsMenu->addAction("multiFLEX...");
+    m_multiFlexAction = multiFlexAction;   // hidden by applyCapabilitiesToUi()
+                                           // on a single-client backend
     connect(multiFlexAction, &QAction::triggered,
             this, &MainWindow::showMultiFlexDialog);
     // m_titleBar connect deferred — see after TitleBar creation (~line 2530)
@@ -601,6 +656,13 @@ void MainWindow::buildMenuBar()
     connect(dspAction, &QAction::triggered, this, [this] {
         ensureAetherDspDialog();
     });
+
+    auto* settingsBrowserAction = settingsMenu->addAction("Settings Browser...");
+    settingsBrowserAction->setMenuRole(QAction::NoRole);  // "Settings" in the
+                                                          // title — macOS #883
+    connect(settingsBrowserAction, &QAction::triggered, this, [this] {
+        showOrRaisePersistent(m_settingsBrowserDialog);
+    });
     // RX chain DSP tile double-click also opens the full AetherDSP
     // Settings dialog — same entry point as the Settings menu action.
     if (m_appletPanel && m_appletPanel->clientChainApplet()) {
@@ -662,6 +724,8 @@ void MainWindow::buildMenuBar()
     }
 #else
     auto* autoDaxAction = settingsMenu->addAction("Autostart DAX with AetherSDR");
+    m_autoDaxAction = autoDaxAction;   // hidden by applyCapabilitiesToUi() on a
+                                       // radio that reports no DAX streams
     autoDaxAction->setCheckable(true);
     autoDaxAction->setChecked(
         AppSettings::instance().value("AutoStartDAX", "False").toString() == "True");
@@ -723,20 +787,28 @@ void MainWindow::buildMenuBar()
     });
     m_profilesMenu->addSeparator();
 
-    // Global profile list (populated on connect)
+    // Global profile list (populated on connect).  Rebuilt on every
+    // globalProfilesChanged() — the radio emits that for both the list and the
+    // active-selection ("current") status, so the checkmark tracks the radio's
+    // authoritative selection live on all platforms.
     connect(&m_radioModel, &RadioModel::globalProfilesChanged, this, [this] {
-        // Remove old profile actions (after the separator)
+        // Delete the old profile actions (after the separator).  Deleting —
+        // rather than removeAction() — frees them; removeAction() leaves each
+        // QAction parented to the menu, so a session's worth of rebuilds would
+        // otherwise accumulate detached actions.
         const auto actions = m_profilesMenu->actions();
         for (int i = 3; i < actions.size(); ++i)  // skip Manager, Import/Export, separator
-            m_profilesMenu->removeAction(actions[i]);
+            delete actions[i];
 
-        // Add current global profiles
+        // Add the current global profiles.  The radio reports an empty active
+        // ("current") until a global profile is explicitly loaded, in which
+        // case no item is checked — that is the honest state, not a bug.
         const auto profiles = m_radioModel.globalProfiles();
         const auto active = m_radioModel.activeGlobalProfile();
         for (const auto& name : profiles) {
             auto* act = m_profilesMenu->addAction(name);
             act->setCheckable(true);
-            act->setChecked(name == active);
+            act->setChecked(!active.isEmpty() && name == active);
             connect(act, &QAction::triggered, this, [this, name] {
                 m_radioModel.loadGlobalProfile(name);
             });
@@ -921,6 +993,13 @@ void MainWindow::buildMenuBar()
     connect(pskMapAction, &QAction::triggered,
             this, &MainWindow::showPskReporterMapDialog);
 
+    auto* callsignLookupAct = viewMenu->addAction("Callsign Lookup...");
+    callsignLookupAct->setMenuRole(QAction::NoRole);
+    callsignLookupAct->setShortcut(QKeySequence("Ctrl+Shift+L"));
+    callsignLookupAct->setToolTip("Look up a callsign on QRZ.com");
+    connect(callsignLookupAct, &QAction::triggered,
+            this, [this] { showCallsignLookupDialog(); });
+
 #ifdef HAVE_WEBSOCKETS
     {
         auto* fdvReporterAct = viewMenu->addAction(tr("FreeDV Reporter..."));
@@ -975,6 +1054,9 @@ void MainWindow::buildMenuBar()
     packetDecoderAction->setMenuRole(QAction::NoRole);
     connect(packetDecoderAction, &QAction::triggered,
             this, &MainWindow::showAx25HfPacketDecodeDialog);
+
+    // Copy Assist has no View-menu entry: it's shown/hidden by the status-bar
+    // "ASR" toggle (and the keyboard shortcut) via showCopyAssist().
 
     auto* smartSpotAct = viewMenu->addAction("Smart Spot Filtering");
     smartSpotAct->setCheckable(true);
@@ -1047,6 +1129,25 @@ void MainWindow::buildMenuBar()
     }
 
     auto* helpMenu = menuBar()->addMenu("&Help");
+
+    // ── Learn & news ──────────────────────────────────────────────────────
+    // Orientation first: how to get going, the full manual, and what changed.
+    helpMenu->addAction("Getting Started...", this, [this]() {
+        auto* dlg = new HelpDialog("Getting Started", ":/help/getting-started.md", this);
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+        trackPersistentDialog(dlg);
+        dlg->show();
+        dlg->raise();
+        dlg->activateWindow();
+    });
+    helpMenu->addAction("AetherSDR Help...", this, [this]() {
+        auto* dlg = new HelpDialog("AetherSDR Help", ":/help/aethersdr-help.md", this);
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+        trackPersistentDialog(dlg);
+        dlg->show();
+        dlg->raise();
+        dlg->activateWindow();
+    });
     helpMenu->addAction("What's New...", this, [this]() {
         if (m_whatsNewDialog) {
             m_whatsNewDialog->show();
@@ -1057,29 +1158,16 @@ void MainWindow::buildMenuBar()
         m_whatsNewDialog = WhatsNewDialog::showAll(this);
         m_whatsNewDialog->setFramelessMode(
             AppSettings::instance().value("FramelessWindow", "True").toString() == "True");
-        m_persistentDialogs.append(QPointer<PersistentDialog>(m_whatsNewDialog));
+        trackPersistentDialog(m_whatsNewDialog);
     });
     helpMenu->addSeparator();
-    helpMenu->addAction("Getting Started...", this, [this]() {
-        auto* dlg = new HelpDialog("Getting Started", ":/help/getting-started.md", this);
-        dlg->setAttribute(Qt::WA_DeleteOnClose);
-        dlg->setModal(false);
-        dlg->show();
-        dlg->raise();
-        dlg->activateWindow();
-    });
-    helpMenu->addAction("AetherSDR Help...", this, [this]() {
-        auto* dlg = new HelpDialog("AetherSDR Help", ":/help/aethersdr-help.md", this);
-        dlg->setAttribute(Qt::WA_DeleteOnClose);
-        dlg->setModal(false);
-        dlg->show();
-        dlg->raise();
-        dlg->activateWindow();
-    });
+
+    // ── Feature guides ────────────────────────────────────────────────────
+    // Deeper topic walkthroughs for specific parts of the app.
     helpMenu->addAction("Understanding Noise Cancellation...", this, [this]() {
         auto* dlg = new HelpDialog("Understanding Noise Cancellation", ":/help/understanding-noise-cancellation.md", this);
         dlg->setAttribute(Qt::WA_DeleteOnClose);
-        dlg->setModal(false);
+        trackPersistentDialog(dlg);
         dlg->show();
         dlg->raise();
         dlg->activateWindow();
@@ -1087,7 +1175,7 @@ void MainWindow::buildMenuBar()
     auto* controlsHelpAction = helpMenu->addAction("Configuring AetherSDR Controls...", this, [this]() {
         auto* dlg = new HelpDialog("Configuring AetherSDR Controls", ":/help/configuring-aethersdr-controls.md", this);
         dlg->setAttribute(Qt::WA_DeleteOnClose);
-        dlg->setModal(false);
+        trackPersistentDialog(dlg);
         dlg->show();
         dlg->raise();
         dlg->activateWindow();
@@ -1096,59 +1184,107 @@ void MainWindow::buildMenuBar()
     auto* dataModesAction = helpMenu->addAction("Configuring Data Modes...", this, [this]() {
         auto* dlg = new HelpDialog("Configuring Data Modes", ":/help/understanding-data-modes.md", this);
         dlg->setAttribute(Qt::WA_DeleteOnClose);
-        dlg->setModal(false);
+        trackPersistentDialog(dlg);
         dlg->show();
         dlg->raise();
         dlg->activateWindow();
     });
     dataModesAction->setMenuRole(QAction::NoRole); // prevent macOS auto-reparenting (#883)
+    helpMenu->addSeparator();
+
+    // ── Community & feedback ──────────────────────────────────────────────
+    // Outward-facing links: the website, donations, feature ideas, bug
+    // reports, and how to contribute back.
+    helpMenu->addAction("AetherSDR Website", this, []() {
+        QDesktopServices::openUrl(QUrl("https://www.aethersdr.com"));
+    });
+    helpMenu->addAction("Donate to AetherSDR", this, []() {
+        QDesktopServices::openUrl(QUrl("https://www.aethersdr.com/#sponsor"));
+    });
+    helpMenu->addAction(QString::fromUtf8("Submit your Idea... \xF0\x9F\x92\xA1"),
+                        this, [this]() {
+        if (m_titleBar) m_titleBar->showFeatureRequestDialog();
+    });
+    // "File an Issue" was previously buried inside the Support dialog; surface
+    // it directly so reporting a bug is one click from the Help menu.
+    helpMenu->addAction("File an Issue...", this, [this]() {
+        SupportDialog::fileIssue(this, &m_radioModel);
+    });
     helpMenu->addAction("Contributing to AetherSDR...", this, [this]() {
         auto* dlg = new HelpDialog("Contributing to AetherSDR", ":/help/contributing-to-aethersdr.md", this);
         dlg->setAttribute(Qt::WA_DeleteOnClose);
-        dlg->setModal(false);
+        trackPersistentDialog(dlg);
         dlg->show();
         dlg->raise();
         dlg->activateWindow();
     });
     helpMenu->addSeparator();
-    helpMenu->addAction(QString::fromUtf8("Submit your idea... \xF0\x9F\x92\xA1"),
-                        this, [this]() {
-        if (m_titleBar) m_titleBar->showFeatureRequestDialog();
-    });
-    helpMenu->addAction("Support...", this, [this]() {
+
+    // ── Diagnostics & maintenance ─────────────────────────────────────────
+    // Tools for capturing logs, chasing slice problems, resetting local
+    // settings, and staying up to date.
+    helpMenu->addAction("Support && Diagnostics...", this, [this]() {
         auto* dlg = new SupportDialog(this);
         dlg->setAttribute(Qt::WA_DeleteOnClose);
         dlg->setRadioModel(&m_radioModel);
+        trackPersistentDialog(dlg);
         dlg->show();
         dlg->raise();
     });
-    helpMenu->addAction("Slice Troubleshooting...", this, [this]() {
-        SliceTroubleshootingDialog dlg(&m_radioModel, m_audio, this,
-                                       [this]() { return buildControlDevicesSnapshot(); },
-                                       [this]() {
-                                           QJsonObject renderer;
-                                           renderer["available"] = true;
-                                           renderer["description"] = spectrum()
-                                               ? spectrum()->rendererDescription()
-                                               : QStringLiteral("No active pan");
-                                           return renderer;
-                                       });
-        dlg.exec();
+    // Before Slice Troubleshooting: this one is about the RADIO's own health
+    // registers, which is the first thing to check when the slice-level
+    // symptoms in that dialog turn out to have a hardware cause.
+    helpMenu->addAction("Radio Health...", this, [this]() {
+        auto* dlg = new RadioHealthDialog(&m_radioModel, this);
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+        trackPersistentDialog(dlg);
+        dlg->show();
+        dlg->raise();
+        dlg->activateWindow();
     });
+    helpMenu->addAction("Slice Troubleshooting...", this, [this]() {
+        auto* dlg = new SliceTroubleshootingDialog(
+            &m_radioModel, m_audio, this,
+            [this]() { return buildControlDevicesSnapshot(); },
+            [this]() {
+                QJsonObject renderer;
+                renderer["available"] = true;
+                renderer["description"] = spectrum()
+                    ? spectrum()->rendererDescription()
+                    : QStringLiteral("No active pan");
+                return renderer;
+            });
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+        dlg->setWindowModality(Qt::ApplicationModal);
+        trackPersistentDialog(dlg);
+        dlg->show();
+        dlg->raise();
+        dlg->activateWindow();
+    });
+    // "Reset Settings" was previously buried inside the Support dialog too.
+    // NoRole is required: macOS would otherwise treat the word "Settings" as a
+    // Preferences action and reparent it into the application menu.
+    auto* resetSettingsAction = helpMenu->addAction("Reset Settings...", this, [this]() {
+        SupportDialog::resetSettings(this);
+    });
+    resetSettingsAction->setMenuRole(QAction::NoRole);
     helpMenu->addAction("Check for Updates...", this, [this]() {
         m_updateChecker->checkNow();
     });
     helpMenu->addSeparator();
     helpMenu->addAction("About AetherSDR", this, [this]{
-        auto* dlg = new QDialog(this);
+        auto* dlg = new PersistentDialog(QStringLiteral("About AetherSDR"),
+                                         QStringLiteral("AboutDialogGeometry"), this);
         dlg->setAttribute(Qt::WA_DeleteOnClose);
-        dlg->setWindowTitle("About AetherSDR");
         dlg->setFixedWidth(380);
         AetherSDR::ThemeManager::instance().applyStyleSheet(dlg, "QDialog { background: {{color.background.0}}; }");
 
-        auto* vbox = new QVBoxLayout(dlg);
+        auto* vbox = new QVBoxLayout(dlg->bodyWidget());
         vbox->setSpacing(8);
         vbox->setContentsMargins(16, 16, 16, 16);
+        dlg->setBodyLayoutMargins(QMargins(16, 16, 16, 16),
+                                  QMargins(16, 14, 16, 16));
+        trackPersistentDialog(dlg);
 
         // Icon
         auto* iconLbl = new QLabel;
@@ -1172,7 +1308,7 @@ void MainWindow::buildMenuBar()
             "<h2 style='margin-bottom:2px; color:#c8d8e8;'>AetherSDR</h2>"
             "<p style='margin-top:0; color:#8aa8c0;'>v%1<br>"
             "<span style='font-size:10px; color:#6a8090;'>(%4)</span></p>"
-            "<p style='margin-top:8px; color:#c8d8e8;'>Linux-native SmartSDR-compatible client<br>"
+            "<p style='margin-top:8px; color:#c8d8e8;'>Cross-platform SmartSDR-compatible client<br>"
             "for FlexRadio transceivers.</p>"
             "<p style='font-size:11px; color:#6a8090;'>"
             "Built with Qt %2 &middot; C++20<br>"
@@ -1232,6 +1368,21 @@ void MainWindow::buildMenuBar()
         AetherSDR::ThemeManager::instance().applyStyleSheet(sep2, "color: {{color.background.2}};");
         vbox->addWidget(sep2);
 
+        auto* communityCreditsButton = new QPushButton(QStringLiteral("Play Community Credits..."));
+        communityCreditsButton->setAccessibleName(QStringLiteral("Play AetherSDR community credits"));
+        communityCreditsButton->setAccessibleDescription(
+            QStringLiteral("Opens an animated thank-you to contributors and Open Collective supporters with music."));
+        AetherSDR::ThemeManager::instance().applyStyleSheet(
+            communityCreditsButton,
+            "QPushButton { background: {{color.background.1}}; color: {{color.accent.bright}}; "
+            "border: 1px solid {{color.accent}}; border-radius: 4px; padding: 7px 18px; "
+            "font-weight: bold; }"
+            "QPushButton:hover { background: {{color.background.2}}; }");
+        vbox->addWidget(communityCreditsButton, 0, Qt::AlignCenter);
+        connect(communityCreditsButton, &QPushButton::clicked, this, [this] {
+            showOrRaisePersistent(m_contributeDialog);
+        });
+
         // Footer
         auto* footer = new QLabel(
             "<div style='text-align:center;'>"
@@ -1244,6 +1395,9 @@ void MainWindow::buildMenuBar()
             "github.com/aethersdr/AetherSDR</a></p>"
             "<p style='font-size:10px; color:#6a8090;'>"
             "SmartSDR protocol &copy; FlexRadio Systems</p>"
+            "<p style='font-size:10px; color:#6a8090;'>"
+            "D-STAR is a registered trademark of Icom Inc.<br>"
+            "AetherSDR is not affiliated with or endorsed by Icom Inc.</p>"
             "<p style='font-size:10px; color:#6a8090;'>"
             "HF propagation forecasts provided by "
             "<a href='https://www.hamqsl.com/' style='color:#8aa8c0;'>hamqsl.com</a></p>"
@@ -1265,6 +1419,9 @@ void MainWindow::buildMenuBar()
 
         // Fetch live contributor list from GitHub API
         auto* nam = new QNetworkAccessManager(dlg);
+        // Bound the contributor fetch (#4688 §6) — without it a half-open
+        // connection leaves the About dialog's list pending with no error.
+        nam->setTransferTimeout(kTransferTimeoutMs);
         auto* reply = nam->get(QNetworkRequest(
             QUrl("https://api.github.com/repos/aethersdr/AetherSDR/contributors")));
         connect(reply, &QNetworkReply::finished, dlg, [contribLabel, reply] {
@@ -1287,5 +1444,32 @@ void MainWindow::buildMenuBar()
         });
     });
 }
+
+#ifdef AETHER_ASR_ENABLED
+void MainWindow::showCopyAssist()
+{
+    // Dock the Copy Assist panel under the waterfall of the active panadapter,
+    // the same way the CW decode panel docks. First open builds the panel and
+    // wires the ASR controller to it; subsequent invocations toggle visibility.
+    if (!m_copyAssistController) {
+        PanadapterApplet* applet = m_panStack ? m_panStack->activeApplet() : nullptr;
+        if (!applet) {
+            return;
+        }
+        m_copyAssistApplet = applet;
+        m_copyAssistController = new CopyAssistController(m_audio, applet->copyAssistPanel(), this);
+        trackPersistentDialog(m_copyAssistController->settingsDialog());
+        // Seed the current frequency so the first "on start" log marker is correct
+        // even before any retune fires.
+        if (auto* s = activeSlice()) {
+            m_copyAssistController->setCurrentFrequency(s->frequency());
+        }
+    }
+    if (m_copyAssistApplet) {
+        m_copyAssistApplet->setCopyAssistVisible(!m_copyAssistApplet->isCopyAssistVisible());
+    }
+    updateKeyerAvailability(); // keep the status-bar ASR indicator in sync
+}
+#endif
 
 } // namespace AetherSDR

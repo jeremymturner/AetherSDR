@@ -3,6 +3,12 @@
         <file alias="icon.png">../docs/assets/logo-circle.png</file>
         <file alias="bg-default.jpg">../docs/assets/logo.jpg</file>
         <file alias="cty.dat">cty.dat</file>
+        <!-- Demo-mode voice clip: public-domain Harvard sentences (the standard
+             speech-intelligibility test set), TTS-generated, 24 kHz mono 16-bit.
+             The demo radio's Voice channel loops this so NR/notch have real speech
+             to preserve and ASR (Copy Assist) has real words. No copyright. ~457 KB. -->
+        <file alias="demo_voice.wav">demo_voice.wav</file>
+        <file alias="dist.dx_community.json">dist.dx_community.json</file>
     </qresource>
     <qresource prefix="/bandplans">
         <file alias="arrl-us.json">bandplans/arrl-us.json</file>
@@ -14,10 +20,19 @@
     </qresource>
     <qresource prefix="/sounds">
         <file alias="aetherial.wav">aetherial.wav</file>
+        <file alias="community-credits.wav">community-credits.wav</file>
+    </qresource>
+    <qresource prefix="/images">
+        <file alias="aurora-cutout.png">aurora-cutout.png</file>
     </qresource>
     <qresource prefix="/themes">
         <file alias="default-dark.json">themes/default-dark.json</file>
         <file alias="default-light.json">themes/default-light.json</file>
+    </qresource>
+    <qresource prefix="/meterfaces">
+        <file alias="analog-meter-themes-v1.json">meterfaces/analog-meter-themes-v1.json</file>
+        <file alias="cross-needle-v12.json">meterfaces/cross-needle-v12.json</file>
+        <file alias="s-meter-v1.json">meterfaces/s-meter-v1.json</file>
     </qresource>
     <qresource prefix="/help">
         <file alias="getting-started.md">help/getting-started.md</file>
@@ -47,5 +62,13 @@
         <file alias="DSEG14Modern-Bold.ttf">../third_party/dseg/DSEG14-Modern/DSEG14Modern-Bold.ttf</file>
         <file alias="DSEG14Modern-BoldItalic.ttf">../third_party/dseg/DSEG14-Modern/DSEG14Modern-BoldItalic.ttf</file>
         <file alias="DSEGWeather.ttf">../third_party/dseg/DSEGWeather/DSEGWeather.ttf</file>
+        <!-- Bundled Inter UI font (SIL OFL 1.1 — third_party/inter/LICENSE.txt).
+             Static Regular + Bold instances (not the variable font — variable-
+             axis support needs Qt 6.7+ and Linux CI is pre-6.5).  Registered at
+             startup so the `font.family.ui` = "Inter" theme token resolves the
+             same on every OS instead of falling back to Segoe UI (Windows) /
+             SF (macOS) and drifting the px-tuned QSS layout.  ~800 KB total. -->
+        <file alias="Inter-Regular.ttf">../third_party/inter/Inter-Regular.ttf</file>
+        <file alias="Inter-Bold.ttf">../third_party/inter/Inter-Bold.ttf</file>
     </qresource>
 </RCC>

@@ -1,5 +1,6 @@
 #include "SupportBundle.h"
 #include "AppSettings.h"
+#include "SettingsSanitizer.h"
 #include "AsyncLogWriter.h"  // redactPii — GHSA-ccrg-j8cp-qhc4
 #include "LogManager.h"
 #include "ZipArchive.h"
@@ -14,6 +15,7 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QSaveFile>
+#include <QStringList>
 #include <QSysInfo>
 #include <QTemporaryDir>
 #include <QUrl>
@@ -155,30 +157,20 @@ QString SupportBundle::createBundle(const RadioInfo& radio)
             f.write(QJsonDocument(obj).toJson(QJsonDocument::Indented));
     }
 
-    // 4. Sanitized settings
+    // 4. Sanitized settings — dumped from the store through the recursive
+    // redactor (a secret-shaped field nested inside a JSON document value is
+    // redacted too, not just secret-named rows). Store metadata (migration
+    // stamps, backup history) rides along for upgrade diagnostics.
     {
-        auto& settings = AppSettings::instance();
-        QFile src(settings.filePath());
-        if (src.open(QIODevice::ReadOnly)) {
-            QString xml = QString::fromUtf8(src.readAll());
-            src.close();
-
-            // Strip lines containing sensitive keys
-            QStringList lines = xml.split('\n');
-            QStringList sanitized;
-            for (const auto& line : lines) {
-                QString lower = line.toLower();
-                if (lower.contains("token") || lower.contains("password") ||
-                    lower.contains("secret") || lower.contains("auth0") ||
-                    lower.contains("refresh")) {
-                    sanitized << "  <!-- [REDACTED] -->";
-                } else {
-                    sanitized << line;
-                }
+        QFile dst(tmp + "/settings.txt");
+        if (dst.open(QIODevice::WriteOnly)) {
+            dst.write(SettingsSanitizer::dump().toUtf8());
+            const QString notice = AppSettings::instance().loadNotice();
+            if (!notice.isEmpty()) {
+                dst.write("\n## load notice\n");
+                dst.write(notice.toUtf8());
+                dst.write("\n");
             }
-            QFile dst(tmp + "/settings.xml");
-            if (dst.open(QIODevice::WriteOnly))
-                dst.write(sanitized.join('\n').toUtf8());
         }
     }
 
@@ -208,6 +200,39 @@ QString SupportBundle::createBundle(const RadioInfo& radio)
         return {};
 
     return archivePath;
+}
+
+QString SupportBundle::recentLogTail(int lines)
+{
+    if (lines <= 0)
+        return {};
+
+    auto& logMgr = LogManager::instance();
+    logMgr.flushLog();
+
+    QFile f(logMgr.logFilePath());
+    if (!f.open(QIODevice::ReadOnly | QIODevice::Text))
+        return {};
+
+    // Read a bounded tail; ~200KB comfortably holds kIssueLogTailLines worth
+    // of formatted lines without loading a large log in full.
+    constexpr qint64 kMaxRead = 200 * 1024;
+    const qint64 size = f.size();
+    const bool seeked = size > kMaxRead;
+    if (seeked)
+        f.seek(size - kMaxRead);
+    const QString text = QString::fromUtf8(f.readAll());
+    f.close();
+
+    QStringList all = text.split('\n');
+    // A mid-line seek can leave a partial first line; drop it so the tail
+    // starts on a clean line boundary.
+    if (seeked && !all.isEmpty())
+        all.removeFirst();
+
+    if (all.size() > lines)
+        all = all.mid(all.size() - lines);
+    return all.join('\n').trimmed();
 }
 
 void SupportBundle::openEmailClient(const QString& bundlePath,

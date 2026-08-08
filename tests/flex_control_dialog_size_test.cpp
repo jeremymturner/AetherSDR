@@ -6,15 +6,17 @@
 // e.g. a 1920x1080 panel after the Windows taskbar, or any DPI-scaled laptop --
 // the old code pinned that intrinsic minimum as a hard floor, so the window
 // opened taller than the screen with its bottom clipped and no way to shrink
-// it. The fix auto-engages the existing compact layout (which fits) whenever
-// the full layout would exceed the available screen height.
+// it. A later fix auto-engaged the existing compact layout, but that made the
+// Compact toggle impossible to turn off on those screens. The content now
+// scrolls instead, preserving both screen fit and the user's mode choice.
 //
 // Invariant under test: the dialog's enforced minimum height is never greater
-// than the available height of the screen it lives on. On a screen too short
-// for the full layout, compact mode must auto-engage.
+// than the available height of the screen it lives on, and Compact must remain
+// a user-controlled toggle on every screen size.
 //
 // Build: CMake target `flex_control_dialog_size_test`. Exit 0 = pass.
 
+#include "TestSettingsProfile.h"
 #include "gui/FlexControlDialog.h"
 
 #include <QApplication>
@@ -40,11 +42,6 @@ void report(const char* name, bool ok, const std::string& detail = {})
     if (!ok) ++g_failed;
 }
 
-// The non-compact stack (header 70 + knob panel 420 + control strip ~110 +
-// status frame 148 + aux grid ~200 + title bar 18 + margins) floors around
-// 1066 px. Any screen shorter than this exercises the auto-compact fallback.
-constexpr int kFullLayoutFloor = 1000;
-
 QPushButton* findCompactButton(FlexControlDialog& dialog)
 {
     const auto buttons = dialog.findChildren<QPushButton*>();
@@ -59,10 +56,19 @@ QPushButton* findCompactButton(FlexControlDialog& dialog)
 
 int main(int argc, char** argv)
 {
+    TestSettingsProfile settingsProfile(QStringLiteral("aether-flex-control-dialog-test"));
+    if (!settingsProfile.isValid()) {
+        return 1;
+    }
+    if (qEnvironmentVariableIsEmpty("QT_QPA_PLATFORM")) {
+        qputenv("QT_QPA_PLATFORM", "offscreen");
+    }
     QApplication app(argc, argv);
+    AppSettings::instance().load();
     std::printf("FlexControlDialog screen-fit test harness (#3662)\n\n");
 
-    // Start from the non-compact layout so the auto-engage path is exercised.
+    // Start from the non-compact layout. Screen fit must not change this user
+    // preference behind their back.
     AppSettings::instance().setValue("FlexControlCompactMode", "False");
 
     const QScreen* scr = QApplication::primaryScreen();
@@ -78,7 +84,6 @@ int main(int argc, char** argv)
     report("compact toggle is present", compact != nullptr);
 
     const int minH = dialog.minimumHeight();
-    const bool engaged = compact && compact->isChecked();
 
     // Headline invariant: the window can never force a minimum height taller
     // than the screen offers. Pre-fix this is the intrinsic ~1066 px and fails
@@ -86,16 +91,14 @@ int main(int argc, char** argv)
     report("enforced minimum height fits the screen", minH <= availH,
            "minH=" + std::to_string(minH) + " availH=" + std::to_string(availH));
 
-    // On a screen too short for the full layout, compact must auto-engage so
-    // nothing is clipped.
-    if (availH < kFullLayoutFloor) {
-        report("compact auto-engaged on a short screen", engaged,
-               "availH=" + std::to_string(availH) + " < floor "
-                   + std::to_string(kFullLayoutFloor));
-    } else {
-        std::printf("[info] screen is tall enough (availH=%d >= %d); "
-                    "non-compact layout retained, no auto-engage expected\n",
-                    availH, kFullLayoutFloor);
+    report("saved non-compact preference is preserved",
+           compact && !compact->isChecked());
+
+    if (compact) {
+        compact->click();
+        report("compact mode can be enabled", compact->isChecked());
+        compact->click();
+        report("compact mode can be disabled again", !compact->isChecked());
     }
 
     std::printf("\n%s\n",

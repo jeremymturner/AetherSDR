@@ -1,4 +1,8 @@
 #include "PanadapterApplet.h"
+#include "CallsignCard.h"
+#ifdef AETHER_ASR_ENABLED
+#include "CopyAssistPanel.h"
+#endif
 #include "CwDecodeSettings.h"
 #include "FramelessMoveHelper.h"
 #include "GuardedSlider.h"
@@ -7,6 +11,7 @@
 #include "SpectrumWidget.h"
 #include "Theme.h"
 #include "core/AppSettings.h"
+#include "gui/CopyAssistSettings.h"
 #include "core/SettingsHelpers.h"
 
 #include <QVBoxLayout>
@@ -34,6 +39,7 @@ PanadapterApplet::PanadapterApplet(QWidget* parent)
 {
     theme::setContainer(this, QStringLiteral("applet/panadapter"));
     auto* layout = new QVBoxLayout(this);
+    m_mainLayout = layout;
     layout->setContentsMargins(0, 0, 0, 0);
     layout->setSpacing(0);
 
@@ -69,9 +75,11 @@ PanadapterApplet::PanadapterApplet(QWidget* parent)
 
     // Pop-out / Dock button (⬈ when docked, ↩ when floating)
     m_popOutBtn = new QPushButton("\u2b08");  // ⬈
+    m_popOutBtn->setObjectName(QStringLiteral("panFloatToggle"));
+    m_popOutBtn->setAccessibleName(tr("Pop out panadapter"));
     m_popOutBtn->setFixedSize(16, 14);
     m_popOutBtn->setStyleSheet(btnStyle + "QPushButton { font-size: 11px; }");
-    m_popOutBtn->setToolTip("Pop out panadapter");
+    m_popOutBtn->setToolTip(tr("Pop out panadapter"));
     m_popOutBtn->hide();  // hidden in single-pan mode
     connect(m_popOutBtn, &QPushButton::clicked, this, [this]() {
         if (m_isFloating) {
@@ -298,7 +306,25 @@ PanadapterApplet::PanadapterApplet(QWidget* parent)
         menu->exec(m_cwText->mapToGlobal(pos));
         delete menu;
     });
-    cwLayout->addWidget(m_cwText);
+    // Decoded text + contact card side by side.  The card stays hidden
+    // until the QRZ wiring spots a station identifying itself in the RX
+    // stream ("DE <call> <call>") and fills it with the lookup result.
+    auto* cwTextRow = new QHBoxLayout;
+    cwTextRow->setContentsMargins(0, 0, 0, 0);
+    cwTextRow->setSpacing(4);
+    cwTextRow->addWidget(m_cwText, 1);
+    m_cwCallsignCard = new CallsignCard(CallsignCard::Variant::Compact, m_cwPanel);
+    m_cwCallsignCard->setCloseButtonVisible(true);
+    m_cwCallsignCard->setMinimumWidth(240);
+    m_cwCallsignCard->setMaximumWidth(320);
+    // Cap the height so the card stays card-shaped (not a full-height
+    // sidebar) when the operator drags the decode panel tall.
+    m_cwCallsignCard->setMaximumHeight(120);
+    m_cwCallsignCard->setVisible(false);
+    connect(m_cwCallsignCard, &CallsignCard::closeRequested,
+            m_cwCallsignCard, &QWidget::hide);
+    cwTextRow->addWidget(m_cwCallsignCard, 0, Qt::AlignTop);
+    cwLayout->addLayout(cwTextRow);
 
     m_cwPanel->hide();
     layout->addWidget(m_cwPanel);
@@ -527,8 +553,11 @@ void PanadapterApplet::setFloatingState(bool floating)
 {
     m_isFloating = floating;
     if (m_popOutBtn) {
+        const QString actionName = floating ? tr("Dock panadapter")
+                                            : tr("Pop out panadapter");
         m_popOutBtn->setText(floating ? "\u21a9" : "\u2b08");  // ↩ or ⬈
-        m_popOutBtn->setToolTip(floating ? "Dock panadapter" : "Pop out panadapter");
+        m_popOutBtn->setAccessibleName(actionName);
+        m_popOutBtn->setToolTip(actionName);
         m_popOutBtn->setVisible(true);  // always visible when floating
     }
     // When floating, always show close (to dock via window close)
@@ -555,6 +584,81 @@ void PanadapterApplet::setCwPanelVisible(bool visible)
 {
     m_cwPanel->setVisible(visible);
 }
+
+#ifdef AETHER_ASR_ENABLED
+CopyAssistPanel* PanadapterApplet::copyAssistPanel()
+{
+    if (m_copyAssistPanel != nullptr) {
+        return m_copyAssistPanel;
+    }
+
+    m_copyAssistHeight = std::clamp(
+        CopyAssistSettings::value("AsrPanelHeight", "160").toString().toInt(), 60, 600);
+
+    // Dock container styled like the CW decode panel — a top border separating
+    // it from the waterfall, fixed height, resizable via a top grip.
+    m_copyAssistDock = new QWidget(this);
+    m_copyAssistDock->setObjectName("copyAssistDock");
+    m_copyAssistDock->setCursor(Qt::ArrowCursor);
+    m_copyAssistDock->setFixedHeight(m_copyAssistHeight);
+    m_copyAssistDock->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+    AetherSDR::ThemeManager::instance().applyStyleSheet(m_copyAssistDock,
+        "QWidget#copyAssistDock { background: {{color.background.0}};"
+        " border-top: 1px solid {{color.background.1}}; }");
+
+    auto* dockLayout = new QVBoxLayout(m_copyAssistDock);
+    dockLayout->setContentsMargins(0, 0, 0, 0);
+    dockLayout->setSpacing(0);
+
+    m_copyAssistGrip = new QWidget(m_copyAssistDock);
+    m_copyAssistGrip->setObjectName("copyAssistResizeGrip");
+    m_copyAssistGrip->setFixedHeight(4);
+    m_copyAssistGrip->setCursor(Qt::SizeVerCursor);
+    m_copyAssistGrip->setToolTip("Drag to resize the Copy Assist panel");
+    AetherSDR::ThemeManager::instance().applyStyleSheet(m_copyAssistGrip,
+        "QWidget { background: {{color.background.1}}; }");
+    m_copyAssistGrip->installEventFilter(this);
+    dockLayout->addWidget(m_copyAssistGrip);
+
+    m_copyAssistPanel = new CopyAssistPanel(m_copyAssistDock);
+    dockLayout->addWidget(m_copyAssistPanel, 1);
+    // Shown/hidden via the status-bar "ASR" toggle (setCopyAssistVisible); the
+    // panel has no close button of its own.
+
+    m_copyAssistDock->hide();
+    m_mainLayout->addWidget(m_copyAssistDock);
+    return m_copyAssistPanel;
+}
+
+void PanadapterApplet::setCopyAssistVisible(bool visible)
+{
+    if (visible) {
+        copyAssistPanel(); // ensure built
+    }
+    if (m_copyAssistDock != nullptr) {
+        m_copyAssistDock->setVisible(visible);
+        // Closing the panel (× button, status-bar toggle, menu, or auto-hide on
+        // leaving voice mode) also turns ASR off — unchecking Enable fires
+        // enableToggled(false), which disables the audio tap.
+        if (!visible && m_copyAssistPanel != nullptr) {
+            m_copyAssistPanel->setAsrEnabled(false);
+        }
+    }
+}
+
+bool PanadapterApplet::isCopyAssistVisible() const
+{
+    return m_copyAssistDock != nullptr && m_copyAssistDock->isVisible();
+}
+
+void PanadapterApplet::setCopyAssistHeight(int h)
+{
+    m_copyAssistHeight = std::clamp(h, 60, 600);
+    if (m_copyAssistDock != nullptr) {
+        m_copyAssistDock->setFixedHeight(m_copyAssistHeight);
+    }
+}
+#endif
 
 void PanadapterApplet::applyCwFont()
 {
@@ -638,6 +742,8 @@ void PanadapterApplet::appendCwText(const QString& text, float cost)
     m_cwText->insertHtml(QString("<span style=\"color:%1\">%2</span>")
         .arg(color, clean.toHtmlEscaped()));
     m_cwText->moveCursor(QTextCursor::End);
+
+    emit cwRxTextDisplayed(clean);
 }
 
 void PanadapterApplet::appendCwTextTx(const QString& text, float cost)
@@ -702,6 +808,32 @@ bool PanadapterApplet::eventFilter(QObject* obj, QEvent* ev)
             return true;
         }
     }
+
+#ifdef AETHER_ASR_ENABLED
+    // Copy Assist panel resize grip — same drag-to-resize as the CW grip.
+    if (obj == m_copyAssistGrip) {
+        if (ev->type() == QEvent::MouseButtonPress) {
+            auto* me = static_cast<QMouseEvent*>(ev);
+            if (me->button() == Qt::LeftButton) {
+                m_copyAssistResizing = true;
+                m_copyAssistResizeStartY = me->globalPosition().toPoint().y();
+                m_copyAssistResizeStartH = m_copyAssistDock->height();
+                return true;
+            }
+        } else if (ev->type() == QEvent::MouseMove && m_copyAssistResizing) {
+            auto* me = static_cast<QMouseEvent*>(ev);
+            const int dy = m_copyAssistResizeStartY - me->globalPosition().toPoint().y();
+            setCopyAssistHeight(m_copyAssistResizeStartH + dy);
+            return true;
+        } else if (ev->type() == QEvent::MouseButtonRelease && m_copyAssistResizing) {
+            m_copyAssistResizing = false;
+            // setValue() self-persists — no extra AppSettings::save() needed.
+            CopyAssistSettings::setValue("AsrPanelHeight",
+                                         QString::number(m_copyAssistHeight));
+            return true;
+        }
+    }
+#endif
 
     if (obj == m_titleBar && m_isFloating && ev->type() == QEvent::MouseMove) {
         return FramelessMoveHelper::move(m_titleBar, static_cast<QMouseEvent*>(ev));
@@ -778,7 +910,7 @@ void PanadapterApplet::appendRttyText(const QString& text, float confidence)
     m_rttyText->moveCursor(QTextCursor::End);
 }
 
-void PanadapterApplet::setRttyStats(float markLevel, float spaceLevel, float snrDb, bool locked)
+void PanadapterApplet::setRttyStats(float markLevel, float /* spaceLevel */, float snrDb, bool locked)
 {
     const int markSegs = qBound(0, qRound(markLevel * 15.0f), 15);
 

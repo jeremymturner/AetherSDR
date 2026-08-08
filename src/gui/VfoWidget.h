@@ -28,6 +28,9 @@ class QGraphicsOpacityEffect;
 class QDoubleSpinBox;
 class QGridLayout;
 class QPainter;
+class QHideEvent;
+class QResizeEvent;
+class QShowEvent;
 
 namespace AetherSDR {
 
@@ -115,7 +118,11 @@ public:
         }
 
         constexpr int kEdgeHysteresis = 20;
-        constexpr double kPanFollowTriggerMarginFrac = 0.05; // matches incremental pan-follow
+        // Must track kIncrementalTriggerEdgeMarginFrac (MainWindow_Wiring.cpp)
+        // so the flag flips sides at the same margin the pan starts to
+        // scroll — a looser value here makes the flag jump sides long
+        // before anything else reacts (#3482: 0.05 -> 0.02).
+        constexpr double kPanFollowTriggerMarginFrac = 0.02; // matches incremental pan-follow
         const int guardPx = std::max(
             kEdgeHysteresis,
             static_cast<int>(std::round(spectrumWidth * kPanFollowTriggerMarginFrac)));
@@ -149,7 +156,11 @@ public:
         }
 
         constexpr int kEdgeHysteresis = 20;
-        constexpr double kPanFollowTriggerMarginFrac = 0.05; // matches incremental pan-follow
+        // Must track kIncrementalTriggerEdgeMarginFrac (MainWindow_Wiring.cpp)
+        // so the flag flips sides at the same margin the pan starts to
+        // scroll — a looser value here makes the flag jump sides long
+        // before anything else reacts (#3482: 0.05 -> 0.02).
+        constexpr double kPanFollowTriggerMarginFrac = 0.02; // matches incremental pan-follow
         const int guardPx = std::max(
             kEdgeHysteresis,
             static_cast<int>(std::round(spectrumWidth * kPanFollowTriggerMarginFrac)));
@@ -271,10 +282,15 @@ public:
     // to screen readers. (#3754)
     QString accessibleSummary() const;
 
-    // Lean render mode: drop WA_TranslucentBackground so the panel composites
-    // as an opaque, cacheable layer instead of being alpha-blended over the
-    // whole window every frame (the dominant idle CPU cost — see #3283).
-    void setOpaqueMode(bool on);
+    // Reparent the flag's satellite widgets (close/lock/record/play buttons +
+    // collapsed freq label — deliberately siblings of the flag, parented to
+    // the SpectrumWidget so they can render outside the flag's bounds) onto a
+    // new spectrum. Required when the flag itself is moved between pans via
+    // SpectrumWidget::takeVfoWidget/adoptVfoWidget: without this the
+    // satellites stay behind on the old pan — ghost buttons at stale
+    // coordinates whose clicks still act on the migrated slice, deleted
+    // entirely when the old pan is torn down (#4037 review).
+    void reparentFlagSatellites(QWidget* newParent);
 
     // Which side of the slice marker the flag panel is currently rendered on.
     // Tracked by updatePosition() via m_lastOnLeft.  Used by panFollowVfo()
@@ -334,8 +350,12 @@ protected:
     void wheelEvent(QWheelEvent* ev) override;
     void mousePressEvent(QMouseEvent* ev) override;
     void mouseReleaseEvent(QMouseEvent* ev) override;
+    void resizeEvent(QResizeEvent* event) override;
+    void showEvent(QShowEvent* event) override;
+    void hideEvent(QHideEvent* event) override;
 
 private:
+    void syncShadowGeometry();
     void updateSignalMeterTarget();
     void animateSignalMeter();
     // Build and push the current MeterInput (RX signal vs the selected TX meter)
@@ -355,6 +375,10 @@ private:
 
     void buildUI();
     void buildTabContent();
+    // Sweep every interactive flag control and give it Qt::PointingHandCursor so
+    // hovering signals clickability.  Re-run after rebuildFilterButtons() so the
+    // dynamically recreated filter/autotune/adaptive buttons are covered (#4036).
+    void applyInteractiveCursors();
     // Meter view (standard S-Meter vs SmartMTR component).  Driven globally by
     // MeterViewController; m_meterStack switches pages and meterBarRect() locates
     // the painted bar.  The inline selector row (m_meterMenuRow) is revealed by
@@ -366,6 +390,8 @@ private:
     void updateTxBadgeStyle(bool isTx);
     void showTab(int index);
     void closeActiveTab();  // close any open DSP/Mode/... tab panel
+    void updateDspTabAccent();
+    void deactivateTabButton(int closedTab);  // reset a just-closed tab's style
     void updateFreqLabel();
     bool cancelDirectEntry();
     void updateFilterLabel();
@@ -401,7 +427,6 @@ private:
     float          m_signalMeterFraction{0.0f};
     float          m_targetSignalMeterFraction{0.0f};
     bool           m_collapsed{false};
-    bool           m_opaqueMode{false};  // lean mode: opaque (non-translucent) panel
     bool           m_collapseToggled{false};  // guard: absorb release after toggle
     int            m_scrollAccum{0};    // trackpad pixel scroll accumulator
     int            m_angleAccum{0};     // mouse wheel angle accumulator
@@ -500,6 +525,7 @@ private:
     QStackedWidget* m_tabStack{nullptr};
     QWidget*        m_tabBar{nullptr};
     int m_activeTab{-1};
+    QPointer<QWidget> m_shadowWidget;
 
     // Tab content widgets
     // Audio tab
@@ -547,6 +573,12 @@ public:
     void setDiversityAllowed(bool allowed);
     void setSmartSdrPlus(bool has);
     void setHasExtendedDsp(bool has);
+    // Whether the RADIO owns its noise reduction / blanking / auto-notch
+    // (RadioCapabilities::hasRadioSideDsp). False hides NR, NB, ANF, NRL,
+    // ANFL and ANFT — controls that on a host-demodulating backend would
+    // toggle firmware that is not there. The client-side modules in the
+    // AetherDSP applet are untouched.
+    void setHasRadioSideDsp(bool has);
 
     // Reflect whether any client-side AetherDSP NR module (NR2 / NR4 / MNR /
     // BNR / DFNR / RN2) is active by accenting the ADSP launcher, so the cue is
@@ -571,6 +603,10 @@ private:
     class QPushButton* m_edgesBtn{nullptr};
     void loadDisplayPrefs();
     void saveDisplayPrefs();
+    // Adaptive RX filter controls (SSB-only, rebuilt with the Mode tab) — RFC #3878
+    // Reusable adaptive-RX-filter control group (shared with the RX applet);
+    // recreated on each SSB grid rebuild, bound to the slice as source of truth.
+    class AdaptiveFilterControls* m_adaptive{nullptr};
 
     QSlider* m_sqlSlider{nullptr};
     QComboBox* m_agcCmb{nullptr};
@@ -617,6 +653,15 @@ private:
     // DSP grid re-layout
     QGridLayout* m_dspGrid{nullptr};
     void relayoutDspGrid();
+    // Shared visibility rule for the 8000-series extended DSP filters
+    // (NRS/RNN/NRF) — one place so setSlice/syncFromSlice/setHasExtendedDsp
+    // can't drift on the mode gate. Caller must hold a valid m_slice. (#2177)
+    void updateExtendedDspVisibility();
+    // The ONE owner of the radio-side DSP buttons' visibility: ANDs each
+    // button's cached mode eligibility with m_hasRadioSideDsp. Both mode
+    // recompute sites and setHasRadioSideDsp() route through here, so no
+    // caller drives these setVisible() directly and none can race another.
+    void applyRadioSideDspVisibility();
     // RTTY Mark/Shift (shown only in RTTY mode)
     QWidget* m_rttyContainer{nullptr};
     // DIG offset (shown only in DIGL/DIGU mode)
@@ -624,8 +669,9 @@ private:
     ScrollableLabel* m_digOffsetLabel{nullptr};   // read-only display, scroll-wheel steps
     QLineEdit*       m_digOffsetEdit{nullptr};     // inline direct-entry (double-click)
     QStackedWidget*  m_digOffsetStack{nullptr};    // switches between label and edit
-    // FM OPT controls (shown only in FM/NFM mode)
+    // FM-family OPT controls. DSTR uses the duplex controls but not CTCSS.
     QWidget*       m_fmContainer{nullptr};
+    QWidget*       m_fmToneContainer{nullptr};
     QComboBox*     m_fmToneModeCmb{nullptr};
     QComboBox*     m_fmToneValueCmb{nullptr};
     QDoubleSpinBox* m_fmOffsetSpin{nullptr};
@@ -659,6 +705,28 @@ private:
     QPushButton* m_zeroBeatBtn{nullptr};
     bool         m_hasSmartSdrPlus{false};
     bool         m_hasExtendedDsp{false};
+    // Whether the RADIO runs its own NR/NB/ANF (RadioCapabilities::
+    // hasRadioSideDsp). Defaults TRUE so a widget built before any backend has
+    // reported stays in its pre-existing state rather than briefly hiding
+    // controls that do exist.
+    bool         m_hasRadioSideDsp{true};
+    // Mode eligibility for each radio-side DSP button, cached by the two places
+    // that recompute it (the slice modeChanged handler and syncFromSlice) so
+    // applyRadioSideDspVisibility() can AND it with the capability WITHOUT
+    // re-deriving mode.
+    //
+    // Re-deriving would force a choice between those two sites' rules, and they
+    // differ: the modeChanged handler hides ANF/ANFL/ANFT for FreeDV modes
+    // (its isVoice carries a !isFdv term), syncFromSlice does not. That is a
+    // pre-existing difference — the same class of drift #2177 found on DFM — and
+    // resolving it is not this change's job. Caching keeps each site's answer
+    // exactly as it was.
+    bool         m_nrModeOk{true};
+    bool         m_nbModeOk{true};
+    bool         m_anfModeOk{true};
+    bool         m_nrlModeOk{true};
+    bool         m_anflModeOk{true};
+    bool         m_anftModeOk{true};
     // RIT/XIT tab
     QPushButton* m_ritBtn{nullptr};
     QPushButton* m_xitBtn{nullptr};

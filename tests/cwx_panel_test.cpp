@@ -1,6 +1,8 @@
 // Focused CWX panel behavior tests.
 // Run: ./build/cwx_panel_test
 
+#include "TestSettingsProfile.h"
+#include "core/AppSettings.h"
 #include "gui/CwxPanel.h"
 #include "models/CwxModel.h"
 
@@ -12,6 +14,7 @@
 #include <QStringList>
 #include <QTextEdit>
 #include <cstdio>
+#include <algorithm>
 #include <string>
 
 using namespace AetherSDR;
@@ -58,6 +61,12 @@ struct Fixture {
     {
         QObject::connect(&model, &CwxModel::commandReady,
                          [this](const QString& command) {
+                             commands.push_back(command);
+                         });
+        // replyCommandReady carries the final cwx send of each macro block, and
+        // every live-mode char, plus the drain-watch epoch + batch char count (#3949)
+        QObject::connect(&model, &CwxModel::replyCommandReady,
+                         [this](const QString& command, int /*epoch*/, int /*nChars*/) {
                              commands.push_back(command);
                          });
     }
@@ -172,9 +181,61 @@ void testSetupTurnsLiveOff()
 
 } // namespace
 
+// Resend must re-send the raw (modifier-bearing) text, not the flattened
+// display text, so per-word speed variation survives a Resend. (#272)
+void testResendPreservesSpeedModifiers()
+{
+    Fixture f;
+    QPushButton *send = nullptr, *live = nullptr, *setup = nullptr;
+    QTextEdit* input = nullptr;
+    if (!requireSendWidgets(f, send, live, setup, input))
+        return;
+
+    input->setPlainText("+CQ");
+    send->click();
+
+    auto* bubble = f.panel.pendingBubble();
+    const bool haveBubble = bubble != nullptr;
+    report("modifier send creates an in-flight history bubble", haveBubble);
+    if (!haveBubble)
+        return;
+
+    report("bubble retains raw modifier text for Resend",
+           bubble->rawText() == QLatin1String("+CQ"));
+    report("bubble paints modifier-stripped display text",
+           bubble->text() == QLatin1String("CQ"));
+
+    auto emitsWpmChange = [](const QStringList& cmds) {
+        return std::any_of(cmds.begin(), cmds.end(), [](const QString& c) {
+            return c.startsWith(QLatin1String("cwx wpm"));
+        });
+    };
+
+    report("modifier send emits a per-word cwx wpm speed change",
+           emitsWpmChange(f.commands));
+
+    // Re-sending the stripped display text (the pre-fix Resend bug) drops the
+    // speed change — which is exactly why the raw text is kept on the bubble.
+    f.commands.clear();
+    f.model.send(bubble->text());
+    report("resending stripped text loses the speed change",
+           !emitsWpmChange(f.commands));
+
+    // Re-sending the raw text reproduces the speed change, so Resend is faithful.
+    f.commands.clear();
+    f.model.send(bubble->rawText());
+    report("resending raw text preserves the speed change",
+           emitsWpmChange(f.commands));
+}
+
 int main(int argc, char** argv)
 {
+    TestSettingsProfile settingsProfile(QStringLiteral("aether-cwx-panel-test"));
+    if (!settingsProfile.isValid()) {
+        return 1;
+    }
     QApplication app(argc, argv);
+    AppSettings::instance().load();
     std::printf("CWX panel behavior test harness\n\n");
 
     testLiveButtonTogglesOff();
@@ -182,6 +243,7 @@ int main(int argc, char** argv)
     testEnterStillSendsWhenLiveOff();
     testSendButtonTurnsLiveOffWithoutDuplicateSend();
     testSetupTurnsLiveOff();
+    testResendPreservesSpeedModifiers();
 
     std::printf("\n%s\n",
                 g_failed == 0

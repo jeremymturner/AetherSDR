@@ -19,7 +19,18 @@ inline constexpr BandDef kBands[] = {
     {"630m",   0.472,    0.479,    0.475,   "CW"},
     {"160m",   1.800,    2.000,    1.900,   "LSB"},
     {"80m",    3.500,    4.000,    3.800,   "LSB"},
-    {"60m",    5.330,    5.405,    5.357,   "USB"},
+    // 60m spans the FCC's encompassing range (47 CFR §97.303), not the outermost
+    // channel dials: from 5330.5 kHz, where the 5332 kHz channel's 2.8 kHz
+    // slot starts, up to 5406.4 kHz, where the 5405 kHz channel's slot ends.
+    // A USB emission from the 5403.5 dial ends at 5406.3, so the last 100 Hz
+    // is headroom rather than extra allocation — do not round it up past
+    // 5.4064: this constant is not only band-grouping metadata,
+    // RadioModel::txFilterFrequencyLimitMessage() gates the PTT preflight on
+    // highMhz, so an edge above the rule lets an out-of-band passband key.
+    // The old 5.405 clipped the top 1.3 kHz of the 5405 channel, so every
+    // frequency->band lookup missed it entirely (#4723). Edges are pinned by
+    // tests/band_edges_test.cpp — keep them in sync.
+    {"60m",    5.3305,   5.4064,   5.357,   "USB"},
     {"40m",    7.000,    7.300,    7.200,   "LSB"},
     {"30m",   10.100,   10.150,   10.125,   "DIGU"},
     {"20m",   14.000,   14.350,   14.225,   "USB"},
@@ -35,6 +46,11 @@ inline constexpr BandDef kBands[] = {
     {"440",  420.000,  450.000,  432.100,   "FM"},
     {"33cm", 902.000,  928.000,  903.100,   "FM"},
     {"23cm",1240.000, 1300.000, 1296.100,   "USB"},
+    // Microwave / weak-signal — transverter bands (defaults = SSB/CW calling freqs)
+    {"13cm",2300.000, 2450.000, 2304.100,   "USB"},
+    {"9cm", 3300.000, 3500.000, 3456.100,   "USB"},
+    {"5cm", 5650.000, 5925.000, 5760.100,   "USB"},
+    {"3cm",10000.000,10500.000,10368.100,   "USB"},
 };
 
 inline constexpr int kBandCount = static_cast<int>(std::size(kBands));

@@ -1,11 +1,15 @@
+#include "TestSettingsProfile.h"
 #include "core/AppSettings.h"
 #include "gui/AmpApplet.h"
 
+#include <QAbstractItemView>
 #include <QApplication>
 #include <QByteArray>
+#include <QComboBox>
 #include <QDir>
 #include <QFile>
 #include <QPushButton>
+#include <QSignalSpy>
 #include <QStandardPaths>
 #include <QTemporaryDir>
 
@@ -31,6 +35,11 @@ QPushButton* tempButton(AmpApplet& applet)
     return applet.findChild<QPushButton*>(QStringLiteral("ampTempUnitButton"));
 }
 
+QComboBox* fanCombo(AmpApplet& applet)
+{
+    return applet.findChild<QComboBox*>(QStringLiteral("ampFanModeCombo"));
+}
+
 void resetSettings()
 {
     auto& settings = AppSettings::instance();
@@ -39,6 +48,7 @@ void resetSettings()
     QFile::remove(path);
     QFile::remove(path + QStringLiteral(".bak"));
     QFile::remove(path + QStringLiteral(".tmp"));
+    settings.load();
 }
 
 void testDefaultPlaceholder()
@@ -132,31 +142,81 @@ void testPreferenceReload()
            button->text());
 }
 
+void testFanModePulldown()
+{
+    resetSettings();
+
+    AmpApplet applet;
+    auto* combo = fanCombo(applet);
+    report("fan combo exists", combo != nullptr);
+    if (!combo) return;
+
+    report("fan combo has three modes", combo->count() == 3, QString::number(combo->count()));
+    // isVisibleTo(&applet), not isVisible(): the applet is never shown as a
+    // top-level window in this offscreen harness, so isVisible() would be
+    // false regardless of the combo's own shown/hidden state.
+    report("fan combo starts hidden", !combo->isVisibleTo(&applet));
+
+    QSignalSpy spy(&applet, &AmpApplet::fanModeChanged);
+
+    // Reflecting an incoming PGXL status must select the right item, show
+    // the combo, and NOT emit fanModeChanged (#3905) — that would echo a
+    // redundant "setup fanmode=" command straight back to the amp.
+    applet.setFanMode("contest");
+    report("setFanMode selects the matching item",
+           combo->currentData().toString() == QStringLiteral("CONTEST"),
+           combo->currentData().toString());
+    report("setFanMode shows the combo", combo->isVisibleTo(&applet));
+    report("setFanMode does not emit fanModeChanged", spy.isEmpty());
+
+    // A user-driven selection must emit the uppercase mode.
+    combo->setCurrentIndex(combo->findData(QStringLiteral("BROADCAST")));
+    report("user selection emits fanModeChanged", spy.count() == 1, QString::number(spy.count()));
+    if (!spy.isEmpty()) {
+        report("emitted mode is uppercase BROADCAST",
+               spy.takeFirst().at(0).toString() == QStringLiteral("BROADCAST"));
+    }
+
+    // An unrecognized mode from the radio must not crash or desync the
+    // combo's selection.
+    const QString before = combo->currentData().toString();
+    applet.setFanMode("bogus");
+    report("unknown fanmode leaves combo selection unchanged",
+           combo->currentData().toString() == before,
+           combo->currentData().toString());
+
+    // #4731: on a large-enough default UI font, the popup's fixed pixel
+    // width (sized off the combo's own hardcoded 10px stylesheet font)
+    // couldn't fit "Fan: Contest" — the longest item — so Qt's default
+    // ElideMiddle silently mangled it. Widths/fonts aren't trustworthy to
+    // assert on directly in this offscreen, unlaid-out harness (the combo
+    // is never shown, so its geometry never reflects a real style pass),
+    // so guard the three properties the fix actually sets instead: let the
+    // widest item drive the combo's width rather than pinning it, and fail
+    // any future overflow visibly (clipped) instead of mid-eliding it.
+    report("fan combo sizes to its widest item, not a pinned width",
+           combo->sizeAdjustPolicy() == QComboBox::AdjustToMinimumContentsLengthWithIcon);
+    report("fan combo reserves room for \"Fan: Contest\"",
+           combo->minimumContentsLength() >= static_cast<int>(QStringLiteral("Fan: Contest").length()),
+           QString::number(combo->minimumContentsLength()));
+    report("fan combo popup does not silently mid-elide overflow",
+           combo->view()->textElideMode() == Qt::ElideNone);
+}
+
 } // namespace
 
 int main(int argc, char** argv)
 {
-    QTemporaryDir fakeHome(QDir::tempPath() + "/aether-amp-applet-test-XXXXXX");
-    if (!fakeHome.isValid()) {
+    TestSettingsProfile settingsProfile(QStringLiteral("aether-amp-applet-test"));
+    if (!settingsProfile.isValid()) {
         std::printf("[FAIL] create temporary home\n");
         return 1;
     }
-
-    const QByteArray fakeHomePath = fakeHome.path().toUtf8();
-    qputenv("HOME", fakeHomePath);
-    qputenv("CFFIXED_USER_HOME", fakeHomePath);
-    qputenv("LOCALAPPDATA", fakeHomePath);
-    qputenv("XDG_CONFIG_HOME", fakeHomePath);
     if (qEnvironmentVariableIsEmpty("QT_QPA_PLATFORM")) {
         qputenv("QT_QPA_PLATFORM", "offscreen");
     }
-    QStandardPaths::setTestModeEnabled(true);
 
     QApplication app(argc, argv);
-
-    const QString configRoot =
-        QStandardPaths::writableLocation(QStandardPaths::GenericConfigLocation);
-    QDir(configRoot + QStringLiteral("/AetherSDR")).removeRecursively();
 
     std::printf("AmpApplet temperature unit test harness\n\n");
 
@@ -164,6 +224,7 @@ int main(int argc, char** argv)
     testSingleSensorToggle();
     testDualSensorToggle();
     testPreferenceReload();
+    testFanModePulldown();
 
     std::printf("\n%s\n",
                 g_failed == 0

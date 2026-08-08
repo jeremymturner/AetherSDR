@@ -1,6 +1,7 @@
 #pragma once
 
 #include "PacketLossConcealment.h"
+#include "VitaBinCoverage.h"
 
 #include <QObject>
 #include <QUdpSocket>
@@ -66,11 +67,14 @@ public:
 
     QHostAddress localAddress() const { return m_localAddress; }
     quint16 localPort() const { return m_localPort; }
-    bool    hasReceivedPackets() const { return m_hasReceivedPacket; }
+    bool    hasReceivedPackets() const { return m_hasReceivedPacket.load(); }
     bool    isRunning() const;
 
     // Update the dBm range used to scale incoming FFT bins for a specific stream.
     void setDbmRange(quint32 streamId, float minDbm, float maxDbm, bool waitForEcho = false);
+    // Abandon an in-flight client range request so the next radio-authoritative
+    // range can update the FFT decoder immediately (for example, on a band change).
+    bool cancelPendingDbmRange(quint32 streamId);
     // Update the ypixels used to scale FFT bin values for a specific stream.
     // The radio encodes FFT bins as pixel Y positions (0 = top/max_dbm,
     // ypixels-1 = bottom/min_dbm), NOT as 0-65535 uint16 range.
@@ -112,6 +116,62 @@ public:
     QList<quint32> daxStreamIds() const;
     quint32 daxStreamIdForChannel(int channel) const;
 
+    // ---- Centralized DAX RX channel ownership (#3305) ----
+    //
+    // Every in-process consumer of a dax_rx channel (the virtual-audio bridge,
+    // TCI, RADE) acquires/releases the channel here instead of tracking stream
+    // ids and peeking at each other's state. PanadapterStream keeps the
+    // channel → (streamId, holders) table and is the ONLY place that decides
+    // when a radio-side stream must exist:
+    //
+    //   acquire, first holder  → emit daxStreamCreateNeeded(ch)
+    //   release, last holder   → deferred (grace + revalidate) →
+    //                            emit daxStreamRemoveNeeded(id, ch)
+    //   radio removed a stream we still hold (profile load, slice teardown)
+    //                           → deferred → re-emit daxStreamCreateNeeded(ch)
+    //
+    // The actual `stream create` / `stream remove` commands are sent by
+    // RadioModel (the command plane), wired to these signals. Decisions are
+    // NEVER made on status-echo edges (the #4009 storm class): acquire/release
+    // are idempotent per holder, and the grace window absorbs the radio's
+    // transient unbind/rebind dax=0/dax=<ch> pairs (#3626) — see
+    // docs/architecture/flex-protocol/state-machines.md §7.
+    enum class DaxConsumer : quint8 {
+        Bridge = 0,   // DAX virtual-audio bridge (macOS CoreAudio / PipeWire)
+        Tci    = 1,   // TCI server audio clients (WSJT-X etc.)
+        Rade   = 2,   // RADE digital-voice engine
+        Clock  = 3,   // AetherClock time-signal decode engine
+    };
+    static const char* daxConsumerName(DaxConsumer who);
+
+    // Add `who` as a holder of `channel` (1-4). Requests stream creation when
+    // the channel gains its first holder. Idempotent per holder. Returns the
+    // channel's current stream id (0 while creation is in flight).
+    quint32 acquireDaxChannel(int channel, DaxConsumer who);
+    // Command plane reports a failed/dropped `stream create` (radio error
+    // reply, or emitted while disconnected). Clears the create latch and — if
+    // the channel is still held — arms a deferred retry, so a transient
+    // failure (DAX slots busy, connect-gap drop) cannot wedge the channel
+    // with `createPending` stuck true (the #3669 wedge class).
+    void notifyDaxCreateFailed(int channel);
+    // Drop `who` as a holder. When the last holder leaves, stream removal is
+    // requested after a grace window (cancelled by a re-acquire).
+    void releaseDaxChannel(int channel, DaxConsumer who);
+    void releaseAllDaxChannels(DaxConsumer who);
+    bool daxChannelHeldBy(int channel, DaxConsumer who) const;
+    // Drop the whole table without emitting removals — the radio reaps all of
+    // a client's streams itself on TCP disconnect (state-machines.md §4.2).
+    void resetDaxChannelsForDisconnect();
+    // Read-only snapshot of the ownership table for diagnostics and the
+    // automation bridge (`get dax`). Safe from any thread.
+    struct DaxChannelSnapshot {
+        int         channel{0};
+        quint32     streamId{0};
+        bool        createPending{false};
+        QStringList holders;   // daxConsumerName() strings
+    };
+    QVector<DaxChannelSnapshot> daxChannelSnapshot() const;
+
     // DAX IQ stream routing
     void registerIqStream(quint32 streamId, int channel);
     void unregisterIqStream(quint32 streamId);
@@ -133,11 +193,22 @@ public:
     // the network worker thread (the socket lives there). Persistence is the
     // caller's responsibility (NetworkSettings, on the GUI thread). (#3810)
     Q_INVOKABLE void setReceiveBufferSizeBytes(int bytes);
+
     // Kernel-granted SO_RCVBUF after the last apply (may be < requested when
     // capped by net.core.rmem_max). 0 until the first bind. Safe from any thread.
     int grantedReceiveBufferBytes() const { return m_grantedRcvBufBytes.load(); }
 
 signals:
+    // Centralized DAX ownership (#3305): command-plane requests, connected to
+    // RadioModel which sends `stream create type=dax_rx dax_channel=<ch>` /
+    // `stream remove 0x<id>` (plus the one-shot #1439 re-assert on create).
+    // RadioModel reports create failures back via notifyDaxCreateFailed().
+    void daxStreamCreateNeeded(int channel);
+    void daxStreamRemoveNeeded(quint32 streamId, int channel);
+    // A channel's radio-side stream went away (our removal or radio-initiated).
+    // TCI uses this to invalidate its channel→trx routing cache.
+    void daxStreamUnregistered(int channel, quint32 streamId);
+
     void daxAudioReady(int channel, const QByteArray& pcm);
     void iqDataReady(int channel, const QByteArray& rawPayload, int sampleRate);
     void spectrumReady(quint32 streamId, const QVector<float>& binsDbm, qint64 emittedNs);
@@ -198,16 +269,19 @@ private:
     struct FrameAssembler {
         quint32        frameIndex{0xFFFFFFFF};
         quint16        totalBins{0};
-        quint16        binsReceived{0};
+        quint16        lastAcceptedTotalBins{0};
         QVector<quint16> buf;          // raw uint16 bins, host byte-order
+        VitaBinCoverage coverage;
+        FftGrowthSuffixGuard growthSuffixGuard;
 
         void reset(quint32 idx, quint16 total) {
             frameIndex   = idx;
             totalBins    = total;
-            binsReceived = 0;
             buf.resize(total);
+            buf.fill(0);
+            coverage.reset(total);
         }
-        bool isComplete() const { return totalBins > 0 && binsReceived >= totalBins; }
+        bool isComplete() const { return coverage.isComplete(); }
     };
 
     // Waterfall frame assembly: tiles arrive in fragments across multiple packets.
@@ -215,23 +289,23 @@ private:
     struct WaterfallFrame {
         quint32          timecode{0xFFFFFFFF};
         quint16          totalBins{0};
-        quint16          binsReceived{0};
         double           lowFreqMhz{0};
         double           binBwMhz{0};
         quint32          autoBlack{0};
         QVector<float>   buf;   // intensity values (int16/128.0f)
+        VitaBinCoverage  coverage;
 
         void reset(quint32 tc, quint16 total, double low, double bw, quint32 ab) {
             timecode     = tc;
             totalBins    = total;
-            binsReceived = 0;
             lowFreqMhz   = low;
             binBwMhz     = bw;
             autoBlack    = ab;
             buf.resize(total);
             buf.fill(0.0f);
+            coverage.reset(total);
         }
-        bool isComplete() const { return totalBins > 0 && binsReceived >= totalBins; }
+        bool isComplete() const { return coverage.isComplete(); }
     };
 
     QMap<quint32, WaterfallFrame> m_wfFrames;  // per-stream waterfall frame assembly
@@ -293,6 +367,7 @@ private:
     QElapsedTimer             m_orphanClock;   // monotonic source for lastSeenMs
     QUdpSocket*     m_socket{nullptr};
     quint16         m_localPort{0};
+
     QMap<quint32, QPair<float,float>> m_dbmRanges;  // streamId → (min, max)
     QMap<quint32, QPair<float,float>> m_pendingDbmRanges;  // streamId → pending echoed range
     QMap<quint32, int> m_yPixels;  // streamId → ypixels for FFT bin scaling
@@ -352,6 +427,23 @@ private:
 
     // DAX stream routing: stream ID → DAX channel (1-4)
     QMap<quint32, int> m_daxStreamIds;
+    // Centralized DAX RX channel ownership (#3305), guarded by m_streamMutex.
+    // `generation` invalidates in-flight deferred removal/recreate lambdas
+    // whenever the channel's state changes (re-acquire cancels a pending
+    // removal; disconnect reset cancels everything).
+    struct DaxChannelState {
+        quint32 streamId{0};
+        bool    createPending{false};
+        quint8  holders{0};       // bitmask of DaxConsumer
+        quint32 generation{0};
+    };
+    QHash<int, DaxChannelState> m_daxChannelStates;
+    quint32 m_daxGenCounter{0};   // monotonic; entries never reuse a generation
+    static constexpr int kDaxRemovalGraceMs  = 1500;  // ≫ the ~80 ms transient rebroadcast cycle (#3626)
+    static constexpr int kDaxRecreateDelayMs = 500;   // radio-removed-but-still-held re-create backoff (#3476)
+    static constexpr int kDaxCreateRetryMs   = 2000;  // failed-create retry cadence while the channel stays held
+    void scheduleDaxRemovalLocked(int channel);       // call with m_streamMutex held
+    void scheduleDaxRecreateLocked(int channel);      // call with m_streamMutex held
     // DAX IQ stream routing: stream ID → IQ channel (1-4)
     QMap<quint32, int> m_iqStreamIds;
     QSet<quint32> m_loggedDaxPacketStreams;
@@ -359,7 +451,10 @@ private:
     QHostAddress m_radioAddress;
     quint16      m_radioPort{0};
     QHostAddress m_localAddress;
-    bool         m_hasReceivedPacket{false};
+    // Written on the network thread (first datagram), read from the GUI thread via
+    // hasReceivedPackets() (the connect health watchdog). Atomic for the same
+    // reason RadioConnection::m_syntheticDemo is.
+    std::atomic<bool> m_hasReceivedPacket{false};
 
     // WAN UDP registration and keepalive
     QTimer*  m_wanRegisterTimer{nullptr};   // 50ms: "client udp_register" until first packet

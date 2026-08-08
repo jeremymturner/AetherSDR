@@ -18,7 +18,7 @@ Read this before adding code to anything named `MainWindow*`. The one rule:
 
 | File | Phase | Holds |
 |---|---|---|
-| `MainWindow.cpp` / `MainWindow.h` | — | The core: constructor (now mostly `wireXxx()` calls), central state members, the signal-routing hub, and cross-cutting code that belongs to no single feature. **Maintainer-gated.** |
+| `MainWindow.cpp` / `MainWindow.h` | — | The core: constructor (now mostly `wireXxx()` calls), central state members, the signal-routing hub, and cross-cutting code that belongs to no single feature. |
 | `MainWindow_Controllers.cpp` | 1a | Physical-controller subsystems: FlexControl, HID encoders (RC-28 / TMate 2 / Ulanzi / PowerMate / Shuttle), StreamDeck labels, controller + meter wiring. |
 | `MainWindow_Menus.cpp` | 1b | `buildMenuBar()` — every `QMenu`/`QAction`, their enable/disable wiring, and the inline lambdas they trigger. |
 | `MainWindow_Shortcuts.cpp` | 1c | The keyboard-shortcut system + its shared state accessors. |
@@ -44,7 +44,7 @@ Read this before adding code to anything named `MainWindow*`. The one rule:
 | A stateless formatter/helper with no `MainWindow` dependency | `MainWindowHelpers.{h,cpp}` |
 | A whole new subsystem with no existing TU home | A **new** `MainWindow_<Subsystem>.cpp` sibling (copy the header-comment style) — not `MainWindow.cpp` |
 | A member field/declaration a sibling method needs | `MainWindow.h` (unavoidable — C++ requires members on the class), kept minimal |
-| A small guard/condition inside a function that itself lives in `MainWindow.cpp` and can't move | Stays inline in `MainWindow.cpp` (e.g. the WFM guard inside `setPanFollow()`) |
+| A small guard/condition inside a function that itself lives in `MainWindow.cpp` and can't move | Stays inline in `MainWindow.cpp` (e.g. the startup-geometry reapply guard inside `showEvent()`) |
 
 ## When a new TU is warranted
 
@@ -104,8 +104,9 @@ TU — the whole point is to stop `MainWindow.cpp` from re-accreting.
 
 - **It's the same class.** Define `void MainWindow::foo()` in the sibling TU;
   declare `foo()` in `MainWindow.h` as usual. No `friend`, no new class.
-- **Carry includes explicitly.** The Linux CI floor is **Qt 6.4.2**; do not rely
-  on transitive includes that only resolve on newer Qt. A sibling TU must
+- **Carry includes explicitly.** The Linux CI image is on **Qt 6.8.3** while
+  macOS runs 6.11.x; do not rely on transitive includes that only resolve on
+  the newer Qt. A sibling TU must
   `#include` every header for the symbols *it* uses, even if `MainWindow.cpp`
   already included them. (This bit #3532; grep moved code for `Q[A-Z]` symbols
   and add the includes.)
@@ -121,10 +122,13 @@ TU — the whole point is to stop `MainWindow.cpp` from re-accreting.
 
 ## Ownership
 
-`MainWindow.{h,cpp}` is maintainer-gated (central architecture). The
-`MainWindow_*.cpp` sibling TUs are **deliberately at the broad reviewer tier** —
-opening up review/approval of extracted feature code to more of the team was a
-primary goal of the decomposition. See [`CONTRIBUTING.md`](../../CONTRIBUTING.md)
+The **whole** MainWindow surface — the core `MainWindow.{h,cpp}` and every
+`MainWindow_*.cpp` sibling TU — sits at the broad reviewer tier (Tier 3,
+`@aethersdr/reviewers`). The core files were formerly maintainer-gated, but
+now that the decomposition is complete that gate is gone: opening up
+review/approval of the extracted feature code — and the shrunk core along with
+it — to more of the team was a primary goal of the split, so nothing here
+bottlenecks on a single maintainer. See [`CONTRIBUTING.md`](../../CONTRIBUTING.md)
 and [`.github/CODEOWNERS`](../../.github/CODEOWNERS).
 
 ## Further direction

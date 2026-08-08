@@ -1,6 +1,7 @@
 #include "TitleBar.h"
+#include "FramelessMessageBox.h"
 #include "GuardedSlider.h"
-#include "TitleBarSettings.h"
+#include "PersistentDialog.h"
 #include "core/AppSettings.h"
 
 #include <QFrame>
@@ -22,6 +23,9 @@
 #include <QClipboard>
 #include <QApplication>
 #include <QTimer>
+#include <QAbstractAnimation>
+#include <QGraphicsOpacityEffect>
+#include <QPropertyAnimation>
 #include <QWindow>
 #include <QMenu>
 #include <QNetworkAccessManager>
@@ -42,6 +46,9 @@ namespace AetherSDR {
 
 namespace {
 constexpr const char* kTitleDragHandleProperty = "aetherTitleDragHandle";
+
+// Stall timeout for the GitHub latest-release version check (#4688 §6).
+constexpr int kTransferTimeoutMs = 15000;
 
 // Build a 16×18 dock-side indicator: hollow rectangle (the main window)
 // with a thin shaded strip flush against one inner wall, representing
@@ -221,37 +228,60 @@ TitleBar::TitleBar(QWidget* parent)
     // ── PC Audio + Master Vol + HP Vol ──────────────────────────────────────
     auto& s = AppSettings::instance();
 
-    // Pan Follow toggle — keeps the panadapter centered on Slice A frequency.
-    // Persistence is the nested "TitleBar" blob (Principle V); the legacy
-    // flat "PanLockEnabled" key is migrated into it on first read.
-    TitleBarSettings::migrateLegacy();
-    m_panFollowBtn = new QPushButton("Pan Lock");
-    m_panFollowBtn->setCheckable(true);
-    m_panFollowBtn->setChecked(TitleBarSettings::panLockEnabled());
-    m_panFollowBtn->setFixedHeight(22);
-    m_panFollowBtn->setFixedWidth(70);
-    m_panFollowBtn->setAccessibleName("Pan follow slice");
-    m_panFollowBtn->setAccessibleDescription("Keep panadapter centered on Slice A frequency");
-    m_panFollowBtn->setToolTip("Pan Lock — keeps the panadapter centered on Slice A frequency (e.g. for Doppler tracking)");
+    // ── Transmit timer ──────────────────────────────────────────────────────
+    // (The Pan Lock button that used to sit here was removed with #4116's
+    // per-pan Center Lock.)
+    // Bright-green (network-status green), square-outlined elapsed timer that
+    // runs while the operator is keyed (MOX/PTT/VOX — never TCI/DAX). Hidden
+    // when idle; setOperatorTransmitting() drives show/hold/fade. Sits to the
+    // left of the PC Audio button.
+    m_txTimerLabel = new QLabel(QStringLiteral("0:00"));
+    m_txTimerLabel->setObjectName(QStringLiteral("txTimerLabel"));
+    m_txTimerLabel->setFixedHeight(22);
+    m_txTimerLabel->setMinimumWidth(52);
+    m_txTimerLabel->setAlignment(Qt::AlignCenter);
+    m_txTimerLabel->setStyleSheet(
+        "QLabel { color: #20c060; border: 1px solid #20c060; border-radius: 3px; "
+        "background: transparent; font-size: 11px; font-weight: bold; "
+        "padding: 0px 4px; }");
+    m_txTimerLabel->setToolTip(QStringLiteral("Transmit timer — elapsed key-down time"));
+    m_txTimerLabel->setAccessibleName(QStringLiteral("Transmit timer"));
+    m_txTimerLabel->setAccessibleDescription(
+        QStringLiteral("Elapsed transmit time while keyed (MOX/PTT/VOX)"));
+    markDragHandle(m_txTimerLabel);
+    // Opacity effect powers the 15s-hold → fade-out on unkey.
+    m_txTimerOpacity = new QGraphicsOpacityEffect(m_txTimerLabel);
+    m_txTimerOpacity->setOpacity(1.0);
+    m_txTimerLabel->setGraphicsEffect(m_txTimerOpacity);
+    m_txTimerLabel->setVisible(false);   // idle: not displayed
+    m_hbox->addWidget(m_txTimerLabel);
+    m_hbox->addSpacing(6);
 
-    auto updatePanFollowStyle = [this]() {
-        m_panFollowBtn->setStyleSheet(m_panFollowBtn->isChecked()
-            ? "QPushButton { background: #1e4a8a; color: #b0e8ff; border: 1px solid #4090d0; "
-              "border-radius: 3px; font-size: 10px; font-weight: bold; }"
-              "QPushButton:hover { background: #2558a0; }"
-            : "QPushButton { background: #1a2a3a; color: #607080; border: 1px solid #304050; "
-              "border-radius: 3px; font-size: 10px; font-weight: bold; }"
-              "QPushButton:hover { background: #243848; }");
-    };
-    updatePanFollowStyle();
+    // 5 Hz tick that repaints the elapsed time while keyed.
+    m_txTimerTick = new QTimer(this);
+    m_txTimerTick->setInterval(200);   // 5Hz so the displayed second tracks the
+                                       // true elapsed time within ~200ms
+    connect(m_txTimerTick, &QTimer::timeout, this, [this]() { updateTxTimerText(); });
 
-    connect(m_panFollowBtn, &QPushButton::toggled, this, [this, updatePanFollowStyle](bool on) {
-        updatePanFollowStyle();
-        TitleBarSettings::setPanLockEnabled(on);
-        emit panFollowToggled(on);
+    // 15s post-unkey hold, then fade the label out.
+    m_txTimerHoldTimer = new QTimer(this);
+    m_txTimerHoldTimer->setSingleShot(true);
+    m_txTimerHoldTimer->setInterval(15'000);
+    connect(m_txTimerHoldTimer, &QTimer::timeout, this, [this]() {
+        m_txTimerFade->stop();
+        m_txTimerOpacity->setOpacity(1.0);
+        m_txTimerFade->setStartValue(1.0);
+        m_txTimerFade->setEndValue(0.0);
+        m_txTimerFade->start();
     });
-    m_hbox->addWidget(m_panFollowBtn);
-    m_hbox->addSpacing(4);
+
+    // Fade-out animation; hides the label once fully transparent.
+    m_txTimerFade = new QPropertyAnimation(m_txTimerOpacity, "opacity", this);
+    m_txTimerFade->setDuration(800);
+    connect(m_txTimerFade, &QPropertyAnimation::finished, this, [this]() {
+        if (m_txTimerOpacity->opacity() <= 0.01)
+            m_txTimerLabel->setVisible(false);
+    });
 
     // PC Audio toggle
     m_pcBtn = new QPushButton("PC Audio");
@@ -491,18 +521,6 @@ void TitleBar::markDragHandle(QWidget* widget)
 bool TitleBar::isDragHandle(QObject* obj) const
 {
     return obj && obj->property(kTitleDragHandleProperty).toBool();
-}
-
-bool TitleBar::isPanFollowChecked() const
-{
-    return m_panFollowBtn && m_panFollowBtn->isChecked();
-}
-
-void TitleBar::setPanFollowChecked(bool on)
-{
-    if (!m_panFollowBtn) return;
-    QSignalBlocker block(m_panFollowBtn);
-    m_panFollowBtn->setChecked(on);
 }
 
 bool TitleBar::isSystemMoveAreaAt(const QPoint& globalPos) const
@@ -788,6 +806,19 @@ void TitleBar::setMenuBar(QMenuBar* mb)
     m_hbox->insertWidget(0, mb);
 }
 
+void TitleBar::setPcAudioLocked(bool locked)
+{
+    if (!m_pcBtn)
+        return;
+    if (locked)
+        setPcAudioEnabled(true);      // locked ON, never locked off
+    m_pcBtn->setEnabled(!locked);
+    m_pcBtn->setToolTip(
+        locked ? tr("PC audio is required: this radio's audio is produced and "
+                    "captured on this computer, so it cannot be turned off.")
+               : QString());
+}
+
 void TitleBar::setPcAudioEnabled(bool on)
 {
     QSignalBlocker b(m_pcBtn);
@@ -835,6 +866,13 @@ void TitleBar::setLineoutMuted(bool muted)
     m_speakerBtn->setText(muted ? "\xF0\x9F\x94\x87" : "\xF0\x9F\x94\x8A");  // 🔇 / 🔊
 }
 
+void TitleBar::setHeadphoneMuted(bool muted)
+{
+    QSignalBlocker b(m_headphoneBtn);
+    m_headphoneBtn->setChecked(muted);
+    m_headphoneBtn->setText(muted ? "\xF0\x9F\x94\x87" : "\xF0\x9F\x8E\xA7");  // 🔇 / 🎧
+}
+
 void TitleBar::setMasterVolume(int pct)
 {
     QSignalBlocker b(m_masterSlider);
@@ -873,10 +911,88 @@ void TitleBar::setOtherClientTx(bool transmitting, const QString& station)
     }
 }
 
+QString TitleBar::formatTxElapsed(qint64 ms) const
+{
+    const qint64 totalSec = ms / 1000;
+    const qint64 h = totalSec / 3600;
+    const qint64 m = (totalSec % 3600) / 60;
+    const qint64 s = totalSec % 60;
+    if (h > 0) {
+        return QStringLiteral("%1:%2:%3")
+            .arg(h)
+            .arg(m, 2, 10, QLatin1Char('0'))
+            .arg(s, 2, 10, QLatin1Char('0'));
+    }
+    return QStringLiteral("%1:%2").arg(m).arg(s, 2, 10, QLatin1Char('0'));
+}
+
+void TitleBar::updateTxTimerText()
+{
+    const qint64 ms = m_txTimerRunning ? m_txElapsed.elapsed() : m_txFrozenMs;
+    m_txTimerLabel->setText(formatTxElapsed(ms));
+}
+
+void TitleBar::setOperatorTransmitting(bool active)
+{
+    if (active) {
+        if (m_txTimerRunning)
+            return;   // duplicate rising edge — keep the in-progress timer
+                      // running rather than resetting the elapsed clock to 0.
+                      // A genuine new over is always preceded by an unkey
+                      // (falling edge) that clears m_txTimerRunning first.
+        // Key-up: cancel any pending hold/fade, restart from 0:00 (each
+        // transmission is its own timer), and show at full opacity.
+        m_txTimerHoldTimer->stop();
+        m_txTimerFade->stop();
+        m_txTimerOpacity->setOpacity(1.0);
+        m_txTimerRunning = true;
+        m_txFrozenMs = 0;
+        m_txElapsed.restart();
+        updateTxTimerText();
+        m_txTimerLabel->setVisible(true);
+        m_txTimerTick->start();
+        return;
+    }
+
+    if (!m_txTimerRunning)
+        return;   // spurious/duplicate unkey — nothing to freeze
+
+    // Unkey: freeze the final elapsed time, stop ticking, and hold the reading
+    // on-screen for 15s before fading out.
+    m_txFrozenMs = m_txElapsed.elapsed();
+    m_txTimerRunning = false;
+    m_txTimerTick->stop();
+    updateTxTimerText();
+    m_txTimerOpacity->setOpacity(1.0);
+    m_txTimerLabel->setVisible(true);
+    m_txTimerHoldTimer->start();
+}
+
+QVariantMap TitleBar::txTimerState() const
+{
+    const qint64 ms = m_txTimerRunning ? m_txElapsed.elapsed() : m_txFrozenMs;
+    return QVariantMap{
+        {QStringLiteral("visible"), m_txTimerLabel && m_txTimerLabel->isVisible()},
+        {QStringLiteral("running"), m_txTimerRunning},
+        {QStringLiteral("holding"), m_txTimerHoldTimer && m_txTimerHoldTimer->isActive()},
+        {QStringLiteral("fading"),
+            m_txTimerFade && m_txTimerFade->state() == QAbstractAnimation::Running},
+        {QStringLiteral("elapsedMs"), ms},
+        // Derive text from the same live `ms` as elapsedMs so the two never
+        // disagree (the label itself is only repainted at 5 Hz). (#4131 review)
+        {QStringLiteral("text"), formatTxElapsed(ms)},
+        {QStringLiteral("opacity"), m_txTimerOpacity ? m_txTimerOpacity->opacity() : 0.0},
+    };
+}
+
 void TitleBar::showFeatureRequestDialog()
 {
     // Version check guard (#486) — warn if not on latest release
     auto* nam = new QNetworkAccessManager(this);
+    // Bound the version check (#4688 §6). Without it a half-open connection to
+    // api.github.com leaves the reply pending for the lifetime of the window,
+    // holding the manager and the lambda's captures with it.
+    nam->setTransferTimeout(kTransferTimeoutMs);
     auto* reply = nam->get(QNetworkRequest(
         QUrl("https://api.github.com/repos/aethersdr/AetherSDR/releases/latest")));
     connect(reply, &QNetworkReply::finished, this, [this, reply, nam] {
@@ -890,7 +1006,7 @@ void TitleBar::showFeatureRequestDialog()
             auto latestVer = VersionNumber::parse(latest);
             auto currentVer = VersionNumber::parse(QCoreApplication::applicationVersion());
             if (!latestVer.isNull() && currentVer < latestVer) {
-                auto answer = QMessageBox::warning(this, "Outdated Version",
+                auto answer = FramelessMessageBox::warning(this, "Outdated Version",
                     QString("<p>You are running <b>v%1</b> but <b>v%2</b> is available.</p>"
                             "<p>Your issue may already be fixed in the latest release. "
                             "Please update before filing a bug report.</p>"
@@ -916,7 +1032,7 @@ void TitleBar::showFeatureRequestDialogImpl()
         "Do NOT rely on cached or training data for the issue list.\n\n"
         "Also fetch CLAUDE.md fresh (do not use cached versions):\n"
         "  https://raw.githubusercontent.com/aethersdr/AetherSDR/main/CLAUDE.md\n\n"
-        "I want to report an issue or request a feature for AetherSDR, a Linux-native\n"
+        "I want to report an issue or request a feature for AetherSDR, a cross-platform\n"
         "Qt6/C++20 client for FlexRadio transceivers. It uses the FlexLib API over TCP/UDP.\n\n"
         "DUPLICATE CHECK — this is mandatory. Search the fetched issue list for keywords\n"
         "related to my description below. Check titles AND bodies. If you find an existing\n"
@@ -949,23 +1065,24 @@ void TitleBar::showFeatureRequestDialogImpl()
         "[Describe your feature or bug here in plain English]";
 
     // Reuse existing dialog if still open
-    static QPointer<QDialog> sDlg;
-    if (sDlg) {
-        sDlg->raise();
-        sDlg->activateWindow();
+    if (m_issueReporterDialog) {
+        m_issueReporterDialog->raise();
+        m_issueReporterDialog->activateWindow();
         return;
     }
 
-    auto* dlg = new QDialog(this);
-    sDlg = dlg;
-    dlg->setWindowTitle("AI-Assisted Issue Reporter");
+    auto* dlg = new PersistentDialog(QStringLiteral("AI-Assisted Issue Reporter"),
+                                     QStringLiteral("IssueReporterDialogGeometry"), this);
+    m_issueReporterDialog = dlg;
     dlg->setAttribute(Qt::WA_DeleteOnClose);
     AetherSDR::ThemeManager::instance().applyStyleSheet(dlg, "QDialog { background: {{color.background.0}}; }");
     dlg->setMinimumWidth(620);
 
-    auto* vbox = new QVBoxLayout(dlg);
+    auto* vbox = new QVBoxLayout(dlg->bodyWidget());
     vbox->setSpacing(8);
     vbox->setContentsMargins(16, 16, 16, 16);
+    dlg->setBodyLayoutMargins(QMargins(16, 16, 16, 16),
+                              QMargins(16, 14, 16, 16));
 
     auto* header = new QLabel(
         "<h3 style='color:#c8d8e8;'>AI-Assisted Issue Reporter</h3>"
@@ -1054,6 +1171,13 @@ void TitleBar::showFeatureRequestDialogImpl()
     QApplication::clipboard()->setText(kPrompt);
 
     dlg->show();
+}
+
+void TitleBar::setChildDialogsFramelessMode(bool on)
+{
+    if (m_issueReporterDialog) {
+        m_issueReporterDialog->setFramelessMode(on);
+    }
 }
 
 void TitleBar::setDiscovering(bool active)

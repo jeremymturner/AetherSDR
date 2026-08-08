@@ -1,4 +1,6 @@
+#include "TestSettingsProfile.h"
 #include "core/AppSettings.h"
+#include "core/SettingsDatabase.h"
 #include "models/AntennaAliasStore.h"
 #include "models/SliceModel.h"
 
@@ -24,22 +26,15 @@ bool expect(bool condition, const char* label)
 
 int main(int argc, char** argv)
 {
-    QTemporaryDir fakeHome(QDir::tempPath() + "/aether-antenna-alias-test-XXXXXX");
-    if (!fakeHome.isValid()) {
+    TestSettingsProfile settingsProfile(QStringLiteral("aether-antenna-alias-test"));
+    if (!settingsProfile.isValid()) {
         std::cerr << "[FAIL] create temporary home\n";
         return 1;
     }
-    qputenv("HOME", fakeHome.path().toUtf8());
-    qputenv("CFFIXED_USER_HOME", fakeHome.path().toUtf8());
-    QStandardPaths::setTestModeEnabled(true);
     QCoreApplication app(argc, argv);
 
-    const QString configRoot =
-        QStandardPaths::writableLocation(QStandardPaths::ConfigLocation);
-    QDir(configRoot + "/AetherSDR").removeRecursively();
-
     auto& settings = AppSettings::instance();
-    settings.reset();
+    settings.load();
 
     const QString radioKey = QStringLiteral("serial-123");
     QMap<QString, QString> aliases;
@@ -49,13 +44,15 @@ int main(int argc, char** argv)
     AntennaAliasStore::save(radioKey, aliases);
 
     bool ok = true;
-    QFile saved(settings.filePath());
-    ok &= expect(saved.open(QIODevice::ReadOnly | QIODevice::Text),
-                 "alias settings file is written");
-    const QString xml = ok ? QString::fromUtf8(saved.readAll()) : QString();
-    saved.close();
-    ok &= expect(xml.contains(QStringLiteral("AntennaAliases_")),
-                 "aliases persist under an XML-safe per-radio key");
+    // Assert against the persisted database file: the per-radio row must be
+    // stored under the encoded AntennaAliases_<hex(radioKey)> key.
+    QString storedJson;
+    ok &= expect(SettingsDatabase::readAppValueFromFile(
+                     settings.filePath(),
+                     AntennaAliasStore::settingsKeyForRadio(radioKey),
+                     storedJson)
+                     && !storedJson.isEmpty(),
+                 "aliases persist under the encoded per-radio key");
 
     settings.reset();
     settings.load();
@@ -76,17 +73,27 @@ int main(int argc, char** argv)
     QStringList commands;
     QObject::connect(&slice, &SliceModel::commandReady,
                      [&commands](const QString& cmd) { commands.append(cmd); });
-    slice.applyStatus({{QStringLiteral("tx_ant_list"), QStringLiteral("ANT1,ANT2,XVTR")}});
+    // aetherd RFC 2.3: antenna-list splitting moved to FlexBackend::decodeSliceStatus;
+    // the model now receives the already-split QStringList via a typed SliceDelta.
+    {
+        SliceDelta d;
+        d.txAntennaList = QStringList({QStringLiteral("ANT1"), QStringLiteral("ANT2"), QStringLiteral("XVTR")});
+        slice.applyChanges(d);
+    }
     ok &= expect(slice.txAntennaList() == QStringList({QStringLiteral("ANT1"),
                                                        QStringLiteral("ANT2"),
                                                        QStringLiteral("XVTR")}),
-                 "slice parses tx_ant_list");
+                 "slice stores txAntennaList");
 
-    slice.applyStatus({{QStringLiteral("rx_ant_list"), QStringLiteral("ANT1,RX_A,RX_B")}});
+    {
+        SliceDelta d;
+        d.rxAntennaList = QStringList({QStringLiteral("ANT1"), QStringLiteral("RX_A"), QStringLiteral("RX_B")});
+        slice.applyChanges(d);
+    }
     ok &= expect(slice.rxAntennaList() == QStringList({QStringLiteral("ANT1"),
                                                        QStringLiteral("RX_A"),
                                                        QStringLiteral("RX_B")}),
-                 "slice parses rx_ant_list");
+                 "slice stores rxAntennaList");
 
     slice.setRxAntenna(QStringLiteral("RX_B"));
     ok &= expect(commands == QStringList({QStringLiteral("slice set 3 rxant=RX_B")}),
@@ -97,6 +104,5 @@ int main(int argc, char** argv)
     ok &= expect(commands == QStringList({QStringLiteral("slice set 3 txant=XVTR")}),
                  "slice TX antenna command keeps canonical token");
 
-    QDir(configRoot + "/AetherSDR").removeRecursively();
     return ok ? 0 : 1;
 }

@@ -1,13 +1,16 @@
 #include "AmpApplet.h"
 #include "HGauge.h"
+#include "GuardedSlider.h"
 #include "core/AppSettings.h"
 
+#include <QAbstractItemView>
 #include <QAccessible>
 #include <QVBoxLayout>
 #include <QHBoxLayout>
 #include <QLabel>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QSignalBlocker>
 #include "core/ThemeManager.h"
 #include "MeterSmoother.h"
 
@@ -192,30 +195,55 @@ AmpApplet::AmpApplet(QWidget* parent)
         "border-radius: 3px; color: {{color.text.primary}}; font-size: 10px; font-weight: bold; }"
         "QPushButton:hover { background: {{color.background.1}}; }";
 
-    // Fan speed cycle button — labelled per mode via fanModeLabel()
-    // ("Fan: Std" / "Fan: Contest" / "Fan: Bcast").  Hidden until a direct
-    // PGXL connection delivers the first fanmode status.
-    m_fanBtn = new QPushButton(fanModeLabel(m_fanMode));
-    m_fanBtn->setSizePolicy(QSizePolicy::Minimum, QSizePolicy::Fixed);
-    m_fanBtn->setFocusPolicy(Qt::TabFocus);
-    AetherSDR::ThemeManager::instance().applyStyleSheet(m_fanBtn, kBtnStyle);
-    m_fanBtn->setToolTip("Fan Speed\nClick to cycle STANDARD / CONTEST / BROADCAST");
-    m_fanBtn->setAccessibleName(QString("Fan speed: %1").arg(m_fanMode));
-    m_fanBtn->setAccessibleDescription("Cycles through STANDARD, CONTEST, and BROADCAST");
-    m_fanBtn->hide();
-    connect(m_fanBtn, &QPushButton::clicked, this, [this]() {
-        static const QStringList kModes = {"STANDARD", "CONTEST", "BROADCAST"};
-        int idx = kModes.indexOf(m_fanMode);
-        if (idx < 0) {
-            qWarning() << "AmpApplet: unknown fanmode" << m_fanMode << "— resetting to STANDARD";
-            idx = -1; // (-1 + 1) % 3 == 0 == STANDARD
-        }
-        m_fanMode = kModes[(idx + 1) % kModes.size()];
-        m_fanBtn->setText(fanModeLabel(m_fanMode));
-        m_fanBtn->setAccessibleName(QString("Fan speed: %1").arg(m_fanMode));
+    // Fan speed pull-down — surfaces all three modes instead of making the
+    // operator click through them blind (#3905). Item text via
+    // fanModeLabel(); uppercase mode stored as itemData so the
+    // fanModeChanged contract ("uppercase, ready for sendCommand") is
+    // unchanged. Hidden until a direct PGXL connection delivers the first
+    // fanmode status.
+    // The popup view is a separate top-level (Qt::Popup) window, so it
+    // doesn't inherit the combo's font — it must be set explicitly here or
+    // the popup paints at the app's default UI font while the combo's own
+    // width (and elision) is computed from the 10px rule below. On a
+    // larger-than-default UI font that mismatch elides "Fan: Contest", the
+    // longest item, into a garbled label (#4731).
+    static const char* kComboStyle =
+        "QComboBox { background: {{color.background.2}}; border: 1px solid {{color.background.2}}; "
+        "border-radius: 3px; padding: 1px 4px; color: {{color.text.primary}}; font-size: 10px; font-weight: bold; }"
+        "QComboBox:hover { background: {{color.background.1}}; }"
+        "QComboBox::drop-down { border: none; width: 14px; }"
+        "QComboBox QAbstractItemView { background: {{color.background.2}}; color: {{color.text.primary}}; "
+        "selection-background-color: {{color.background.1}}; font-size: 10px; font-weight: bold; }";
+    // GuardedComboBox (not plain QComboBox): this is a hardware control, so
+    // an accidental mouse-wheel scroll while just hovering over it must not
+    // silently change fan mode and send a command to the amp — it only
+    // responds to wheel input when its dropdown is actually open (#3905).
+    m_fanCombo = new GuardedComboBox;
+    m_fanCombo->setObjectName(QStringLiteral("ampFanModeCombo"));
+    for (const QString& mode : {QStringLiteral("STANDARD"), QStringLiteral("CONTEST"), QStringLiteral("BROADCAST")})
+        m_fanCombo->addItem(fanModeLabel(mode), mode);
+    // Let the widest item ("Fan: Contest") drive the combo's width instead
+    // of leaving it pinned to whatever the stylesheet happens to compute
+    // (#4731) — matches the pattern used by every other combo in the app,
+    // e.g. ProfileSwitcherApplet, AdaptiveFilterControls.
+    m_fanCombo->setSizeAdjustPolicy(QComboBox::AdjustToMinimumContentsLengthWithIcon);
+    m_fanCombo->setMinimumContentsLength(12);
+    // Belt-and-braces: if a future label ever outgrows the combo anyway,
+    // fail visibly (clipped) rather than silently mislabelling the mode.
+    m_fanCombo->view()->setTextElideMode(Qt::ElideNone);
+    m_fanCombo->setSizePolicy(QSizePolicy::Minimum, QSizePolicy::Fixed);
+    m_fanCombo->setFocusPolicy(Qt::TabFocus);
+    AetherSDR::ThemeManager::instance().applyStyleSheet(m_fanCombo, kComboStyle);
+    m_fanCombo->setToolTip("Fan Speed\nSelect STANDARD / CONTEST / BROADCAST");
+    m_fanCombo->setAccessibleName(QString("Fan speed: %1").arg(m_fanMode));
+    m_fanCombo->setAccessibleDescription("Selects STANDARD, CONTEST, or BROADCAST fan mode");
+    m_fanCombo->hide();
+    connect(m_fanCombo, &QComboBox::currentIndexChanged, this, [this](int index) {
+        m_fanMode = m_fanCombo->itemData(index).toString();
+        m_fanCombo->setAccessibleName(QString("Fan speed: %1").arg(m_fanMode));
         emit fanModeChanged(m_fanMode);
     });
-    btnRow->addWidget(m_fanBtn);
+    btnRow->addWidget(m_fanCombo);
 
     m_operateBtn = new QPushButton("OPERATE");
     m_operateBtn->setSizePolicy(QSizePolicy::Minimum, QSizePolicy::Fixed);
@@ -370,10 +398,23 @@ void AmpApplet::setMainsVoltage(int volts)
 
 void AmpApplet::setFanMode(const QString& mode)
 {
-    m_fanMode = mode.toUpper();
-    m_fanBtn->setText(fanModeLabel(m_fanMode));
-    m_fanBtn->setAccessibleName(QString("Fan speed: %1").arg(m_fanMode));
-    m_fanBtn->show();
+    const QString upper = mode.toUpper();
+    int idx = m_fanCombo->findData(upper);
+    if (idx < 0) {
+        // Leave m_fanMode and the combo's selection as they were — updating
+        // one but not the other would desync what's displayed from what
+        // AmpApplet thinks the mode is.
+        qWarning() << "AmpApplet: unknown fanmode" << upper;
+    } else {
+        m_fanMode = upper;
+        // Reflecting an incoming PGXL status — block signals so this
+        // doesn't fire currentIndexChanged and echo a redundant
+        // "setup fanmode=" command back to the amp (#3905).
+        QSignalBlocker blocker(m_fanCombo);
+        m_fanCombo->setCurrentIndex(idx);
+    }
+    m_fanCombo->setAccessibleName(QString("Fan speed: %1").arg(m_fanMode));
+    m_fanCombo->show();
 }
 
 void AmpApplet::setState(const QString& state)
@@ -414,7 +455,7 @@ void AmpApplet::setDirectConnected(bool direct)
         m_vacLabel->setText("Vac  — V");
         m_vacLabel->setStyleSheet("QLabel { color: #505050; font-size: 10px; }");
         // Fan mode is only available via direct PGXL protocol — hide until reconnected.
-        m_fanBtn->hide();
+        m_fanCombo->hide();
     }
 }
 

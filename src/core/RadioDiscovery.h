@@ -50,10 +50,26 @@ struct RadioBindSettings {
 
 // Represents a discovered FlexRadio on the network.
 struct RadioInfo {
+    // aetherd Gap B (Step 2b): radio family discriminator. "flex" (default, so
+    // every existing Flex discovery/probe path is unchanged) or "hl2"
+    // (Hermes-Lite 2, from HPSDR discovery / the manual HL2 path). RadioModel
+    // routes the connect through the matching backend based on this.
+    QString family{QStringLiteral("flex")};
     QString name;           // e.g. "FLEX-6600"
     QString model;
     QString serial;
     QString version;
+    // What the radio calls its version, when a bare number would not be
+    // self-describing. The HL2 reports a gateware revision ("75"), which says
+    // nothing on its own; a Flex reports a software version ("4.2.20.41343"),
+    // which does. Empty means "render the version alone", so every existing
+    // backend is unchanged by omitting it.
+    //
+    // DISPLAY ONLY, and deliberately a separate field rather than a prefix
+    // baked into `version`: that value is also served over rigctl
+    // (RigctlProtocol) and the automation bridge, where clients parse it as a
+    // version token.
+    QString versionLabel;
     QString nickname;
     QString callsign;
     QHostAddress address;
@@ -65,6 +81,12 @@ struct RadioInfo {
     bool isRouted{false};
     bool isSystemModel{false};
     QString turfRegion;
+    // Optional: bands the radio itself supports, e.g. "2m,440,23cm"
+    // (names from BandDefs).  Real Flex radios don't send this — band
+    // capability then derives from the model string as before.  Gateways
+    // presenting non-Flex hardware use it to declare their true band set
+    // instead of inheriting the impersonated model's bands.
+    QString bands;
     RadioBindSettings bindSettings;
     QHostAddress sessionBindAddress;
 

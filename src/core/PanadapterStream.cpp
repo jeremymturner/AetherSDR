@@ -158,6 +158,8 @@ void PanadapterStream::init()
 
 bool PanadapterStream::isRunning() const
 {
+    // Truthful for the demo too: a demo stream binds no socket and runs no timer
+    // (SimBackend produces the demo's audio and spectrum), so it is not running.
     return m_socket && m_socket->state() == QAbstractSocket::BoundState;
 }
 
@@ -203,6 +205,24 @@ void PanadapterStream::setReceiveBufferSizeBytes(int bytes)
 bool PanadapterStream::start(RadioConnection* conn)
 {
     if (isRunning()) stop();  // clean up previous session before rebinding (#561)
+
+    if (conn && conn->isSyntheticDemo()) {
+        // Demo radio: nothing to bind and nothing to generate.
+        //
+        // SimBackend (RFC #4288 Route A) produces the demo's audio AND its
+        // panadapter FFT from its own NoiseMixer and delivers both over the
+        // IRadioBackend seam, so one noise scene drives both what the operator
+        // hears and what the display shows. This stream is deliberately idle:
+        // an earlier revision ran a 20 fps 1024-bin spectrum timer and a 10 ms
+        // audio timer here against a SECOND NoiseMixer, which had no consumers
+        // at all (pure CPU burn) and risked drifting out of step with the scene
+        // actually being heard.
+        //
+        // The stream object still exists and starts cleanly — RadioModel harvests
+        // it from SimBackend and the rest of AE treats it as a normal idle pan
+        // stream.
+        return true;
+    }
 
     resetAudioStreamStats();
 
@@ -528,6 +548,17 @@ void PanadapterStream::setDbmRange(quint32 streamId, float minDbm, float maxDbm,
     m_dbmRanges[streamId] = {minDbm, maxDbm};
     qCDebug(lcVita49) << "PanadapterStream: dBm range for 0x" + QString::number(streamId, 16)
              << minDbm << "->" << maxDbm;
+}
+
+bool PanadapterStream::cancelPendingDbmRange(quint32 streamId)
+{
+    QMutexLocker lock(&m_streamMutex);
+    const bool removed = m_pendingDbmRanges.remove(streamId) > 0;
+    if (removed) {
+        qCDebug(lcVita49) << "PanadapterStream: cancelled pending dBm range for 0x"
+                         + QString::number(streamId, 16);
+    }
+    return removed;
 }
 
 void PanadapterStream::setYPixels(quint32 streamId, int yPixels)
@@ -874,32 +905,57 @@ void PanadapterStream::decodeFFT(const uchar* raw, int totalBytes, bool hasTrail
     if (numBins == 0 || binSize == 0 || totalBins == 0) return;
 
     const int binDataOffset = VITA49_HEADER_BYTES + FFT_SUBHEADER_BYTES;
-    int binDataBytes = numBins * binSize;
     const int available = totalBytes - binDataOffset - (hasTrailer ? 4 : 0);
-    if (available < binDataBytes) {
-        binDataBytes = available;
-        if (binDataBytes <= 0) return;
-    }
+    // FLEX FFT samples are uint16. A short datagram must not be read past its
+    // payload or counted as complete; wait for coverage of the missing bins.
+    if (binSize != sizeof(quint16)) return;
+    const int binsToRead = boundedVitaPayloadBinCount(
+        numBins, binSize, available);
+    if (binsToRead <= 0) return;
 
     const uchar* binData = raw + binDataOffset;
 
-    // Per-stream frame assembly
+    // Per-stream frame assembly.
     auto& frame = m_frames[streamId];
-    if (frameIndex != frame.frameIndex) {
+    const bool startsNewFrame =
+        frameIndex != frame.frameIndex || totalBins != frame.totalBins;
+    if (startsNewFrame) {
         if (frame.totalBins > 0 && !frame.isComplete())
             PerfTelemetry::instance().recordFrameRestart(PerfTelemetry::FrameKind::Panadapter);
         frame.reset(frameIndex, totalBins);
     }
 
-    if (startBin + numBins > static_cast<quint16>(frame.buf.size()))
+    if (static_cast<int>(startBin) + binsToRead > frame.buf.size())
+        return;
+    if (frame.isComplete())
+        return;
+    if (!frame.coverage.markRange(startBin, binsToRead))
         return;
 
-    for (quint16 i = 0; i < numBins; ++i)
+    for (int i = 0; i < binsToRead; ++i)
         frame.buf[startBin + i] = qFromBigEndian<quint16>(binData + i * 2);
 
-    frame.binsReceived += numBins;
-
     if (!frame.isComplete()) return;
+
+    // On an x_pixels grow, firmware 4.2.18 can complete one expanded frame
+    // with the old-width prefix followed by zero-filled new bins. Zero means
+    // max dBm in the radio's vertical pixel encoding. Reject that placeholder
+    // before it reaches FFT averaging or retained 3D history; the previous
+    // complete FFT remains live until the first valid expanded frame arrives.
+    const bool zeroFilledGrowth = hasZeroFilledFftGrowthSuffix(
+        frame.buf, frame.lastAcceptedTotalBins);
+    const FftGrowthSuffixAction growthAction =
+        frame.growthSuffixGuard.observe(zeroFilledGrowth, frame.totalBins);
+    if (growthAction == FftGrowthSuffixAction::Reject) {
+        return;
+    }
+    const int floorFilledSuffixStart =
+        growthAction == FftGrowthSuffixAction::EmitWithFloorSuffix
+        ? frame.lastAcceptedTotalBins
+        : -1;
+    if (growthAction == FftGrowthSuffixAction::Accept) {
+        frame.lastAcceptedTotalBins = frame.totalBins;
+    }
 
     // Convert to dBm using per-stream range
     QPair<float,float> dbmRange;
@@ -916,29 +972,23 @@ void PanadapterStream::decodeFFT(const uchar* raw, int totalBytes, bool hasTrail
     const int   count = frame.buf.size();
     QVector<float> bins(count);
 
-    int effectiveYPixels = std::max(yPixVal, 2);
-    int rawMax = 0;
-    int overRangeCount = 0;
-    for (const quint16 rawBin : frame.buf) {
-        const int rawValue = static_cast<int>(rawBin);
-        rawMax = std::max(rawMax, rawValue);
-        if (rawValue >= effectiveYPixels) {
-            ++overRangeCount;
-        }
-    }
-    // A stale/tiny y_pixels status makes normal noise bins clamp to one flat
-    // floor while strong signals still poke through. If the frame itself shows
-    // that the radio is encoding against a taller pixel space, preserve the
-    // trace and let the normal dimension re-push/echo path catch up.
-    if (overRangeCount > std::max(8, count / 8)) {
-        effectiveYPixels = std::max(effectiveYPixels, rawMax + 1);
-    }
-
-    const float yPix = static_cast<float>(effectiveYPixels);
+    // The radio's configured y_pixels is the encoding scale. Values at or
+    // beyond y_pixels are bottom-clipped samples, not evidence that the frame
+    // silently switched to a taller scale. Inferring a different height from
+    // each frame makes a clipped floor look like valid, rescaled FFT data.
+    const float yPix = static_cast<float>(std::max(yPixVal, 2));
 
     for (int i = 0; i < count; ++i) {
-        const float pixel = std::clamp(
-            static_cast<float>(frame.buf[i]), 0.0f, yPix - 1.0f);
+        // If firmware repeats its resize placeholder, keep the panadapter live
+        // after a bounded wait without ever interpreting the zero-filled suffix
+        // as max dBm. A later populated growth frame is still detected against
+        // lastAcceptedTotalBins and replaces this floor extension normally.
+        const bool floorFillSuffix = floorFilledSuffixStart >= 0
+            && i >= floorFilledSuffixStart;
+        const float pixel = floorFillSuffix
+            ? yPix - 1.0f
+            : std::clamp(
+                static_cast<float>(frame.buf[i]), 0.0f, yPix - 1.0f);
         const float dbm = maxDbm - (pixel / (yPix - 1.0f)) * range;
         bins[i] = std::clamp(dbm, minDbm, maxDbm);
     }
@@ -984,11 +1034,9 @@ void PanadapterStream::decodeWaterfallTile(const uchar* raw, int totalBytes, boo
 
     if (tileWidth == 0 || tileHeight == 0) return;
 
-    // FrameLowFreq and BinBandwidth arrive as either VitaFrequency (Hz × 2^20)
-    // or plain Hz; disambiguate on the raw integer magnitude so there is no
-    // upper frequency ceiling. The previous "divide then reject results above
-    // 1000 MHz" heuristic blacked out the waterfall for every transverter above
-    // 1 GHz (#3449, #1843, #1928, #2835). See VitaTileFrequency.h.
+    // FrameLowFreq and BinBandwidth are VITA fixed-point values (Hz × 2^20).
+    // Decode them unconditionally so a tile that overhangs slightly below DC
+    // cannot be mistaken for plain Hz (#4412). See VitaTileFrequency.h.
     const auto tileFreq = AetherSDR::Vita::decodeTileFrequencyMhz(frameLowRaw, binBwRaw);
     const double lowFreqMhz = tileFreq.lowMhz;
     const double binBwMhz   = tileFreq.binBwMhz;
@@ -1039,13 +1087,13 @@ void PanadapterStream::decodeWaterfallTile(const uchar* raw, int totalBytes, boo
     // refactor that breaks the wfFrame.buf.size() <-> wfFrame.totalBins
     // invariant.  GHSA-7gvg-x594-pprq.
     if (firstBinIndex + binsToRead > wfFrame.buf.size()) return;
+    if (wfFrame.isComplete()) return;
+    if (!wfFrame.coverage.markRange(firstBinIndex, binsToRead)) return;
 
     for (int i = 0; i < binsToRead; ++i) {
         const auto raw16 = static_cast<qint16>(qFromBigEndian<quint16>(tilePayload + i * 2));
         wfFrame.buf[firstBinIndex + i] = static_cast<float>(raw16) / 128.0f;
     }
-    wfFrame.binsReceived += binsToRead;
-
     // Only emit when the full frame is assembled
     if (!wfFrame.isComplete()) return;
 
@@ -1423,6 +1471,17 @@ void PanadapterStream::registerDaxStream(quint32 streamId, int channel)
     }
     m_daxStreamIds[streamId] = channel;
     m_loggedDaxPacketStreams.remove(streamId);
+    // Ownership table (#3305): the create we requested has materialized (or a
+    // leftover stream from a previous arm was adopted). If nobody holds the
+    // channel, start the grace clock — an unheld stream is an orphan-in-waiting.
+    {
+        auto& st = m_daxChannelStates[channel];
+        st.streamId = streamId;
+        st.createPending = false;
+        st.generation = ++m_daxGenCounter;
+        if (st.holders == 0)
+            scheduleDaxRemovalLocked(channel);
+    }
     qCDebug(lcVita49) << "PanadapterStream: registered DAX stream" << Qt::hex << streamId << "-> channel" << channel;
 }
 
@@ -1438,19 +1497,268 @@ quint32 PanadapterStream::daxStreamIdForChannel(int channel) const
 
 void PanadapterStream::unregisterDaxStream(quint32 streamId)
 {
-    QMutexLocker lock(&m_streamMutex);
-    m_daxStreamIds.remove(streamId);
-    m_loggedDaxPacketStreams.remove(streamId);
-    // DAX audio streams use the PLC path too; drop the per-stream PLC
-    // entry so it doesn't outlive the stream itself (#2738).
-    m_audioPlc.remove(streamId);
-    qCDebug(lcVita49) << "PanadapterStream: unregistered DAX stream" << Qt::hex << streamId;
+    int channel = 0;
+    {
+        QMutexLocker lock(&m_streamMutex);
+        m_daxStreamIds.remove(streamId);
+        m_loggedDaxPacketStreams.remove(streamId);
+        // DAX audio streams use the PLC path too; drop the per-stream PLC
+        // entry so it doesn't outlive the stream itself (#2738).
+        m_audioPlc.remove(streamId);
+        // Ownership table (#3305): if the radio tore the stream down while
+        // consumers still hold the channel (profile load / slice teardown),
+        // schedule a re-create. Our own removals erase the entry first, so
+        // this only fires for radio-initiated teardown.
+        for (auto it = m_daxChannelStates.begin(); it != m_daxChannelStates.end(); ++it) {
+            if (it->streamId == streamId) {
+                channel = it.key();
+                it->streamId = 0;
+                it->generation = ++m_daxGenCounter;
+                if (it->holders != 0)
+                    scheduleDaxRecreateLocked(it.key());
+                else
+                    m_daxChannelStates.erase(it);
+                break;
+            }
+        }
+        qCDebug(lcVita49) << "PanadapterStream: unregistered DAX stream" << Qt::hex << streamId;
+    }
+    if (channel)
+        emit daxStreamUnregistered(channel, streamId);
 }
 
 QList<quint32> PanadapterStream::daxStreamIds() const
 {
     QMutexLocker lock(&m_streamMutex);
     return m_daxStreamIds.keys();
+}
+
+// ---- Centralized DAX RX channel ownership (#3305) ----
+
+const char* PanadapterStream::daxConsumerName(DaxConsumer who)
+{
+    switch (who) {
+    case DaxConsumer::Bridge: return "bridge";
+    case DaxConsumer::Tci:    return "tci";
+    case DaxConsumer::Rade:   return "rade";
+    case DaxConsumer::Clock:  return "clock";
+    }
+    return "?";
+}
+
+static inline quint8 daxHolderBit(PanadapterStream::DaxConsumer who)
+{
+    return quint8(1u << quint8(who));
+}
+
+quint32 PanadapterStream::acquireDaxChannel(int channel, DaxConsumer who)
+{
+    if (channel < 1 || channel > 4) return 0;
+    bool needCreate = false;
+    quint32 streamId = 0;
+    {
+        QMutexLocker lock(&m_streamMutex);
+        auto& st = m_daxChannelStates[channel];
+        const quint8 bit = daxHolderBit(who);
+        const bool alreadyHeld = st.holders & bit;
+        st.holders |= bit;
+        // Any acquire invalidates a pending deferred removal.
+        st.generation = ++m_daxGenCounter;
+        if (st.streamId == 0 && !st.createPending) {
+            st.createPending = true;
+            needCreate = true;
+        }
+        streamId = st.streamId;
+        if (!alreadyHeld) {
+            qCInfo(lcVita49) << "PanadapterStream: DAX ch" << channel
+                             << "acquired by" << daxConsumerName(who)
+                             << "holders=0x" + QString::number(st.holders, 16)
+                             << (needCreate ? "(creating stream)" : "");
+        }
+    }
+    if (needCreate)
+        emit daxStreamCreateNeeded(channel);
+    return streamId;
+}
+
+void PanadapterStream::releaseDaxChannel(int channel, DaxConsumer who)
+{
+    if (channel < 1 || channel > 4) return;
+    QMutexLocker lock(&m_streamMutex);
+    auto it = m_daxChannelStates.find(channel);
+    if (it == m_daxChannelStates.end()) return;
+    const quint8 bit = daxHolderBit(who);
+    if (!(it->holders & bit)) return;
+    it->holders &= ~bit;
+    it->generation = ++m_daxGenCounter;
+    qCInfo(lcVita49) << "PanadapterStream: DAX ch" << channel
+                     << "released by" << daxConsumerName(who)
+                     << "holders=0x" + QString::number(it->holders, 16);
+    if (it->holders == 0) {
+        if (it->streamId != 0) {
+            scheduleDaxRemovalLocked(channel);
+        } else if (!it->createPending) {
+            m_daxChannelStates.erase(it);
+        }
+        // else: a create is in flight for a channel nobody wants anymore.
+        // Keep the entry so registerDaxStream() finds it when the status
+        // lands, sees holders==0, and schedules ONE deterministic removal —
+        // erasing here would make the registration re-insert a fresh entry
+        // and bounce through create→remove churn (review #4017 item 3).
+    }
+}
+
+void PanadapterStream::notifyDaxCreateFailed(int channel)
+{
+    if (channel < 1 || channel > 4) return;
+    bool retryArmed = false;
+    {
+        QMutexLocker lock(&m_streamMutex);
+        auto it = m_daxChannelStates.find(channel);
+        if (it == m_daxChannelStates.end() || it->streamId != 0) return;
+        it->createPending = false;
+        it->generation = ++m_daxGenCounter;
+        if (it->holders == 0) {
+            m_daxChannelStates.erase(it);
+        } else {
+            // Still wanted: retry on a gentle cadence. Each cycle re-enters
+            // this method on failure, so a persistent condition (DAX slots
+            // exhausted on the radio) costs one command per kDaxCreateRetryMs
+            // — and heals the moment a slot frees or the connection is up.
+            const quint32 gen = it->generation;
+            QTimer::singleShot(kDaxCreateRetryMs, this, [this, channel, gen]() {
+                bool needCreate = false;
+                {
+                    QMutexLocker lock(&m_streamMutex);
+                    auto it = m_daxChannelStates.find(channel);
+                    if (it == m_daxChannelStates.end()) return;
+                    if (it->generation != gen) return;
+                    if (it->holders == 0 || it->streamId != 0 || it->createPending) return;
+                    it->createPending = true;
+                    it->generation = ++m_daxGenCounter;
+                    needCreate = true;
+                }
+                if (needCreate) {
+                    qCInfo(lcVita49) << "PanadapterStream: retrying DAX ch" << channel
+                                     << "stream create after failure (#3305)";
+                    emit daxStreamCreateNeeded(channel);
+                }
+            });
+            retryArmed = true;
+        }
+    }
+    qCWarning(lcVita49) << "PanadapterStream: DAX ch" << channel
+                        << "stream create failed/dropped —"
+                        << (retryArmed ? "retry armed" : "channel unheld, entry dropped");
+}
+
+void PanadapterStream::releaseAllDaxChannels(DaxConsumer who)
+{
+    for (int ch = 1; ch <= 4; ++ch)
+        releaseDaxChannel(ch, who);
+}
+
+bool PanadapterStream::daxChannelHeldBy(int channel, DaxConsumer who) const
+{
+    QMutexLocker lock(&m_streamMutex);
+    auto it = m_daxChannelStates.constFind(channel);
+    return it != m_daxChannelStates.constEnd() && (it->holders & daxHolderBit(who));
+}
+
+QVector<PanadapterStream::DaxChannelSnapshot> PanadapterStream::daxChannelSnapshot() const
+{
+    QMutexLocker lock(&m_streamMutex);
+    QVector<DaxChannelSnapshot> out;
+    out.reserve(m_daxChannelStates.size());
+    for (auto it = m_daxChannelStates.constBegin(); it != m_daxChannelStates.constEnd(); ++it) {
+        DaxChannelSnapshot s;
+        s.channel = it.key();
+        s.streamId = it->streamId;
+        s.createPending = it->createPending;
+        for (DaxConsumer who : {DaxConsumer::Bridge, DaxConsumer::Tci, DaxConsumer::Rade,
+                                DaxConsumer::Clock}) {
+            if (it->holders & daxHolderBit(who))
+                s.holders << QString::fromLatin1(daxConsumerName(who));
+        }
+        out.append(s);
+    }
+    std::sort(out.begin(), out.end(),
+              [](const DaxChannelSnapshot& a, const DaxChannelSnapshot& b) {
+        return a.channel < b.channel;
+    });
+    return out;
+}
+
+void PanadapterStream::resetDaxChannelsForDisconnect()
+{
+    QMutexLocker lock(&m_streamMutex);
+    // Radio reaps every stream of a disconnected client itself
+    // (state-machines.md §4.2) — no removal commands, just forget. Bump every
+    // generation via the counter so in-flight deferred lambdas expire.
+    ++m_daxGenCounter;
+    m_daxChannelStates.clear();
+    qCDebug(lcVita49) << "PanadapterStream: DAX channel ownership reset for disconnect";
+}
+
+// m_streamMutex held. Last holder left: remove the radio-side stream after a
+// grace window. The window absorbs the radio's transient unbind/rebind
+// dax=0/dax=<ch> status pairs (#3626) — a re-acquire inside the window bumps
+// the generation and the removal quietly expires.
+void PanadapterStream::scheduleDaxRemovalLocked(int channel)
+{
+    auto it = m_daxChannelStates.find(channel);
+    if (it == m_daxChannelStates.end()) return;
+    const quint32 gen = it->generation;
+    QTimer::singleShot(kDaxRemovalGraceMs, this, [this, channel, gen]() {
+        quint32 removeId = 0;
+        {
+            QMutexLocker lock(&m_streamMutex);
+            auto it = m_daxChannelStates.find(channel);
+            if (it == m_daxChannelStates.end()) return;
+            if (it->generation != gen) return;      // state changed — expired
+            if (it->holders != 0) return;           // re-acquired
+            removeId = it->streamId;
+            m_daxChannelStates.erase(it);
+        }
+        if (removeId) {
+            qCInfo(lcVita49) << "PanadapterStream: DAX ch" << channel
+                             << "unheld past grace — removing stream"
+                             << Qt::hex << removeId << "(#3305)";
+            unregisterDaxStream(removeId);   // entry already erased: no recreate
+            emit daxStreamUnregistered(channel, removeId);
+            emit daxStreamRemoveNeeded(removeId, channel);
+        }
+    });
+}
+
+// m_streamMutex held. The radio destroyed a stream we still hold (profile
+// load / slice teardown replaces dax_rx streams without a TCI/bridge
+// disconnect — the #3476 "switched profile, never came back" failure).
+// Re-create after a short backoff so a genuine teardown storm can't turn
+// into a create storm.
+void PanadapterStream::scheduleDaxRecreateLocked(int channel)
+{
+    auto it = m_daxChannelStates.find(channel);
+    if (it == m_daxChannelStates.end()) return;
+    const quint32 gen = it->generation;
+    QTimer::singleShot(kDaxRecreateDelayMs, this, [this, channel, gen]() {
+        bool needCreate = false;
+        {
+            QMutexLocker lock(&m_streamMutex);
+            auto it = m_daxChannelStates.find(channel);
+            if (it == m_daxChannelStates.end()) return;
+            if (it->generation != gen) return;
+            if (it->holders == 0 || it->streamId != 0 || it->createPending) return;
+            it->createPending = true;
+            it->generation = ++m_daxGenCounter;  // keep the mutation⇒generation-bump invariant
+            needCreate = true;
+        }
+        if (needCreate) {
+            qCInfo(lcVita49) << "PanadapterStream: DAX ch" << channel
+                             << "still held after radio-side removal — re-creating (#3476)";
+            emit daxStreamCreateNeeded(channel);
+        }
+    });
 }
 
 void PanadapterStream::registerIqStream(quint32 streamId, int channel)

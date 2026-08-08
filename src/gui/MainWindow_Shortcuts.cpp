@@ -32,11 +32,13 @@
 #include "MainWindowShortcutState.h"
 #include "core/AppSettings.h"
 #include "core/CwTrace.h"
+#include "core/DigitalVoiceFeature.h"
 #include "core/KiwiSdrProtocol.h"
 #include "core/LogManager.h"
 #include "models/SliceModel.h"
 
 #include <QAbstractSlider>
+#include <QJsonObject>
 #include <QToolTip>
 #include <QApplication>
 #include <QApplicationStateChangeEvent>
@@ -282,6 +284,9 @@ void MainWindow::failSafeMomentaryKeyingToRx(const char* reason)
     // lost (focus left the window) would otherwise strand the transmitter. On
     // deactivation force the whole family back to RX. Cheap and safe to call on
     // every deactivation: bail out unless something is actually keyed.
+    // Whoever was holding it, the fail-safe owns the release from here.
+    m_dialPttHoldActive = false;
+
     const bool anyActive = m_pttHoldActive || m_cwStraightKeyActive
         || m_cwLeftPaddleActive || m_cwRightPaddleActive;
     if (!anyActive)
@@ -529,7 +534,9 @@ bool MainWindow::eventFilter(QObject* obj, QEvent* event)
         QToolTip::hideText();
     }
     if (obj == m_networkLabel && event->type() == QEvent::ToolTip) {
-        const QString tooltip = buildNetworkTooltip(m_radioModel);
+        const QString tooltip = buildNetworkTooltip(m_radioModel,
+                                                     m_adaptiveFpsCap,
+                                                     m_radioModel.pendingThrottleLift());
         m_networkLabel->setToolTip(tooltip);
         auto* helpEvent = static_cast<QHelpEvent*>(event);
         QToolTip::showText(helpEvent->globalPos(), tooltip, m_networkLabel);
@@ -547,14 +554,21 @@ bool MainWindow::eventFilter(QObject* obj, QEvent* event)
         toggleConnectionDialog();
         return true;
     }
+#ifdef AETHER_ASR_ENABLED
+    if (obj == m_asrIndicator && event->type() == QEvent::MouseButtonPress) {
+        if (!m_asrIndicator->isEnabled()) return true;
+        showCopyAssist();           // toggles the docked Copy Assist panel
+        updateKeyerAvailability();  // refresh the indicator's active/available style
+        return true;
+    }
+#endif
     if (obj == m_cwxIndicator && event->type() == QEvent::MouseButtonPress) {
         if (!m_cwxIndicator->isEnabled()) return true;
         bool show = !m_cwxPanel->isVisible();
         // Close DVK (mutual exclusion)
         if (show && m_dvkPanel->isVisible()) {
             m_dvkPanel->hide();
-            auto* sl = activeSlice();
-            updateKeyerAvailability(sl ? sl->mode() : QString());
+            updateKeyerAvailability();
         }
         m_cwxPanel->setVisible(show);
         m_cwxIndicator->setStyleSheet(show
@@ -579,8 +593,7 @@ bool MainWindow::eventFilter(QObject* obj, QEvent* event)
         // Close CWX (mutual exclusion)
         if (show && m_cwxPanel->isVisible()) {
             m_cwxPanel->hide();
-            auto* sl = activeSlice();
-            updateKeyerAvailability(sl ? sl->mode() : QString());
+            updateKeyerAvailability();
         }
         m_dvkPanel->setVisible(show);
         m_dvkIndicator->setStyleSheet(show
@@ -610,7 +623,8 @@ bool MainWindow::eventFilter(QObject* obj, QEvent* event)
             [this, on](int code, const QString& body) {
                 if (code != 0) {
                     showPanadapterInterlockNotification(
-                        QString("FDX not available: %1").arg(body.trimmed()));
+                        QString("FDX not available: %1").arg(body.trimmed()),
+                        QStringLiteral("fdx-unavailable"));
                     return;
                 }
                 // Radio accepted; no status echo follows, so apply manually.
@@ -639,7 +653,7 @@ bool MainWindow::eventFilter(QObject* obj, QEvent* event)
     }
     if (obj == m_pgxlContainer && event->type() == QEvent::MouseButtonPress) {
         // Simple toggle: OPERATE ↔ STANDBY (PGXL has no BYPASS)
-        m_radioModel.setAmpOperate(!m_radioModel.ampOperate());
+        m_radioModel.amplifier().setOperate(!m_radioModel.amplifier().operate());
         return true;
     }
     if (obj == m_txIndicator && event->type() == QEvent::MouseButtonPress) {
@@ -735,7 +749,7 @@ void MainWindow::registerShortcutActions()
             menu->setRfGain(next);
 
         auto& settings = AppSettings::instance();
-        settings.setValue(sw->settingsKey("DisplayRfGain"), QString::number(next));
+        settings.setValue(rfGainSettingsKey(sw), QString::number(next));
         settings.save();
     };
 
@@ -802,9 +816,9 @@ void MainWindow::registerShortcutActions()
     }
 
     // ── Mode ────────────────────────────────────────────────────────────
-    static const char* modes[] = {"USB", "LSB", "CW", "CWL", "AM", "SAM", "FM", "NFM", "DFM", "DIGU", "DIGL", "RTTY"};
-    for (const char* mode : modes) {
-        QString m = mode;
+    const QStringList modes = filterUnavailableDigitalVoiceModes(
+        {"USB", "LSB", "CW", "CWL", "AM", "SAM", "FM", "NFM", "DFM", "DSTR", "DIGU", "DIGL", "RTTY"});
+    for (const QString& m : modes) {
         m_shortcutManager.registerAction(
             QString("mode_%1").arg(m.toLower()), m, "Mode",
             QKeySequence(), [this, m]() {
@@ -825,18 +839,20 @@ void MainWindow::registerShortcutActions()
                 tx.requestPttOff(TransmitModel::PttSource::Mox);
             else
                 tx.requestPttOn(TransmitModel::PttSource::Mox);
-        });
+        }, /*autoRepeat=*/false, /*keysTx=*/true);
     // PTT (Hold) is handled by the app-level event filter (handlePttHoldShortcut)
     // because QShortcut has no "released" signal. Register with a null handler so
     // the keyboard map shows it as bound; the event filter looks the binding up
-    // by kPttHoldActionId so a reassigned key takes effect (#3879).
+    // by kPttHoldActionId so a reassigned key takes effect (#3879). keysTx even
+    // with a null handler: the flag is declared where the action is, so a future
+    // direct handler is born gated (#4057 review).
     m_shortcutManager.registerAction(kPttHoldActionId, "PTT (Hold)", "TX",
-        QKeySequence(Qt::Key_Space), nullptr);
+        QKeySequence(Qt::Key_Space), nullptr, /*autoRepeat=*/false, /*keysTx=*/true);
     m_shortcutManager.registerAction("atu_start", "ATU Start", "TX",
         QKeySequence(), [this]() {
             if (!m_radioModel.isConnected()) return;
             m_radioModel.transmitModel().atuStart();
-        });
+        }, /*autoRepeat=*/false, /*keysTx=*/true);
     m_shortcutManager.registerAction("tune_toggle", "TUNE Toggle", "TX",
         QKeySequence(), [this]() {
             if (!m_radioModel.isConnected()) return;
@@ -844,12 +860,12 @@ void MainWindow::registerShortcutActions()
                 m_radioModel.transmitModel().stopTune();
             else
                 m_radioModel.transmitModel().startTune();
-        });
+        }, /*autoRepeat=*/false, /*keysTx=*/true);
     m_shortcutManager.registerAction("two_tone_tune", "Two-Tone Tune", "TX",
         QKeySequence(), [this]() {
             if (!m_radioModel.isConnected()) return;
             m_radioModel.transmitModel().toggleTwoToneTune();
-        });
+        }, /*autoRepeat=*/false, /*keysTx=*/true);
     m_shortcutManager.registerAction("vox_toggle", "VOX Toggle", "TX",
         QKeySequence(), [this]() {
             if (!m_radioModel.isConnected()) return;
@@ -996,45 +1012,13 @@ void MainWindow::registerShortcutActions()
             auto* s = activeSlice();
             if (s) s->setLocked(!s->isLocked());
         });
-
-    static constexpr double kPanZoomFactor = 1.5;
-    auto zoomActivePanadapter = [this](double factor) {
-        if (!m_radioModel.isConnected()) {
-            return;
-        }
-
-        auto* s = activeSlice();
-        if (!s || s->panId().isEmpty()) {
-            return;
-        }
-
-        auto* sw = spectrumForSlice(s);
-        if (!sw) {
-            return;
-        }
-
-        const double currentBw = sw->bandwidthMhz();
-        // Clamp to limits so the final keypress snaps to exact min/max (#1458).
-        const double newBw = std::clamp(currentBw * factor,
-                                        m_radioModel.minPanBandwidthMhz(),
-                                        m_radioModel.maxPanBandwidthMhz());
-        if (newBw == currentBw) return;  // already at the hard limit
-
-        double newCenter = sw->centerMhz();
-
-        // When zooming in, center on the active slice so repeated keypresses do
-        // not push it toward the panadapter edge (#1932).
-        if (factor < 1.0) {
-            newCenter = s->frequency();
-        }
-        newCenter = std::max(newCenter, newBw / 2.0);
-
-        sw->setFrequencyRange(newCenter, newBw);
-        // Keep keyboard zoom on the same combined pan-range path as trackpad /
-        // on-screen zoom so mode/frequency jumps do not reintroduce stale
-        // center-versus-bandwidth transitions.
-        applyPanRangeRequest(s->panId(), newCenter, newBw, "keyboard-pan-zoom");
-    };
+    m_shortcutManager.registerAction("center_lock_toggle", "Center Lock Active Slice", "Tuning",
+        QKeySequence(), [this]() {
+            SliceModel* slice = activeSlice();
+            if (slice) {
+                setCenterLockForSlice(slice, !centerLockActiveForSlice(slice));
+            }
+        });
 
     // ── DSP ─────────────────────────────────────────────────────────────
     m_shortcutManager.registerAction("nb_toggle", "NB Toggle", "DSP",
@@ -1202,13 +1186,15 @@ void MainWindow::registerShortcutActions()
             tx.setCwBreakIn(!tx.cwBreakIn());
         });
     // Momentary CW actions are handled by the app-level event filter so
-    // key release edges reach the netCW path too.
+    // key release edges reach the netCW path too. keysTx even with null
+    // handlers: CW keying IS transmitting; the flag lives with the action so a
+    // future direct handler is born gated (#4057 review).
     m_shortcutManager.registerAction(kCwStraightKeyActionId, kCwStraightKeyActionName, "CW",
-        QKeySequence(), nullptr);
+        QKeySequence(), nullptr, /*autoRepeat=*/false, /*keysTx=*/true);
     m_shortcutManager.registerAction(kCwLeftPaddleActionId, kCwLeftPaddleActionName, "CW",
-        QKeySequence(), nullptr);
+        QKeySequence(), nullptr, /*autoRepeat=*/false, /*keysTx=*/true);
     m_shortcutManager.registerAction(kCwRightPaddleActionId, kCwRightPaddleActionName, "CW",
-        QKeySequence(), nullptr);
+        QKeySequence(), nullptr, /*autoRepeat=*/false, /*keysTx=*/true);
 
     // ── EQ ──────────────────────────────────────────────────────────────
     m_shortcutManager.registerAction("tx_eq_toggle", "TX EQ Toggle", "EQ",
@@ -1225,24 +1211,19 @@ void MainWindow::registerShortcutActions()
         });
 
     // ── Display ─────────────────────────────────────────────────────────
+    // Band/Segment Zoom read the pan's radio-authoritative model state — see
+    // togglePanZoomModeForPan below for why no client-side bool exists. (#4057)
     m_shortcutManager.registerAction("band_zoom", "Band Zoom", "Display",
-        QKeySequence(), [this]() {
-            if (!m_radioModel.isConnected()) return;
-            auto* s = activeSlice();
-            if (s) m_radioModel.sendCommand(
-                QString("slice set %1 band_zoom=1").arg(s->sliceId()));
-        });
+        QKeySequence(), [this]() { togglePanZoomMode(/*segmentZoom=*/false); });
     m_shortcutManager.registerAction("segment_zoom", "Segment Zoom", "Display",
-        QKeySequence(), [this]() {
-            if (!m_radioModel.isConnected()) return;
-            auto* s = activeSlice();
-            if (s) m_radioModel.sendCommand(
-                QString("slice set %1 segment_zoom=1").arg(s->sliceId()));
-        });
+        QKeySequence(), [this]() { togglePanZoomMode(/*segmentZoom=*/true); });
+    // Keyboard step uses kPanZoomFactor per press; rotary dials use a finer
+    // per-detent factor (kRotaryPanZoomFactor in MainWindow_Controllers.cpp).
+    static constexpr double kPanZoomFactor = 1.5;
     m_shortcutManager.registerAction("pan_zoom_in", "Panadapter Zoom In", "Display",
-        QKeySequence(Qt::Key_Equal), [zoomActivePanadapter]() { zoomActivePanadapter(1.0 / kPanZoomFactor); });
+        QKeySequence(Qt::Key_Equal), [this]() { zoomActivePanadapter(1.0 / kPanZoomFactor); });
     m_shortcutManager.registerAction("pan_zoom_out", "Panadapter Zoom Out", "Display",
-        QKeySequence(Qt::Key_Minus), [zoomActivePanadapter]() { zoomActivePanadapter(kPanZoomFactor); });
+        QKeySequence(Qt::Key_Minus), [this]() { zoomActivePanadapter(kPanZoomFactor); });
     m_shortcutManager.registerAction("open_memories", "Open Memories Dialog", "Display",
         QKeySequence(Qt::Key_Slash), [this]() { showMemoryDialog(); });
 
@@ -1278,6 +1259,140 @@ void MainWindow::registerShortcutActions()
         else
             releaseSliderShortcutLease(false);
     });
+}
+
+int MainWindow::fireShortcutAction(const QString& id, bool allowTx)
+{
+    // Mirrors the MIDI dispatch path (fireShortcut in MainWindow_Controllers.cpp):
+    // look up the registered action and run its handler directly. Actions with
+    // no key sequence and no menu entry — e.g. Band Zoom / Segment Zoom — are
+    // only reachable this way, so this is how the bridge exercises them.
+    // The distinct result codes let the caller report honestly: "unknown id",
+    // "keys TX" (per the action's registration-site keysTx flag — one source of
+    // truth, no parallel id list), and "event-filter-driven" (ptt_hold, CW keys
+    // register null handlers on purpose) are three different situations, not one
+    // generic false (#4057 review).
+    auto* a = m_shortcutManager.action(id);
+    if (!a) {
+        return ShortcutFireUnknownId;
+    }
+    if (a->keysTx && !allowTx) {
+        return ShortcutFireTxBlocked;
+    }
+    if (!a->handler) {
+        return ShortcutFireNoDirectHandler;
+    }
+    a->handler();
+    return a->keysTx ? ShortcutFireTxOk : ShortcutFireOk;
+}
+
+void MainWindow::togglePanZoomModeForPan(const QString& panId, bool segmentZoom)
+{
+    // Radio-authoritative toggle (#4057). band_zoom/segment_zoom are per-pan,
+    // radio-owned flags broadcast in pan status (FlexLib Panadapter.cs:933) and
+    // decoded into PanadapterModel. Reading the model instead of a client-side
+    // bool keeps every entry point — keyboard/MIDI shortcut, right-click menu,
+    // FlexControl, RC28 — in sync with the radio: a manual pan/zoom clears the
+    // flag on the radio, the status echo clears the model, and the next press
+    // correctly sends =1 again instead of a dead =0. Band/segment mutual
+    // exclusion is likewise the radio's own (it clears the other flag and
+    // broadcasts both), per-pan state is naturally per-pan, and a failed send
+    // can't invert anything because nothing is latched client-side.
+    if (panId.isEmpty()) {
+        return;
+    }
+    auto* pan = m_radioModel.panadapter(panId);
+    if (!pan) {
+        return;
+    }
+    const bool on = segmentZoom ? !pan->segmentZoomOn() : !pan->bandZoomOn();
+    m_radioModel.sendCommand(QString("display pan set %1 %2=%3")
+        .arg(panId,
+             segmentZoom ? QStringLiteral("segment_zoom")
+                         : QStringLiteral("band_zoom"))
+        .arg(on ? 1 : 0));
+}
+
+void MainWindow::zoomActivePanadapter(double factor)
+{
+    if (!m_radioModel.isConnected()) {
+        return;
+    }
+
+    auto* s = activeSlice();
+    if (!s || s->panId().isEmpty()) {
+        return;
+    }
+
+    auto* sw = spectrumForSlice(s);
+    if (!sw) {
+        return;
+    }
+
+    const double currentBw = sw->bandwidthMhz();
+    // Clamp to limits so the final keypress snaps to exact min/max (#1458).
+    const double newBw = std::clamp(currentBw * factor,
+                                    m_radioModel.panMinBandwidthMhz(s->panId()),
+                                    m_radioModel.panMaxBandwidthMhz(s->panId()));
+    if (newBw == currentBw) {
+        return;  // already at the hard limit
+    }
+
+    double newCenter = sw->centerMhz();
+
+    // When zooming in, center on the active slice so repeated keypresses do
+    // not push it toward the panadapter edge (#1932).
+    if (factor < 1.0) {
+        newCenter = s->frequency();
+    }
+    newCenter = std::max(newCenter, newBw / 2.0);
+
+    sw->setFrequencyRange(newCenter, newBw);
+    applyPanRangeRequest(s->panId(), newCenter, newBw, "pan-zoom");
+}
+
+void MainWindow::setPanZoomMode(bool segmentZoom, bool enable)
+{
+    if (!m_radioModel.isConnected()) {
+        return;
+    }
+    auto* s = activeSlice();
+    if (!s) {
+        return;
+    }
+    const QString panId = !s->panId().isEmpty()
+        ? s->panId()
+        : (m_panStack ? m_panStack->activePanId() : m_radioModel.panId());
+    if (panId.isEmpty()) {
+        return;
+    }
+    auto* pan = m_radioModel.panadapter(panId);
+    if (!pan) {
+        return;
+    }
+    const bool current = segmentZoom ? pan->segmentZoomOn() : pan->bandZoomOn();
+    if (current != enable) {
+        m_radioModel.sendCommand(QString("display pan set %1 %2=%3")
+            .arg(panId,
+                 segmentZoom ? QStringLiteral("segment_zoom")
+                             : QStringLiteral("band_zoom"))
+            .arg(enable ? 1 : 0));
+    }
+}
+
+void MainWindow::togglePanZoomMode(bool segmentZoom)
+{
+    if (!m_radioModel.isConnected()) {
+        return;
+    }
+    auto* s = activeSlice();
+    if (!s) {
+        return;
+    }
+    const QString panId = !s->panId().isEmpty()
+        ? s->panId()
+        : (m_panStack ? m_panStack->activePanId() : m_radioModel.panId());
+    togglePanZoomModeForPan(panId, segmentZoom);
 }
 
 

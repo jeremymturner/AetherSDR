@@ -3,6 +3,7 @@
 #include "core/AppSettings.h"
 #include "core/AudioEngine.h"
 #include "core/DeviceDiagnostics.h"
+#include "models/Nr2SettingsModel.h"
 #include "models/RadioModel.h"
 
 #include <QApplication>
@@ -331,9 +332,11 @@ QString nr4MethodName(int id)
 QJsonObject buildClientDspSnapshot(const AudioEngine* audio)
 {
     auto& settings = AppSettings::instance();
+    const Nr2SettingsModel::Config nr2Config =
+        Nr2SettingsModel::instance().config();
 
-    const int nr2GainMethod = settings.value("NR2GainMethod", "2").toInt();
-    const int nr2NpeMethod = settings.value("NR2NpeMethod", "0").toInt();
+    const int nr2GainMethod = nr2Config.gainMethod;
+    const int nr2NpeMethod = nr2Config.npeMethod;
     const int nr4MethodId = settings.value("NR4NoiseEstimationMethod", "0").toInt();
 
     QJsonObject nr2;
@@ -342,10 +345,13 @@ QJsonObject buildClientDspSnapshot(const AudioEngine* audio)
     nr2["gain_method"] = nr2GainMethodName(nr2GainMethod);
     nr2["npe_method_id"] = nr2NpeMethod;
     nr2["npe_method"] = nr2NpeMethodName(nr2NpeMethod);
-    nr2["ae_filter"] = settings.value("NR2AeFilter", "True").toString() == "True";
-    nr2["gain_max"] = settings.value("NR2GainMax", "1.50").toFloat();
-    nr2["gain_smooth"] = settings.value("NR2GainSmooth", "0.85").toFloat();
-    nr2["qspp"] = settings.value("NR2Qspp", "0.20").toFloat();
+    nr2["ae_filter"] = nr2Config.aeFilter;
+    nr2["gain_max"] = nr2Config.gainMax;
+    nr2["gain_floor"] = nr2Config.gainFloor;
+    nr2["gain_smooth"] = nr2Config.gainSmooth;
+    nr2["qspp"] = nr2Config.qspp;
+    nr2["legacy_geometry_and_gain_mapping"] =
+        nr2Config.legacyGeometryAndGainMapping;
 
     QJsonObject nr4;
     nr4["enabled"] = audio ? audio->nr4Enabled() : false;
@@ -383,19 +389,17 @@ SliceTroubleshootingDialog::SliceTroubleshootingDialog(RadioModel* model,
                                                        QWidget* parent,
                                                        SnapshotProvider controlDevicesProvider,
                                                        SnapshotProvider rendererProvider)
-    : QDialog(parent)
+    : PersistentDialog(QStringLiteral("Slice Troubleshooting"),
+                       QStringLiteral("SliceTroubleshootingDialogGeometry"), parent)
     , m_model(model)
     , m_audio(audio)
     , m_controlDevicesProvider(std::move(controlDevicesProvider))
     , m_rendererProvider(std::move(rendererProvider))
 {
     theme::setContainer(this, QStringLiteral("dialog/sliceTroubleshoot"));
-    setWindowTitle("Slice Troubleshooting");
     setMinimumSize(920, 720);
     resize(980, 760);
-    setWindowFlags(windowFlags() & ~Qt::WindowContextHelpButtonHint);
-
-    auto* root = new QVBoxLayout(this);
+    auto* root = new QVBoxLayout(bodyWidget());
     root->setSpacing(8);
 
     auto* intro = new QLabel(
@@ -783,6 +787,22 @@ QString SliceTroubleshootingDialog::buildSummary(const QJsonObject& snapshot)
                  .arg(formatNumber(telemetry["alc"]))
                  .arg(formatNumber(telemetry["mic_level_dbfs"]))
                  .arg(formatNumber(telemetry["comp_level_db"]));
+    // Qualify the TX group on the line above whenever it is NOT live.
+    //
+    // TX forward power holds its last smoothed value while SWR correctly reads
+    // n/a, so without this the reader of a support bundle sees a plausible
+    // wattage next to a missing SWR and concludes the antenna is the problem.
+    // Only emitted when stale: a live group needs no caveat, and the common
+    // case should stay quiet. (#4533 review)
+    if (telemetry.contains("tx_meters_fresh") && !telemetry["tx_meters_fresh"].toBool()) {
+        const qint64 ageMs = static_cast<qint64>(telemetry["tx_meters_age_ms"].toDouble(-1));
+        lines << QString("  - ⚠ TX meters are NOT live (%1) — TX forward power is the last "
+                          "value received, not a current reading, and TX SWR is omitted "
+                          "rather than shown stale.")
+                     .arg(ageMs >= 0
+                              ? QString("last sample %1 ms ago").arg(ageMs)
+                              : QString("no TX meter sample this session"));
+    }
     lines << QString("- Amplifier: present `%1`, model `%2`, handle `%3`, operate `%4`")
                  .arg(yesNo(amplifier["present"].toBool()))
                  .arg(orPlaceholder(amplifier["model"].toString()))

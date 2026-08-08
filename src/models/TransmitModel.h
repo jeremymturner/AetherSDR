@@ -6,6 +6,8 @@
 #include <QString>
 #include <QStringList>
 
+#include "core/backends/TransmitDelta.h"
+
 #include <functional>
 
 class QTimer;
@@ -130,12 +132,11 @@ public:
     QString     activeMicProfile()  const { return m_activeMicProfile; }
     QStringList micInputList()      const { return m_micInputList; }
 
-    // ── Status parsing (called from RadioModel) ─────────────────────────────
-    void applyTransmitStatus(const QMap<QString, QString>& kvs);
-    void applyInterlockStatus(const QMap<QString, QString>& kvs);
-    void applyAtuStatus(const QMap<QString, QString>& kvs);
-    void applyApdStatus(const QMap<QString, QString>& kvs);
-    void applyApdSamplerStatus(const QMap<QString, QString>& kvs);
+    // Apply a normalized, typed transmit delta from the backend
+    // (IRadioBackend::transmitChanged). Vendor-neutral fields only — the Flex
+    // wire decode for all five transmit-family status planes lives in
+    // FlexBackend::decode*Status. Present-only. (aetherd RFC 2.3.)
+    void applyChanges(const TransmitDelta& delta);
     void setProfileList(const QStringList& profiles);
     void setActiveProfile(const QString& profile);
     void setMicProfileList(const QStringList& profiles);
@@ -154,10 +155,44 @@ public:
         Footswitch   = 2,   // future: serial-PTT or other hardware path
         Tune         = 3,   // local TUNE/two-tone carrier
         Dax          = 4,   // external digital-audio PTT path
+        Atu          = 5,   // internal automatic-tuner carrier
+        Wspr         = 6,   // local generated WSPR audio
     };
+
+    // Source of the most recently *initiated* key-up. Set by the keying entry
+    // points (requestPttOn / RadioModel::setTransmit / RadioModel's ATU command
+    // gate) so downstream consumers can tell an operator-driven MOX/PTT/VOX
+    // transmit from an ATU/TCI-hardware/DAX-triggered one — the radio interlock
+    // reports these software paths as source=SW, so the distinction has to be
+    // captured here at the funnel.
+    // Resets to Mox on full unkey so a subsequent hardware/VOX key (which never
+    // flows through a source-bearing entry point) is treated as operator TX.
+    PttSource activePttSource() const { return m_activePttSource; }
+    void      noteActivePttSource(PttSource source) { m_activePttSource = source; }
 
     // ── Command methods (emit commandReady) ─────────────────────────────────
     void setRfPower(int power);
+
+    // The host modulates, so the microphone is a PC input and nothing else.
+    //
+    // The mic-source list (MIC / BAL / LINE / ACC / PC) enumerates a FlexRadio's
+    // physical input jacks. A Hermes-Lite 2 has none of them: audio is
+    // modulated here and handed to the radio as IQ, so "PC" is not a preference
+    // but the only thing that can possibly be true. Offering the others invites
+    // the operator to select an input that silently transmits nothing.
+    void setHostModulation(bool on);
+    [[nodiscard]] bool hostModulation() const { return m_hostModulation; }
+
+    // Whether the connected radio has an antenna tuner at all
+    // (RadioCapabilities::hasTuner), pushed down by RadioModel on connect for
+    // the same reason hostModulation is: the capability lives on the backend and
+    // the widgets that need it only see this model.
+    //
+    // Defaults TRUE so nothing changes for a Flex, and so a widget that reads it
+    // before any backend has reported stays in the pre-existing state rather
+    // than briefly greying out a control that does exist.
+    void setHasTuner(bool present);
+    [[nodiscard]] bool hasTuner() const { return m_hasTuner; }
     void setTunePower(int power);
     void setTuneMode(const QString& mode);
     void startTune(PttSource source = PttSource::Tune);
@@ -204,6 +239,24 @@ public:
     void setMicAcc(bool on);
     void setSpeechProcessorEnable(bool on);
     void setSpeechProcessorLevel(int level);
+    // Adopt speech-processor state that did NOT come from this model — the
+    // client-side compressor on a host-modulating backend, where PROC drives our
+    // own DSP and the operator can also reach that same compressor through the
+    // Aetherial strip.
+    //
+    // Updates the state and notifies the UI WITHOUT emitting commandReady, which
+    // is the whole point: the setters above are operator INTENT and must stay
+    // that way (Principle II), so an observer that mirrored engine state back
+    // through them would echo our own state as a fresh command and, with the
+    // strip on the other end, oscillate. Returns true when something changed.
+    bool applySpeechProcessorState(bool on, int level);
+    // Adopt a mic selection the OPERATOR did not choose — a radio whose input
+    // this client cannot select forces the source, and the model must agree
+    // with what the UI is showing. Like applySpeechProcessorState this updates
+    // state WITHOUT emitting commandReady, because pushing a forced value back
+    // out as operator intent is how a capability turns into a command nobody
+    // issued. Returns true when something changed.
+    bool applyMicSelectionState(const QString& input);
     void setDax(bool on);
     void setSbMonitor(bool on);
     void setMonGainSb(int gain);
@@ -220,6 +273,7 @@ public:
     void setDexpLevel(int level);
     void setTxFilterLow(int hz);
     void setTxFilterHigh(int hz);
+    void setTxFilter(int lowHz, int highHz);
 
     // ── CW commands ─────────────────────────────────────────────────────────
     void setCwSpeed(int wpm);
@@ -236,8 +290,27 @@ public:
 
 signals:
     void stateChanged();
+    // (rfPowerChanged is declared once below — main already has it for the
+    // external-surface mirror path; backends that set drive through the seam
+    // reuse that same signal rather than a duplicate. #4449 recovery.)
+    // Keying and tune as INTENT rather than as a Flex command string.
+    //
+    // setMox() and startTune() emit "xmit N" / "transmit tune N" through
+    // commandReady, which is a Flex TCP command and reaches a backend with no
+    // command channel not at all. These carry the same intent for backends that
+    // key through IRadioBackend. RadioModel routes them only for non-Flex
+    // families, so Flex keeps its single command and does not key twice.
+    void moxCommandIssued(bool on);
+    void tuneCommandIssued(bool on);
+    void hostModulationChanged(bool on);
+    void hasTunerChanged(bool present);
     void tuneChanged(bool tuning);
     void moxChanged(bool mox);
+    // Fires whenever m_transmitting changes — from setMox() (optimistic edge)
+    // OR from setTransmitting() (interlock-driven: CW break-in, VOX, footswitch).
+    // Use this instead of moxChanged() for anything that should track actual TX
+    // state regardless of source (e.g. hardware TX indicator LEDs).
+    void transmittingChanged(bool tx);
     void atuStateChanged();
     void profileListChanged();
     void micStateChanged();
@@ -248,10 +321,41 @@ signals:
     // instead of phoneStateChanged for slot work that should NOT run on
     // every VOX/CW/dexp/mic-boost/etc. status update.
     void txFilterCutoffChanged(int lowHz, int highHz);
+    // The operator asked for a TX passband. OPERATOR INTENT ONLY — applyStatus()
+    // never emits this — so a backend that modulates on this host can bind to it
+    // and drive its own modulator without echoing radio state back as a command
+    // (Principle II). Distinct from txFilterCutoffChanged, which also fires when
+    // a Flex's own status moves the value.
+    void txFilterCommandIssued(int lowHz, int highHz);
+    // The operator moved the MIC slider. OPERATOR INTENT ONLY, for exactly the
+    // reason txFilterCommandIssued carries above: applyStatus() must never emit
+    // this, or a Flex's own `transmit set miclevel=` echo would be handed
+    // straight back to the seam as a fresh command.
+    void micLevelCommandIssued(int level);
+    // The operator moved PROC or its NOR/DX/DX+ level. OPERATOR INTENT ONLY,
+    // for the same reason as txFilterCommandIssued — and here the distinction is
+    // what protects the operator's own work: the client compressor these drive is
+    // shared with the Aetherial strip, and its NOR/DX/DX+ presets overwrite the
+    // strip's threshold/ratio/makeup. Keying the preset write off micStateChanged
+    // instead would let the strip's OWN enable toggle read as an off->on
+    // transition and overwrite the settings the operator had just dialled in
+    // there. applySpeechProcessorState() never emits this.
+    void speechProcessorCommandIssued(bool on, int level);
+    // Fires only when cwPitch actually changes. Use this instead of
+    // phoneStateChanged for slot work that should NOT run on every
+    // VOX/CW/dexp/mic-boost/etc. status update (e.g. #4423 KiwiSDR BFO sync).
+    void cwPitchChanged(int hz);
     void apdStateChanged();
     void apdSamplerChanged(const QString& txAnt);
     void apdEqualizerResetReceived();
     void maxPowerLevelChanged(int maxWatts);
+    // Fire only when RF/tune power actually changes, from either the local
+    // setter or a radio status update. Use these instead of stateChanged()
+    // for anything that mirrors power to an external surface (#4161) — the
+    // radio restores per-band power on QSY, and a coarse stateChanged()
+    // listener cannot tell that apart from any other TX field moving.
+    void rfPowerChanged(int watts);
+    void tunePowerChanged(int watts);
     // Emitted when the radio reports the TX slice mode (e.g. "FDVU", "FDVL", "USB").
     // Value is empty string until the first transmit status is received.
     void txSliceModeChanged(const QString& mode);
@@ -287,6 +391,8 @@ private:
 
     // Transmit state
     int    m_rfPower{100};
+    bool   m_hostModulation{false};
+    bool   m_hasTuner{true};
     int    m_tunePower{10};
     bool   m_tune{false};
     bool   m_mox{false};
@@ -304,6 +410,9 @@ private:
     bool    m_daxOn{false};
     bool    m_sbMonitor{false};
     int     m_monGainSb{50};
+
+    // Source of the currently-/last-initiated key-up (see activePttSource()).
+    PttSource m_activePttSource{PttSource::Mox};
 
     // VOX / phone state
     bool m_voxEnable{false};

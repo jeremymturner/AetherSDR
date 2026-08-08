@@ -99,15 +99,26 @@ public:
 public slots:
     void setOperatorCallsign(const QString& callsign);
     void setReceiverControls(const KiwiSdrReceiverControls& controls);
-    void connectToEndpoint(const QString& endpoint);
+    void connectToEndpoint(const QString& endpoint,
+                           const QString& password = {});
     void disconnectFromEndpoint();
     void setTrackedSlice(int sliceId, double frequencyMhz,
                          const QString& mode, int filterLowHz,
-                         int filterHighHz, const QString& panId);
+                         int filterHighHz, const QString& panId,
+                         const QString& bandName, int cwPitchHz);
     void setWaterfallView(const QString& panId, double centerMhz,
                           double bandwidthMhz);
-    void setWaterfallLineDurationMs(int lineDurationMs);
-    void setWaterfallDisplayAdjustments(int cellDb, int floorDb);
+    // AetherSDR's Display > WtrFall Rate control value: 1..100, low slow /
+    // high fast, and NOT milliseconds — the old name (…LineDurationMs) asserted
+    // a unit this value has never had, which is what inverted the control on
+    // the HL2 (core/WaterfallRate.h, #4606).
+    //
+    // "Display" is not decoration: setWaterfallRateOverride() below is the
+    // KiwiSDR's OWN `wf_speed`, a 0..4 scale with different semantics. Two
+    // different rates reach this client and they must not be confused.
+    void setDisplayWaterfallRate(int rate);
+    void setWaterfallDisplayRange(int minDbm, int maxDbm, bool autoScale);
+    void requestWaterfallAutoScale();
     void setWaterfallRateOverride(int rate);
     void setAudioActive(bool active);
     void setDecodeAudioWhenInactive(bool decode);
@@ -123,6 +134,8 @@ signals:
     void waterfallRowReady(const QString& panId, const QVector<float>& binsDbm,
                            double lowFreqMhz, double highFreqMhz,
                            quint32 timecode);
+    void waterfallDisplayRangeChanged(float minDbm, float maxDbm,
+                                      bool autoRange);
     void meterReadingReady(
         const AetherSDR::KiwiSdrProtocol::MeterReading& reading);
     void telemetryChanged(const AetherSDR::KiwiSdrReceiverTelemetry& telemetry);
@@ -184,6 +197,9 @@ private:
     void handleWaterfallFrame(const QByteArray& frame);
     void handleMessage(StreamKind stream, const QByteArray& frame);
     void handleTextMessage(StreamKind stream, const QString& text);
+    void updateWaterfallDisplayMetadata(
+        StreamKind stream,
+        const QVector<KiwiSdrProtocol::MsgToken>& msgTokens);
     bool updateWaterfallFftBins(int binCount);
     bool updateCampStatusFromMetadata(const KiwiSdrProtocol::MsgToken& token);
     void updateWaterfallAvailability();
@@ -204,6 +220,13 @@ private:
                              double lowFreqMhz, double highFreqMhz,
                              quint32 timecode);
     void sendWaterfallRateToServer();
+    KiwiSdrProtocol::WaterfallDisplayRange adjustedAutoWaterfallDisplayRange(
+        float minDbm, float maxDbm, int sourceZoom) const;
+    KiwiSdrProtocol::WaterfallDisplayRange currentWaterfallDisplayRange() const;
+    void emitWaterfallDisplayRangeChanged(bool force = false);
+    void recordWaterfallAutoScaleRow(const QVector<float>& binsDbm);
+    void resetWaterfallAutoScaleHistory();
+    void updateWaterfallAutoScale(bool force = false);
     void markSoundAudioReady();
     QString logEndpoint() const;
     QString setupTimeoutDetail() const;
@@ -246,6 +269,7 @@ private:
     State m_state{State::Disconnected};
     QString m_stateDetail;
     QString m_endpoint;
+    QString m_password;
     QString m_host;
     QString m_operatorCallsign;
     QString m_lastSoundIdentityCallsign;
@@ -258,9 +282,11 @@ private:
     bool m_telemetryPending{false};
     int m_trackedSliceId{-1};
     double m_trackedFrequencyMhz{0.0};
+    QString m_trackedBandName;
     QString m_trackedMode;
     int m_trackedFilterLowHz{0};
     int m_trackedFilterHighHz{0};
+    int m_trackedCwPitchHz{0};
     QString m_trackedPanId;
     bool m_userDisconnecting{false};
     bool m_secureWebSocket{false};
@@ -321,12 +347,28 @@ private:
     double m_waterfallRequestHighMhz{0.0};
     int m_waterfallZoomCap{14};
     int m_waterfallFftBins{1024};
-    float m_waterfallMinDbm{-130.0f};
-    float m_waterfallMaxDbm{-50.0f};
-    int m_waterfallCellDb{0};
-    int m_waterfallFloorDb{0};
+    float m_waterfallMinDbm{-110.0f};
+    float m_waterfallMaxDbm{-10.0f};
+    int m_waterfallManualMinDbm{-110};
+    int m_waterfallManualMaxDbm{-10};
+    bool m_waterfallAutoScaleEnabled{true};
+    int m_waterfallCalibrationDb{0};
+    float m_waterfallServerAutoMinDbm{0.0f};
+    float m_waterfallServerAutoMaxDbm{0.0f};
+    bool m_waterfallServerAutoMinValid{false};
+    bool m_waterfallServerAutoMaxValid{false};
+    int m_waterfallServerAutoZoom{0};
+    float m_waterfallClientAutoMinDbm{0.0f};
+    float m_waterfallClientAutoMaxDbm{0.0f};
+    bool m_waterfallClientAutoRangeValid{false};
+    int m_waterfallClientAutoZoom{0};
+    bool m_waterfallAutoScalePending{true};
+    float m_lastEmittedWaterfallMinDbm{0.0f};
+    float m_lastEmittedWaterfallMaxDbm{0.0f};
+    bool m_lastEmittedWaterfallRangeValid{false};
+    bool m_lastEmittedWaterfallAutoRange{false};
     int m_waterfallRateOverride{0};
-    int m_waterfallLineDurationMs{100};
+    int m_displayWaterfallRate{100};
     bool m_waterfallAvailable{true};
     QString m_waterfallAvailabilityDetail;
     int m_waterfallRxChannel{-1};
@@ -337,6 +379,7 @@ private:
         KiwiSdrProtocol::FrameLayout::Unknown};
     QByteArray m_lastDecodedSoundPcm;
     QVector<float> m_lastWaterfallBins;
+    QVector<QVector<float>> m_waterfallAutoScaleRows;
     QString m_lastWaterfallPanId;
     double m_lastWaterfallLowMhz{0.0};
     double m_lastWaterfallHighMhz{0.0};

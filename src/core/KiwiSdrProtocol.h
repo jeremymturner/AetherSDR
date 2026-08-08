@@ -26,6 +26,9 @@ inline constexpr int kAgcFastDecayMs = 300;
 inline constexpr int kAgcMedDecayMs = 1000;
 inline constexpr int kAgcSlowDecayMs = 3000;
 inline constexpr int kAgcSlopeDb = 6;
+// Kiwi sound stream is ~12 kHz-sampled (KiwiSdrClient::m_soundSampleRateHz),
+// so its audio passband can't extend past this Nyquist limit.
+inline constexpr int kKiwiMaxAudioBandwidthHz = 6000;
 
 struct SoundFrameHeader {
     int sequence{-1};
@@ -42,6 +45,12 @@ struct WaterfallLineHeader {
 };
 
 struct WaterfallAperture {
+    float minDbm{0.0f};
+    float maxDbm{0.0f};
+    bool valid{false};
+};
+
+struct WaterfallDisplayRange {
     float minDbm{0.0f};
     float maxDbm{0.0f};
     bool valid{false};
@@ -262,8 +271,25 @@ struct MeterReading {
 SoundFrameHeader parseSoundFrameHeader(const QByteArray& frame);
 WaterfallLineHeader parseWaterfallLineHeader(const QByteArray& frame);
 quint64 sequenceGapCount(int previousSequence, int currentSequence);
+float waterfallByteToDbm(unsigned char value);
 float waterfallByteToDisplayLevel(unsigned char value);
+float calibratedWaterfallLevel(float dbm, int calibrationDb);
 WaterfallAperture autoWaterfallAperture(const QVector<float>& binsDbm);
+WaterfallDisplayRange autoWaterfallDisplayRange(const QVector<float>& binsDbm);
+WaterfallDisplayRange autoWaterfallDisplayRangeFromRows(
+    const QVector<QVector<float>>& rowsDbm);
+float waterfallZoomCorrectionDb(int zoom);
+WaterfallDisplayRange defaultWaterfallDisplayRange(int zoom,
+                                                   int ceilingOffsetDb,
+                                                   int floorOffsetDb);
+WaterfallDisplayRange adjustedWaterfallDisplayRange(float minDbm,
+                                                    float maxDbm,
+                                                    int ceilingOffsetDb,
+                                                    int floorOffsetDb);
+WaterfallDisplayRange zoomAdjustedWaterfallDisplayRange(float minDbm,
+                                                        float maxDbm,
+                                                        int sourceZoom,
+                                                        int currentZoom);
 float waterfallColorIndex(float dbm, float minDbm, float maxDbm);
 QVector<MsgToken> parseMsgTokens(const QString& message);
 IpLimitNotice parseIpLimitNotice(const QString& valueText);
@@ -278,6 +304,9 @@ bool diagnosticCompressionFlagEnabled(const QByteArray& value);
 bool diagnosticWaterfallCompressionFlagEnabled(const QByteArray& value);
 QString formatSoundCompressionCommand(bool compressed);
 QString formatWaterfallCompressionCommand(bool compressed);
+constexpr int kAuthPasswordEncodedMaxLength = 256;
+bool authPasswordFitsServerLimit(const QString& password);
+QString formatAuthCommand(const QString& password);
 FrameObservation classifySoundFrame(const QByteArray& frame);
 FrameObservation classifyWaterfallFrame(const QByteArray& frame,
                                         int zoomCap = 14);
@@ -299,6 +328,10 @@ QString formatSquelchCommand(bool enabled, int thresholdDb,
 int agcDecayMsForMode(const QString& mode);
 QString formatAgcCommand(bool enabled, bool hang, int thresholdDb,
                          int manualGainDb, int decayMs);
+QString formatSoundTuneCommand(const QString& mode, int lowCutHz, int highCutHz,
+                               double freqKhz, int cwPitchHz,
+                               bool cwLowerSideband = false,
+                               int maxAudioBandwidthHz = kKiwiMaxAudioBandwidthHz);
 MeterReading meterUnavailable(MeterSource source, const QString& notes = {});
 MeterReading extractMeterFromSndVerifiedLayout(const QByteArray& frame,
                                                const MeterContext& context);

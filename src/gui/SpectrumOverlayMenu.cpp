@@ -2,6 +2,8 @@
 #include "DspParamPopup.h"
 #include "MemoryBrowsePanel.h"
 #include "SpectrumWidget.h"
+#include "SpectrumOverlayWheelGuard.h"
+#include "AutoBlackMode.h"
 #include "GuardedSlider.h"
 #include "ComboStyle.h"
 #include "Theme.h"
@@ -25,12 +27,17 @@
 #include <QSignalBlocker>
 #include <QEvent>
 #include <QFrame>
+#include <QScrollArea>
+#include <QScrollBar>
+#include <QStyle>
+#include <QFontMetrics>
 #include <QColorDialog>
 #include <QRegularExpression>
 #include <QColorDialog>
 
 #include <algorithm>
 #include <cmath>
+#include <optional>
 
 #include "core/ThemeManager.h"
 
@@ -78,9 +85,23 @@ static constexpr int kKiwiSdrWaterfallRateMax = 4;
 
 static QString kiwiWaterfallDbText(int db)
 {
-    return QStringLiteral("%1%2 dB")
-        .arg(db >= 0 ? QStringLiteral("+") : QString())
-        .arg(db);
+    return QStringLiteral("%1 dBm").arg(db);
+}
+
+static int reserveValueLabelText(QLabel* label, const QString& text,
+                                 int minimumWidth)
+{
+    if (!label) {
+        return minimumWidth;
+    }
+
+    constexpr int kHorizontalPadding = 6;
+    const QFontMetrics metrics(label->font());
+    const int width = std::max(minimumWidth,
+                               metrics.horizontalAdvance(text)
+                                   + kHorizontalPadding);
+    label->setFixedWidth(width);
+    return width;
 }
 
 static QString kiwiWaterfallRateText(int rate)
@@ -276,7 +297,7 @@ SpectrumOverlayMenu::SpectrumOverlayMenu(QWidget* parent)
         {"ANT",       1, nullptr},   // 3 — toggleAntPanel
         {"Display",   4, nullptr},   // 4 — toggleDisplayPanel
         {"Memory",    5, nullptr},   // 6 — toggleMemoryPanel
-        // MEM+ moved into MemoryBrowsePanel (bottom button — doesn't scroll).
+        // Add Memory lives at the top of MemoryBrowsePanel, outside the scrolling rows.
         {"DAX",       3, nullptr},   // 6 — toggleDaxPanel
     };
 
@@ -316,7 +337,31 @@ SpectrumOverlayMenu::SpectrumOverlayMenu(QWidget* parent)
     buildDisplayPanel();
     buildMemoryPanel();
 
-    // Prevent mouse/wheel events from falling through panels to the spectrum
+    m_wheelGuard = new SpectrumOverlayWheelGuard(this);
+    m_wheelGuard->setDisplayScrollArea(m_displayScroll);
+    m_wheelGuard->guardTree(
+        this, SpectrumOverlayWheelGuard::BoundaryMode::Consume);
+    m_wheelGuard->guardTree(
+        m_bandPanel, SpectrumOverlayWheelGuard::BoundaryMode::Consume);
+    m_wheelGuard->guardTree(
+        m_antPanel, SpectrumOverlayWheelGuard::BoundaryMode::Consume);
+    m_wheelGuard->guardTree(
+        m_daxPanel, SpectrumOverlayWheelGuard::BoundaryMode::Consume);
+    m_wheelGuard->guardTree(
+        m_displayPanel,
+        SpectrumOverlayWheelGuard::BoundaryMode::ScrollDisplay);
+    m_wheelGuard->guardTree(
+        m_memoryPanel, SpectrumOverlayWheelGuard::BoundaryMode::Consume);
+
+    // The panel can be opened before the panadapter reaches its restored
+    // height. Re-clamp it whenever that host subsequently resizes so the
+    // QScrollArea retains a real scroll range instead of extending off-screen.
+    if (parentWidget()) {
+        parentWidget()->installEventFilter(this);
+    }
+
+    // Mouse presses on panel backgrounds must not fall through to the
+    // spectrum. Wheel ownership is handled for every descendant above.
     for (auto* panel : {m_bandPanel, m_antPanel, m_daxPanel, m_displayPanel,
                         static_cast<QWidget*>(m_memoryPanel)})
         if (panel) panel->installEventFilter(this);
@@ -408,12 +453,14 @@ void SpectrumOverlayMenu::buildBandPanel()
                     hideAllSubPanels();
                     emit bandSelected(bandName, freq, mode);
                 });
+                m_bandBtnFreqs.append({btn, freq});
             }
 
             grid->addWidget(btn, row, col);
         }
     }
 
+    applyTuningRangeToBandButtons();
     m_bandPanel->adjustSize();
 }
 
@@ -606,7 +653,13 @@ void SpectrumOverlayMenu::buildAntPanel()
     m_wnbLabel->setFixedWidth(kValueW);
     m_wnbLabel->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
     wnbRow->addWidget(m_wnbLabel);
-    vbox->addLayout(wnbRow);
+    // Wrapped in a container rather than added as a bare layout, so the whole
+    // row can be hidden as one unit when the radio has no wideband noise
+    // blanker. Hiding the button alone would strand its level slider.
+    m_wnbRow = new QWidget;
+    wnbRow->setContentsMargins(0, 0, 0, 0);
+    m_wnbRow->setLayout(wnbRow);
+    vbox->addWidget(m_wnbRow);
 
     connect(m_wnbBtn, &QPushButton::toggled, this, &SpectrumOverlayMenu::wnbToggled);
     connect(m_wnbSlider, &QSlider::valueChanged, this, [this](int v) {
@@ -777,14 +830,6 @@ void SpectrumOverlayMenu::setPanId(const QString& id)
     m_panId = id;
     wirePanadapterRxAntenna();
     refreshAntennaCombo();
-}
-
-void SpectrumOverlayMenu::setLeanChecked(bool on)
-{
-    if (!m_leanBtn || m_leanBtn->isChecked() == on)
-        return;
-    QSignalBlocker block(m_leanBtn);  // reflect state without re-emitting
-    m_leanBtn->setChecked(on);
 }
 
 void SpectrumOverlayMenu::setRadioModel(RadioModel* model)
@@ -1216,11 +1261,43 @@ void SpectrumOverlayMenu::updateLayout()
 void SpectrumOverlayMenu::buildDisplayPanel()
 {
     m_displayPanel = new QWidget(parentWidget());
-    AetherSDR::ThemeManager::instance().applyStyleSheet(m_displayPanel, "QWidget { background: rgba(15, 15, 26, 220); "
-                                   "border: 1px solid {{color.background.2}}; border-radius: 3px; }");
+    m_displayPanel->setObjectName(QStringLiteral("displayPanel"));
+    AetherSDR::ThemeManager::instance().applyStyleSheet(
+        m_displayPanel,
+        "QWidget#displayPanel { background: rgba(15, 15, 26, 220); "
+        "border: 1px solid {{color.background.2}}; border-radius: 3px; }");
     m_displayPanel->hide();
 
-    auto* grid = new QGridLayout(m_displayPanel);
+    // #3969: the panel's ~24 rows exceed a short window's height, so the grid
+    // lives on a content widget inside a scroll area (same pattern as
+    // RadioSetupDialog::wrapTabInScrollArea) and toggleDisplayPanel() clamps
+    // the shown height. The explicit transparent styles stop the panel-level
+    // QWidget stylesheet above from cascading a second background/border onto
+    // the scroll machinery.
+    auto* panelLayout = new QVBoxLayout(m_displayPanel);
+    panelLayout->setContentsMargins(1, 1, 1, 1);  // keep the 1px panel border visible
+    m_displayScroll = new QScrollArea;
+    m_displayScroll->setObjectName(QStringLiteral("displayPanelScroll"));
+    m_displayScroll->verticalScrollBar()->setObjectName(
+        QStringLiteral("displayPanelScrollBar"));
+    m_displayScroll->setWidgetResizable(true);
+    m_displayScroll->setFrameShape(QFrame::NoFrame);
+    m_displayScroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    m_displayScroll->setVerticalScrollBarPolicy(Qt::ScrollBarAsNeeded);
+    m_displayScroll->setStyleSheet(
+        "QScrollArea#displayPanelScroll { background: transparent; border: none; }");
+    m_displayScroll->viewport()->setObjectName(
+        QStringLiteral("displayPanelViewport"));
+    m_displayScroll->viewport()->setStyleSheet(
+        "QWidget#displayPanelViewport { background: transparent; border: none; }");
+    auto* displayContent = new QWidget;
+    displayContent->setObjectName(QStringLiteral("displayPanelContent"));
+    displayContent->setStyleSheet(
+        "QWidget#displayPanelContent { background: transparent; border: none; }");
+    m_displayScroll->setWidget(displayContent);
+    panelLayout->addWidget(m_displayScroll);
+
+    auto* grid = new QGridLayout(displayContent);
     grid->setContentsMargins(8, 6, 8, 6);
     grid->setSpacing(4);
     grid->setColumnStretch(1, 1);
@@ -1236,12 +1313,24 @@ void SpectrumOverlayMenu::buildDisplayPanel()
 
     int row = 0;
     // Grid columns: 0=label, 1=button (optional), 2=slider, 3=value
+    const QString widestValueText = QStringLiteral("-260 dBm");
+    int valueColumnWidth = 28;
+    auto reserveValueColumnLabel = [&](QLabel* label) {
+        valueColumnWidth = std::max(valueColumnWidth,
+                                    reserveValueLabelText(label, widestValueText,
+                                                          valueColumnWidth));
+        grid->setColumnMinimumWidth(3, valueColumnWidth);
+    };
 
     // Helper: label col 0, slider col 1-2, value col 3
     auto makeRow = [&](const QString& text, int lo, int hi, int def,
-                       QSlider*& slider, QLabel*& valLbl) {
+                       QSlider*& slider, QLabel*& valLbl,
+                       QLabel** titleLbl = nullptr) {
         auto* lbl = new QLabel(text);
         lbl->setStyleSheet(labelStyle);
+        if (titleLbl) {
+            *titleLbl = lbl;
+        }
         grid->addWidget(lbl, row, 0);
 
         slider = new GuardedSlider(Qt::Horizontal);
@@ -1252,7 +1341,7 @@ void SpectrumOverlayMenu::buildDisplayPanel()
 
         valLbl = new QLabel(QString::number(def));
         valLbl->setStyleSheet(valStyle);
-        valLbl->setFixedWidth(28);
+        reserveValueColumnLabel(valLbl);
         valLbl->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
         grid->addWidget(valLbl, row, 3);
         ++row;
@@ -1261,9 +1350,13 @@ void SpectrumOverlayMenu::buildDisplayPanel()
     // Helper: label col 0, button col 1, slider col 2, value col 3
     auto makeRowWithBtn = [&](const QString& text, int lo, int hi, int def,
                               QSlider*& slider, QLabel*& valLbl,
-                              QPushButton*& btn, const QString& btnText) {
+                              QPushButton*& btn, const QString& btnText,
+                              QLabel** titleLbl = nullptr) {
         auto* lbl = new QLabel(text);
         lbl->setStyleSheet(labelStyle);
+        if (titleLbl) {
+            *titleLbl = lbl;
+        }
         grid->addWidget(lbl, row, 0);
 
         btn = new QPushButton(btnText);
@@ -1280,7 +1373,7 @@ void SpectrumOverlayMenu::buildDisplayPanel()
 
         valLbl = new QLabel(QString::number(def));
         valLbl->setStyleSheet(valStyle);
-        valLbl->setFixedWidth(28);
+        reserveValueColumnLabel(valLbl);
         valLbl->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
         grid->addWidget(valLbl, row, 3);
         ++row;
@@ -1316,10 +1409,9 @@ void SpectrumOverlayMenu::buildDisplayPanel()
     makeHeader("PANADAPTER");
     {
         auto* toggleRow = new QWidget;
-        // The Display panel's QWidget { border: 1px solid } cascades to this
-        // QWidget container and would otherwise draw a 1 px frame around the
-        // whole Heat Map / Grid / Wt Avg row.  Override locally.
-        toggleRow->setStyleSheet("QWidget { border: none; background: transparent; }");
+        toggleRow->setObjectName(QStringLiteral("displayPanelToggleRow"));
+        toggleRow->setStyleSheet(
+            "QWidget#displayPanelToggleRow { border: none; background: transparent; }");
         auto* toggleLayout = new QHBoxLayout(toggleRow);
         toggleLayout->setContentsMargins(0, 2, 0, 2);
         toggleLayout->setSpacing(3);
@@ -1370,8 +1462,10 @@ void SpectrumOverlayMenu::buildDisplayPanel()
         emit fftAverageChanged(v);
     });
 
-    // FPS
-    makeRow("FFT FPS:", 5, 30, 25, m_fpsSlider, m_fpsLabel);
+    // FPS — 60 ceiling: the per-pixel trace path made per-frame prep cost
+    // width-flat (~120 µs), so the display, not the client, is the limit.
+    // The radio clamps what it will actually deliver.
+    makeRow("FFT FPS:", 5, 60, 25, m_fpsSlider, m_fpsLabel);
     m_fpsSlider->setObjectName("displayFftFpsSlider");
     connect(m_fpsSlider, &QSlider::valueChanged, this, [this](int v) {
         m_fpsLabel->setText(QString::number(v));
@@ -1383,6 +1477,18 @@ void SpectrumOverlayMenu::buildDisplayPanel()
         auto* lbl = new QLabel("FFT Line:");
         lbl->setStyleSheet(labelStyle);
         grid->addWidget(lbl, row, 0);
+
+        // Trace line color — independent of the fill color (#4239). Mirrors the
+        // "FFT Fill" row's color-button-in-column-1 layout for symmetry.
+        m_lineColorBtn = new QPushButton;
+        m_lineColorBtn->setObjectName("displayFftLineColorBtn");
+        m_lineColorBtn->setFixedSize(18, 18);
+        m_lineColorBtn->setStyleSheet(
+            QString("QPushButton { background: %1; border: 1px solid #506070;"
+                    " border-radius: 2px; }")
+                .arg(m_lineColor.name()));
+        m_lineColorBtn->setToolTip("Choose trace line color");
+        grid->addWidget(m_lineColorBtn, row, 1);
 
         auto* lineWidthSlider = new GuardedSlider(Qt::Horizontal);
         lineWidthSlider->setRange(0, 10);
@@ -1397,11 +1503,11 @@ void SpectrumOverlayMenu::buildDisplayPanel()
         });
         m_lineWidthSlider = lineWidthSlider;
         applyPrimarySliderStyle(m_lineWidthSlider);
-        grid->addWidget(m_lineWidthSlider, row, 1, 1, 2);
+        grid->addWidget(m_lineWidthSlider, row, 2);
 
         m_lineWidthLabel = new QLabel("2.0");
         m_lineWidthLabel->setStyleSheet(valStyle);
-        m_lineWidthLabel->setFixedWidth(28);
+        reserveValueColumnLabel(m_lineWidthLabel);
         m_lineWidthLabel->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
         grid->addWidget(m_lineWidthLabel, row, 3);
         ++row;
@@ -1410,6 +1516,18 @@ void SpectrumOverlayMenu::buildDisplayPanel()
             float w = v * 0.5f;
             m_lineWidthLabel->setText(v == 0 ? "Off" : QString::number(w, 'f', 1));
             emit fftLineWidthChanged(w);
+        });
+        connect(m_lineColorBtn, &QPushButton::clicked, this, [this] {
+            QColor c = QColorDialog::getColor(m_lineColor, this, "FFT Line Color",
+                                               QColorDialog::DontUseNativeDialog);
+            if (c.isValid()) {
+                m_lineColor = c;
+                m_lineColorBtn->setStyleSheet(
+                    QString("QPushButton { background: %1; border: 1px solid #506070;"
+                            " border-radius: 2px; }")
+                        .arg(c.name()));
+                emit fftLineColorChanged(c);
+            }
         });
     }
 
@@ -1438,7 +1556,7 @@ void SpectrumOverlayMenu::buildDisplayPanel()
 
         m_fillLabel = new QLabel("70");
         m_fillLabel->setStyleSheet(valStyle);
-        m_fillLabel->setFixedWidth(28);
+        reserveValueColumnLabel(m_fillLabel);
         m_fillLabel->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
         grid->addWidget(m_fillLabel, row, 3);
         ++row;
@@ -1501,7 +1619,7 @@ void SpectrumOverlayMenu::buildDisplayPanel()
     //              persists in m_blackAutoOffsetValue and emits
     //              wfAutoBlackOffsetChanged.
     makeRowWithBtn("Black Level:", 0, 100, 50, m_blackSlider, m_blackLabel,
-                   m_autoBlackBtn, "SW");
+                   m_autoBlackBtn, "SW", &m_blackTitleLabel);
     m_blackSlider->setObjectName("displayBlackLevelSlider");
     m_autoBlackBtn->setObjectName("displayAutoBlackBtn");
     connect(m_blackSlider, &QSlider::valueChanged, this, [this](int v) {
@@ -1509,11 +1627,8 @@ void SpectrumOverlayMenu::buildDisplayPanel()
             ? kiwiWaterfallDbText(v)
             : QString::number(v));
         if (m_kiwiWaterfallControlMode) {
-            if (m_autoBlackBtn && m_autoBlackBtn->isChecked() && v != 0) {
-                QSignalBlocker blocker(m_autoBlackBtn);
-                m_autoBlackBtn->setChecked(false);
-            }
-            emit kiwiWaterfallFloorChanged(v);
+            clearKiwiWaterfallAutoButtonState();
+            emit kiwiWaterfallMinChanged(v);
             return;
         }
         if (m_autoBlackMode != 0) {      // Auto-C / Auto-R → bias the offset
@@ -1524,39 +1639,41 @@ void SpectrumOverlayMenu::buildDisplayPanel()
             emit wfBlackLevelChanged(v);
         }
     });
-    // One click advances the 3-way mode: Off → Auto-C → Auto-R → Off.
-    // In Kiwi mode the same button resets the Kiwi waterfall floor to its
-    // automatic baseline instead of changing the Flex auto-black source.
+    // One click advances the mode: Off → SW → HW → Off, or Off → SW → Off on a
+    // radio that computes no black level of its own (AutoBlackMode::modeCount).
+    // In Kiwi mode the same button requests the computed auto floor/ceiling scale.
     connect(m_autoBlackBtn, &QPushButton::clicked, this, [this]() {
         if (m_kiwiWaterfallControlMode) {
-            if (m_blackSlider) {
-                QSignalBlocker blocker(m_blackSlider);
-                m_blackSlider->setValue(0);
-                if (m_blackLabel) {
-                    m_blackLabel->setText(kiwiWaterfallDbText(0));
-                }
-                emit kiwiWaterfallFloorChanged(0);
-            }
             if (m_autoBlackBtn) {
                 QSignalBlocker blocker(m_autoBlackBtn);
                 m_autoBlackBtn->setChecked(true);
             }
+            emit kiwiWaterfallAutoRequested();
             return;
         }
 
-        applyAutoBlackMode((m_autoBlackMode + 1) % 3, /*emitSignals=*/true);
+        // From what the operator can SEE, not from a masked intent: showing SW
+        // and advancing to HW-as-SW again would look like a dead button. A click
+        // is a real choice on this radio, so it overwrites the stored intent —
+        // the one case where losing a stashed HW is correct.
+        applyAutoBlackMode(
+            AutoBlackMode::nextOnClick(m_autoBlackMode,
+                                       m_radioSideAutoBlackAvailable),
+            /*emitSignals=*/true);
     });
     applyAutoBlackMode(m_autoBlackMode, /*emitSignals=*/false);  // initial label/slider role
 
     // Gain
-    makeRow("WtrFall Gain:", 0, 100, 50, m_gainSlider, m_gainLabel);
+    makeRow("WtrFall Gain:", 0, 100, 50, m_gainSlider, m_gainLabel,
+            &m_gainTitleLabel);
     m_gainSlider->setObjectName("displayWfGainSlider");
     connect(m_gainSlider, &QSlider::valueChanged, this, [this](int v) {
         m_gainLabel->setText(m_kiwiWaterfallControlMode
             ? kiwiWaterfallDbText(v)
             : QString::number(v));
         if (m_kiwiWaterfallControlMode) {
-            emit kiwiWaterfallCellChanged(v);
+            clearKiwiWaterfallAutoButtonState();
+            emit kiwiWaterfallMaxChanged(v);
             return;
         }
         emit wfColorGainChanged(v);
@@ -1577,7 +1694,7 @@ void SpectrumOverlayMenu::buildDisplayPanel()
 
         m_rateLabel = new QLabel(rateSliderLabelText(m_rateSlider->value()));
         m_rateLabel->setStyleSheet(valStyle);
-        m_rateLabel->setFixedWidth(34);
+        reserveValueColumnLabel(m_rateLabel);
         m_rateLabel->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
         grid->addWidget(m_rateLabel, row, 3);
         ++row;
@@ -1655,7 +1772,7 @@ void SpectrumOverlayMenu::buildDisplayPanel()
         grid->addWidget(m_bgOpacitySlider, row, 1, 1, 2);
         m_bgOpacityLabel = new QLabel("80");
         m_bgOpacityLabel->setStyleSheet(valStyle);
-        m_bgOpacityLabel->setFixedWidth(28);
+        reserveValueColumnLabel(m_bgOpacityLabel);
         m_bgOpacityLabel->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
         grid->addWidget(m_bgOpacityLabel, row, 3);
         connect(m_bgOpacitySlider, &QSlider::valueChanged, this, [this](int v) {
@@ -1798,30 +1915,38 @@ void SpectrumOverlayMenu::buildDisplayPanel()
         emit dssGainChanged(v);
     });
 
+    // ── 3D span — how far the near rows overhang the plot edges ───────────
+    // Caps how much of the radio's offscreen spectrum the surface may use to
+    // close the empty wedges beside it. 100 spends everything available, so a
+    // source that ships no overhang is unaffected at any setting.
+    makeRow("3D Span:", 0, 100, 100, m_dssRowSpanSlider, m_dssRowSpanLabel,
+            &m_dssRowSpanTitle);
+    if (m_dssRowSpanSlider) {
+        m_dssRowSpanSlider->setObjectName("dssRowSpanSlider");
+        m_dssRowSpanSlider->setAccessibleName(tr("3D Span"));
+        m_dssRowSpanSlider->setAccessibleDescription(
+            tr("How far the nearest 3D traces overhang the plot edges, using "
+               "spectrum from outside the panadapter. 0 keeps the classic "
+               "narrowing trapezoid."));
+        // Tooltip text lives in setDssRowSpanSupported() so the enabled and
+        // unavailable wordings cannot drift apart.
+        m_dssRowSpanSupported = false;
+        setDssRowSpanSupported(true);
+    }
+    connect(m_dssRowSpanSlider, &QSlider::valueChanged, this, [this](int v) {
+        if (m_dssRowSpanLabel) {
+            m_dssRowSpanLabel->setText(QString::number(v));
+        }
+        emit dssRowSpanChanged(v);
+    });
+
     makeHeader("SYSTEM");
 
-    // ── Lean render mode toggle (#3283) ─────────────────────────────────
-    // Global low-overhead render mode: opaque panadapter + VFO, capped
-    // repaint, WAVE scope off, throttled meters. Grouped with the spectrum
-    // render controls, below the 3D Floor slider. Drives the app-wide toggle.
-    {
-        m_leanBtn = new QPushButton("Lean Mode");
-        m_leanBtn->setObjectName("displayLeanModeBtn");
-        m_leanBtn->setCheckable(true);
-        m_leanBtn->setStyleSheet(btnStyle);
-        m_leanBtn->setToolTip("Lean mode: opaque panadapter + VFO, capped "
-                              "repaint, WAVE scope off, throttled meters. "
-                              "Reduces CPU/GPU load. Persists across restarts.");
-        connect(m_leanBtn, &QPushButton::toggled, this,
-                [this](bool on) { emit leanModeToggled(on); });
-        grid->addWidget(m_leanBtn, row, 0, 1, 4);
-        ++row;
-    }
-
     // ── Render GPU (multi-GPU systems only) ───────────────────────────────
-    // The graphics adapter can't be switched under a live context, so the
-    // choice is persisted and applied on the next launch (GpuSelector reads it
-    // before QApplication).  Hidden entirely on single-GPU systems.
+    // First control under SYSTEM: the graphics adapter can't be switched under
+    // a live context, so the choice is persisted and applied on the next launch
+    // (GpuSelector reads it before QApplication).  Hidden entirely on single-GPU
+    // systems.
     if (GpuSelector::hasMultiple()) {
         auto* lbl = new QLabel("GPU:");
         lbl->setStyleSheet(labelStyle);
@@ -1913,7 +2038,8 @@ void SpectrumOverlayMenu::buildDisplayPanel()
     if (m_floorEnableBtn) m_floorEnableBtn->setToolTip("Shows a noise floor reference line on the spectrum display.");
     if (m_floorSlider) m_floorSlider->setToolTip("Vertical position of the noise floor reference line (% from top).");
 
-    m_displayPanel->adjustSize();
+    // No adjustSize() here: toggleDisplayPanel() sizes the panel from the
+    // scroll content's hint (clamped to the parent) on every show.
 }
 
 // Apply a 3-way auto-black mode to the single cycle button + shared Black slider.
@@ -1924,26 +2050,83 @@ void SpectrumOverlayMenu::buildDisplayPanel()
 // swaps between its manual and auto-offset roles.  When emitSignals is true (a
 // user click) it drives the on/off + client/radio-source signals plus the
 // matching slider-value signal so the renderer and radio both update.
+int SpectrumOverlayMenu::effectiveAutoBlackMode() const
+{
+    // m_autoBlackMode is the operator's stored INTENT and may legitimately hold
+    // HW while attached to a radio that has none; this is that intent masked by
+    // the capability. See gui/AutoBlackMode.h — the arithmetic lives there
+    // because this class cannot be linked into a test on its own.
+    return AutoBlackMode::effective(m_autoBlackMode,
+                                    m_radioSideAutoBlackAvailable);
+}
+
+void SpectrumOverlayMenu::setRadioSideAutoBlackAvailable(bool available)
+{
+    if (m_radioSideAutoBlackAvailable == available) {
+        return;
+    }
+    m_radioSideAutoBlackAvailable = available;
+    // Intent is NOT rewritten here and no wf* signal is emitted — those reach
+    // SpectrumWidget::setWfAutoBlackRadioSide, which writes AppSettings, and a
+    // capability is not a choice the operator made. Coercing through them meant
+    // one session on an HL2 permanently deleted a Flex user's HW preference.
+    // MainWindow applies the same mask to the widget and to the radio push; all
+    // this has to do is re-render the button. (#4606)
+    applyAutoBlackMode(m_autoBlackMode, /*emitSignals=*/false);
+}
+
 void SpectrumOverlayMenu::applyAutoBlackMode(int mode, bool emitSignals)
 {
-    m_autoBlackMode = mode;
+    // Intent keeps the full 0..2 range even while HW is masked off, so coming
+    // back to a Flex restores HW without the operator re-selecting it.
+    m_autoBlackMode = AutoBlackMode::clampIntent(mode);
+    mode = effectiveAutoBlackMode();
     const bool autoOn    = (mode != 0);
     const bool radioSide = (mode == 2);
 
-    if (m_autoBlackBtn) {
+    // KIWI MODE OWNS THESE TWO WIDGETS. While a pan is displaying KiwiSDR the
+    // button is a one-shot "Auto" (setKiwiWaterfallControlMode) and the slider is
+    // the Kiwi floor in dBm with a -260..29 range — neither has anything to do
+    // with the Off/SW/HW cycle. Writing the cycle's label and its 0..100 offset
+    // into them here would relabel "Auto" as "SW" and jam an out-of-range value
+    // into the floor slider.
+    //
+    // Until #4606 this could not happen: every caller was either kiwi-guarded or
+    // reached only via setKiwiWaterfallControlMode(false). setRadioSideAutoBlack-
+    // Available() is a new caller that fires on a capability change regardless of
+    // display source, so the guard belongs HERE, at the mutation, rather than at
+    // each call site — the next new caller gets it for free.
+    const bool ownsWidgets =
+        AutoBlackMode::ownsSharedWidgets(m_kiwiWaterfallControlMode);
+    if (m_autoBlackBtn && ownsWidgets) {
         QSignalBlocker bb(m_autoBlackBtn);
         m_autoBlackBtn->setCheckable(true);
         m_autoBlackBtn->setChecked(autoOn);   // highlight in either Auto mode
         // SW = client-side (software) estimate, HW = radio's (hardware) level —
         // short labels that fit the compact button.
         m_autoBlackBtn->setText(mode == 0 ? "Off" : mode == 1 ? "SW" : "HW");
-        m_autoBlackBtn->setToolTip(
-            "Waterfall auto-black (click to cycle):\n"
-            "Off = manual black level\n"
-            "SW = client-side noise-floor estimate (software)\n"
-            "HW = radio's per-tile auto-black level (hardware)");
+        m_autoBlackBtn->setToolTip(m_radioSideAutoBlackAvailable
+            ? QStringLiteral(
+                "Waterfall auto-black (click to cycle):\n"
+                "Off = manual black level\n"
+                "SW = client-side noise-floor estimate (software)\n"
+                "HW = radio's per-tile auto-black level (hardware)")
+            : QStringLiteral(
+                "Waterfall auto-black (click to cycle):\n"
+                "Off = manual black level\n"
+                "SW = client-side noise-floor estimate (software)\n"
+                "This radio computes no black level of its own, so there is no "
+                "hardware option."));
+        // Kept in step with the tooltip so the two cannot disagree about whether
+        // HW exists.
+        m_autoBlackBtn->setAccessibleDescription(m_radioSideAutoBlackAvailable
+            ? tr("Cycles the waterfall auto-black mode: off (manual black "
+                 "level), software noise-floor estimate, or hardware level.")
+            : tr("Cycles the waterfall auto-black mode: off (manual black "
+                 "level) or software noise-floor estimate. This radio "
+                 "computes no black level of its own."));
     }
-    if (m_blackSlider) {
+    if (m_blackSlider && ownsWidgets) {
         QSignalBlocker bs(m_blackSlider);
         const int v = autoOn ? m_blackAutoOffsetValue : m_blackManualValue;
         m_blackSlider->setValue(v);
@@ -1951,6 +2134,12 @@ void SpectrumOverlayMenu::applyAutoBlackMode(int mode, bool emitSignals)
         m_blackSlider->setToolTip(autoOn
             ? "Auto-black target offset. 50 = at noise floor; lower = darker, higher = lighter."
             : "Waterfall black level. Decrease to darken the noise floor.");
+        m_blackSlider->setAccessibleName(autoOn
+            ? tr("Waterfall auto-black offset")
+            : tr("Waterfall black level"));
+        m_blackSlider->setAccessibleDescription(autoOn
+            ? tr("Sets the target offset from the measured noise floor.")
+            : tr("Sets the manual waterfall black level."));
     }
     if (emitSignals) {
         emit wfAutoBlackChanged(autoOn);
@@ -1971,7 +2160,9 @@ void SpectrumOverlayMenu::syncDisplaySettings(int avg, int fps, int fillPct,
                                                bool autoBlackRadioSide,
                                                int renderMode,
                                                int dssFloorDepth,
-                                               int dssGain)
+                                               int dssGain,
+                                               const QColor& lineColor,
+                                               int dssRowSpan)
 {
     if (!m_avgSlider) return;  // panel not built yet
 
@@ -1992,6 +2183,11 @@ void SpectrumOverlayMenu::syncDisplaySettings(int avg, int fps, int fillPct,
     m_fillColorBtn->setStyleSheet(
         QString("QPushButton { background: %1; border: 1px solid #506070;"
                 " border-radius: 2px; }").arg(fillColor.name()));
+    m_lineColor = lineColor;
+    if (m_lineColorBtn)
+        m_lineColorBtn->setStyleSheet(
+            QString("QPushButton { background: %1; border: 1px solid #506070;"
+                    " border-radius: 2px; }").arg(lineColor.name()));
     m_gainSlider->setValue(gain);
     m_gainLabel->setText(QString::number(gain));
     m_blackManualValue     = black;
@@ -2042,28 +2238,107 @@ void SpectrumOverlayMenu::syncDisplaySettings(int avg, int fps, int fillPct,
         m_dssGainSlider->setValue(dssGain);
         if (m_dssGainLabel) m_dssGainLabel->setText(QString::number(dssGain));
     }
+    if (m_dssRowSpanSlider) {
+        QSignalBlocker bs(m_dssRowSpanSlider);
+        m_dssRowSpanSlider->setValue(dssRowSpan);
+        if (m_dssRowSpanLabel) {
+            m_dssRowSpanLabel->setText(QString::number(dssRowSpan));
+        }
+    }
+}
+
+void SpectrumOverlayMenu::setDssRowSpanSupported(bool supported)
+{
+    if (!m_dssRowSpanSlider || m_dssRowSpanSupported == supported) {
+        return;
+    }
+    m_dssRowSpanSupported = supported;
+    m_dssRowSpanSlider->setEnabled(supported);
+    if (m_dssRowSpanLabel) {
+        m_dssRowSpanLabel->setEnabled(supported);
+    }
+    if (m_dssRowSpanTitle) {
+        m_dssRowSpanTitle->setEnabled(supported);
+    }
+    m_dssRowSpanSlider->setToolTip(supported
+        ? QStringLiteral(
+              "3D surface width: how far the nearest traces overhang the plot "
+              "edges,\nusing spectrum the radio sends from outside the "
+              "panadapter.\nHigher = the empty wedges beside the surface close "
+              "from the front;\n0 = the classic narrowing trapezoid. Limited "
+              "by how much\noffscreen spectrum the source actually provides.")
+        : QStringLiteral(
+              "Unavailable: the 3D view is on the CPU fallback, which always "
+              "draws\nthe narrowing trapezoid. The GPU mesh path this control "
+              "drives\nneeds float (RGBA16F) textures, which this system's "
+              "graphics\ndriver does not report."));
 }
 
 void SpectrumOverlayMenu::setKiwiWaterfallControlMode(bool kiwiMode)
 {
-    if (m_kiwiWaterfallControlMode == kiwiMode) {
-        return;
-    }
-
     m_kiwiWaterfallControlMode = kiwiMode;
+    std::optional<QSignalBlocker> gainBlocker;
+    std::optional<QSignalBlocker> blackBlocker;
+    std::optional<QSignalBlocker> rateBlocker;
+    std::optional<QSignalBlocker> autoBlocker;
     if (m_gainSlider) {
-        m_gainSlider->setRange(kiwiMode ? -30 : 0, kiwiMode ? 30 : 100);
-        m_gainSlider->setToolTip(kiwiMode
-            ? "KiwiSDR waterfall cell adjustment, -30 to +30 dB."
-            : "Waterfall color gain.");
+        gainBlocker.emplace(m_gainSlider);
     }
     if (m_blackSlider) {
-        m_blackSlider->setRange(kiwiMode ? -30 : 0, kiwiMode ? 30 : 100);
+        blackBlocker.emplace(m_blackSlider);
+    }
+    if (m_rateSlider) {
+        rateBlocker.emplace(m_rateSlider);
+    }
+    if (m_autoBlackBtn) {
+        autoBlocker.emplace(m_autoBlackBtn);
+    }
+    if (m_gainTitleLabel) {
+        m_gainTitleLabel->setText(kiwiMode
+            ? QStringLiteral("WF Ceiling:")
+            : QStringLiteral("WtrFall Gain:"));
+    }
+    if (m_blackTitleLabel) {
+        m_blackTitleLabel->setText(kiwiMode
+            ? QStringLiteral("WF Floor:")
+            : QStringLiteral("Black Level:"));
+    }
+    if (m_gainSlider) {
+        m_gainSlider->setRange(kiwiMode ? -259 : 0, kiwiMode ? 30 : 100);
+        m_gainSlider->setToolTip(kiwiMode
+            ? "KiwiSDR waterfall ceiling dBm. Auto sets this from the row's 98th percentile plus 30 dB."
+            : "Waterfall color gain.");
+        m_gainSlider->setAccessibleName(kiwiMode
+            ? tr("KiwiSDR waterfall ceiling")
+            : tr("Waterfall color gain"));
+        m_gainSlider->setAccessibleDescription(kiwiMode
+            ? tr("Sets the maximum KiwiSDR waterfall display level in dBm.")
+            : tr("Sets the waterfall color gain from 0 to 100."));
+    }
+    if (m_blackSlider) {
+        m_blackSlider->setRange(kiwiMode ? -260 : 0, kiwiMode ? 29 : 100);
         m_blackSlider->setToolTip(kiwiMode
-            ? "KiwiSDR waterfall floor adjustment, -30 to +30 dB."
+            ? "KiwiSDR waterfall floor dBm. Auto sets this from the median row level minus 10 dB."
             : (m_autoBlackBtn && m_autoBlackBtn->isChecked()
                    ? "Auto-black target offset. 50 = at noise floor; lower = darker, higher = lighter."
                    : "Waterfall black level. Decrease to darken the noise floor."));
+        // Set the accessible name unconditionally in both modes (like the gain
+        // and rate sliders) so a kiwi->flex switch never leaves a stale name.
+        // The flex-mode name mirrors applyAutoBlackMode's auto-on/off wording;
+        // applyAutoBlackMode still refreshes it as the mode cycles.
+        if (kiwiMode) {
+            m_blackSlider->setAccessibleName(tr("KiwiSDR waterfall floor"));
+            m_blackSlider->setAccessibleDescription(
+                tr("Sets the minimum KiwiSDR waterfall display level in dBm."));
+        } else {
+            const bool autoOn = (m_autoBlackMode != 0);
+            m_blackSlider->setAccessibleName(autoOn
+                ? tr("Waterfall auto-black offset")
+                : tr("Waterfall black level"));
+            m_blackSlider->setAccessibleDescription(autoOn
+                ? tr("Sets the target offset from the measured noise floor.")
+                : tr("Sets the manual waterfall black level."));
+        }
     }
     if (m_rateSlider) {
         m_rateSlider->setRange(kiwiMode ? 0 : WF_RATE_SLIDER_MIN,
@@ -2072,11 +2347,28 @@ void SpectrumOverlayMenu::setKiwiWaterfallControlMode(bool kiwiMode)
         m_rateSlider->setToolTip(kiwiMode
             ? "KiwiSDR waterfall rate. Auto follows the Flex waterfall rate."
             : "Waterfall rate.");
+        m_rateSlider->setAccessibleName(kiwiMode
+            ? tr("KiwiSDR waterfall rate")
+            : tr("Waterfall rate"));
+        m_rateSlider->setAccessibleDescription(kiwiMode
+            ? tr("Zero follows the Flex waterfall rate; values 1 to 4 request a fixed KiwiSDR rate.")
+            : tr("Sets the waterfall row update rate."));
     }
     if (m_autoBlackBtn) {
         m_autoBlackBtn->setToolTip(kiwiMode
-            ? "Reset KiwiSDR waterfall floor to automatic baseline."
+            ? "Apply the KiwiSDR automatic waterfall floor and ceiling scale."
             : "Use the measured noise floor for waterfall black level.");
+        // The non-Kiwi wording tracks the capability gate, like the tooltip:
+        // announcing a hardware position a screen-reader user cannot reach is
+        // worse than not mentioning it. (#4606)
+        m_autoBlackBtn->setAccessibleDescription(kiwiMode
+            ? tr("Applies the computed KiwiSDR waterfall floor and ceiling levels.")
+            : (m_radioSideAutoBlackAvailable
+                ? tr("Cycles the waterfall auto-black mode: off (manual black "
+                     "level), software noise-floor estimate, or hardware level.")
+                : tr("Cycles the waterfall auto-black mode: off (manual black "
+                     "level) or software noise-floor estimate. This radio "
+                     "computes no black level of its own.")));
         if (kiwiMode) {
             m_autoBlackBtn->setCheckable(true);
             m_autoBlackBtn->setText("Auto");
@@ -2086,28 +2378,38 @@ void SpectrumOverlayMenu::setKiwiWaterfallControlMode(bool kiwiMode)
     }
 }
 
-void SpectrumOverlayMenu::syncKiwiWaterfallSettings(int cellDb, int floorDb,
-                                                    int rate)
+void SpectrumOverlayMenu::syncKiwiWaterfallSettings(int minDbm, int maxDbm,
+                                                    bool autoScale, int rate)
 {
     if (!m_gainSlider || !m_blackSlider || !m_rateSlider) {
         return;
     }
 
-    const int clampedCell = std::clamp(cellDb, -30, 30);
-    const int clampedFloor = std::clamp(floorDb, -30, 30);
+    const int clampedMin = std::clamp(minDbm, -260, 29);
+    const int clampedMax = std::clamp(maxDbm, clampedMin + 1, 30);
     const int clampedRate = std::clamp(rate, 0, kKiwiSdrWaterfallRateMax);
     QSignalBlocker b1(m_gainSlider), b2(m_blackSlider),
                    b3(m_rateSlider), b4(m_autoBlackBtn);
 
     setKiwiWaterfallControlMode(true);
 
-    m_gainSlider->setValue(clampedCell);
-    m_gainLabel->setText(kiwiWaterfallDbText(clampedCell));
-    m_blackSlider->setValue(clampedFloor);
-    m_blackLabel->setText(kiwiWaterfallDbText(clampedFloor));
-    m_autoBlackBtn->setChecked(clampedFloor == 0);
+    m_gainSlider->setValue(clampedMax);
+    m_gainLabel->setText(kiwiWaterfallDbText(clampedMax));
+    m_blackSlider->setValue(clampedMin);
+    m_blackLabel->setText(kiwiWaterfallDbText(clampedMin));
+    m_autoBlackBtn->setChecked(autoScale);
     m_rateSlider->setValue(clampedRate);
     m_rateLabel->setText(kiwiWaterfallRateText(clampedRate));
+}
+
+void SpectrumOverlayMenu::clearKiwiWaterfallAutoButtonState()
+{
+    if (!m_kiwiWaterfallControlMode || !m_autoBlackBtn) {
+        return;
+    }
+
+    QSignalBlocker blocker(m_autoBlackBtn);
+    m_autoBlackBtn->setChecked(false);
 }
 
 void SpectrumOverlayMenu::syncNoiseFloorPosition(int pos)
@@ -2119,6 +2421,37 @@ void SpectrumOverlayMenu::syncNoiseFloorPosition(int pos)
     m_floorSlider->setValue(clamped);
     if (m_floorLabel) {
         m_floorLabel->setText(QString::number(clamped));
+    }
+}
+
+void SpectrumOverlayMenu::syncPanProcessingSettings(int avg, int fps,
+                                                     bool weightedAvg)
+{
+    if (!m_avgSlider || !m_fpsSlider || !m_weightedAvgBtn) {
+        return;
+    }
+
+    const QSignalBlocker avgBlocker(m_avgSlider);
+    const QSignalBlocker fpsBlocker(m_fpsSlider);
+    const QSignalBlocker weightedBlocker(m_weightedAvgBtn);
+    m_avgSlider->setValue(avg);
+    m_avgLabel->setText(QString::number(avg));
+    m_fpsSlider->setValue(fps);
+    m_fpsLabel->setText(QString::number(fps));
+    m_weightedAvgBtn->setChecked(weightedAvg);
+}
+
+void SpectrumOverlayMenu::syncDssFloorDepth(int dB)
+{
+    if (!m_dssFloorSlider) {
+        return;
+    }
+
+    const int clamped = std::clamp(dB, 0, 24);
+    QSignalBlocker block(m_dssFloorSlider);
+    m_dssFloorSlider->setValue(clamped);
+    if (m_dssFloorLabel) {
+        m_dssFloorLabel->setText(QString::number(clamped));
     }
 }
 
@@ -2185,13 +2518,58 @@ void SpectrumOverlayMenu::toggleDisplayPanel()
     hideAllSubPanels();
     if (!wasVisible) {
         m_displayPanelVisible = true;
-        int menuBottom = y() + height();
-        int panelH = m_displayPanel->sizeHint().height();
-        int panelY = menuBottom - panelH;
-        m_displayPanel->move(x() + width(), std::max(0, panelY));
+        layoutDisplayPanel();
         m_displayPanel->raise();
         m_displayPanel->show();
         m_menuBtns[kBtnDisplay]->setStyleSheet(kMenuBtnActive);
+    }
+}
+
+void SpectrumOverlayMenu::layoutDisplayPanel()
+{
+    if (!m_displayPanel || !m_displayScroll || !m_displayScroll->widget()) {
+        return;
+    }
+
+    // Size from the scroll content's hint — QScrollArea::sizeHint() is
+    // font-metric-capped, not content-sized — then clamp to the current parent
+    // height so short or subsequently resized windows scroll instead of clip.
+    const QSize contentHint = m_displayScroll->widget()->sizeHint();
+    const QWidget* host = m_displayPanel->parentWidget();
+    const int hostHeight = host ? host->height() : contentHint.height() + 2;
+    const int scrollBarExtent = m_displayPanel->style()->pixelMetric(
+        QStyle::PM_ScrollBarExtent, nullptr, m_displayScroll);
+    const QSize panelSize = constrainedDisplayPanelSize(
+        contentHint, hostHeight, scrollBarExtent);
+
+    m_displayPanel->resize(panelSize);
+    const int menuBottom = y() + height();
+    const int panelY = constrainedDisplayPanelTop(
+        menuBottom, panelSize.height(), hostHeight);
+    m_displayPanel->move(x() + width(), panelY);
+}
+
+// WNB is a RADIO-side noise blanker: the toggle and level go to the radio's own
+// wideband blanker, so on a backend that has none the row would be a control
+// with nothing behind it. Hidden as a unit, button and slider together.
+void SpectrumOverlayMenu::setRadioSideDspAvailable(bool available)
+{
+    if (m_wnbRow) {
+        m_wnbRow->setVisible(available);
+    }
+}
+
+void SpectrumOverlayMenu::setDaxStreamsAvailable(bool available)
+{
+    // The button lives in the menu row and the panel is a popup off it, so both
+    // have to go — hiding only the button would leave the panel reachable if it
+    // were already open when the capability changed.
+    if (m_menuBtns.size() > kBtnDax && m_menuBtns[kBtnDax]) {
+        m_menuBtns[kBtnDax]->setVisible(available);
+    }
+    if (!available && m_daxPanel) {
+        m_daxPanel->hide();
+        m_daxPanelVisible = false;
     }
 }
 
@@ -2261,6 +2639,15 @@ void SpectrumOverlayMenu::setRadioCapabilities(ModelCapabilities caps)
     setXvtrBands(m_lastXvtrBands);
 }
 
+void SpectrumOverlayMenu::setDeclaredBands(const QStringList& bands)
+{
+    if (bands == m_declaredBands)
+        return;  // No change — skip the rebuild.
+    m_declaredBands = bands;
+    // Same full-rebuild delegation as a capability change (above).
+    setXvtrBands(m_lastXvtrBands);
+}
+
 void SpectrumOverlayMenu::updateLoopButtonVisibility()
 {
     const bool showLoopA = m_radioCapabilities.hasLoopA;
@@ -2306,6 +2693,10 @@ void SpectrumOverlayMenu::setXvtrBands(const QVector<XvtrBand>& bands)
     for (auto* btn : m_xvtrBandBtns)
         btn->deleteLater();
     m_xvtrBandBtns.clear();
+    // The whole band panel is destroyed and rebuilt below, so every pointer in
+    // here is about to dangle. Cleared HERE rather than after the rebuild,
+    // because deleteLater() on the panel takes its children with it.
+    m_bandBtnFreqs.clear();
 
     // Rebuild the main band panel to insert XVTR bands between
     // HF bands and utility buttons (WWV/GEN/2200/630/XVTR). (#571)
@@ -2359,30 +2750,64 @@ void SpectrumOverlayMenu::setXvtrBands(const QVector<XvtrBand>& bands)
             hideAllSubPanels();
             emit bandSelected(bandName, freq, mode);
         });
+        m_bandBtnFreqs.append({btn, freq});
         return btn;
     };
 
     int row = 0;
-    for (int r = 0; r < 4; ++r) {
-        for (int col = 0; col < 3; ++col) {
-            int idx = hfLayout[r][col];
-            if (idx < 0) continue;
-            grid->addWidget(makeBandBtn(idx), row, col);
-        }
-        ++row;
-    }
-
-    // Built-in transverter bands (4m / 2m) — surfaced for radios that
-    // report the corresponding capability flag (FLEX-6500 Region 1: 4m;
-    // FLEX-6700: 4m + 2m).  Styled identically to HF bands per #695
-    // (these are native radio hardware, not user-configured XVTRs).
-    if (m_radioCapabilities.has4Meters || m_radioCapabilities.has2Meters) {
+    if (!m_declaredBands.isEmpty()) {
+        // The radio declared its own band set ("bands=" discovery/status
+        // key — gateways presenting non-Flex hardware).  Build the grid
+        // from the declaration in BandDefs order instead of the HF layout
+        // + model capability flags: the radio said what it can do, so the
+        // menu offers exactly that (an IC-9700 gets 2m/440/23cm, not an
+        // HF grid it can't tune).  Utility and XVTR rows are unaffected.
+        // NB buttons are built from BandDefs here, not via makeBandBtn():
+        // BAND_GRID only carries the curated HF-menu entries, so declared
+        // VHF/UHF names (440, 23cm, ...) have no BAND_GRID row to reuse.
         int col = 0;
-        if (m_radioCapabilities.has4Meters)
-            grid->addWidget(makeBandBtn(kBandIdx4m), row, col++);
-        if (m_radioCapabilities.has2Meters)
-            grid->addWidget(makeBandBtn(kBandIdx2m), row, col++);
-        ++row;
+        for (const auto& def : kBands) {
+            const QString bandName = QString::fromLatin1(def.name);
+            if (!m_declaredBands.contains(bandName))
+                continue;
+            auto* btn = new QPushButton(bandName, m_bandPanel);
+            btn->setFixedSize(BAND_BTN_W, BAND_BTN_H);
+            btn->setStyleSheet(bandBtnStyle);
+            const double  freq = def.defaultFreqMhz;
+            const QString mode = QString::fromLatin1(def.defaultMode);
+            connect(btn, &QPushButton::clicked, this, [this, bandName, freq, mode]() {
+                hideAllSubPanels();
+                emit bandSelected(bandName, freq, mode);
+            });
+            m_bandBtnFreqs.append({btn, freq});
+            grid->addWidget(btn, row, col % 3);
+            if (++col % 3 == 0)
+                ++row;
+        }
+        if (col % 3)
+            ++row;
+    } else {
+        for (int r = 0; r < 4; ++r) {
+            for (int col = 0; col < 3; ++col) {
+                int idx = hfLayout[r][col];
+                if (idx < 0) continue;
+                grid->addWidget(makeBandBtn(idx), row, col);
+            }
+            ++row;
+        }
+
+        // Built-in transverter bands (4m / 2m) — surfaced for radios that
+        // report the corresponding capability flag (FLEX-6500 Region 1: 4m;
+        // FLEX-6700: 4m + 2m).  Styled identically to HF bands per #695
+        // (these are native radio hardware, not user-configured XVTRs).
+        if (m_radioCapabilities.has4Meters || m_radioCapabilities.has2Meters) {
+            int col = 0;
+            if (m_radioCapabilities.has4Meters)
+                grid->addWidget(makeBandBtn(kBandIdx4m), row, col++);
+            if (m_radioCapabilities.has2Meters)
+                grid->addWidget(makeBandBtn(kBandIdx2m), row, col++);
+            ++row;
+        }
     }
 
     // XVTR bands (inserted between HF and utility)
@@ -2521,29 +2946,73 @@ void SpectrumOverlayMenu::setXvtrBands(const QVector<XvtrBand>& bands)
     xvGrid->addWidget(hfBtn, slot / XVTR_COLS, slot % XVTR_COLS);
 
     m_xvtrPanel->adjustSize();
+    if (m_wheelGuard) {
+        m_wheelGuard->guardTree(
+            m_bandPanel, SpectrumOverlayWheelGuard::BoundaryMode::Consume);
+        m_wheelGuard->guardTree(
+            m_xvtrPanel, SpectrumOverlayWheelGuard::BoundaryMode::Consume);
+    }
+    // The panel was rebuilt from scratch, so the range gate has to be
+    // re-applied — it is a property of the radio, not of the buttons.
+    applyTuningRangeToBandButtons();
+}
+
+void SpectrumOverlayMenu::setTuningRangeMhz(double minMhz, double maxMhz)
+{
+    if (qFuzzyCompare(m_tuningMinMhz, minMhz) && qFuzzyCompare(m_tuningMaxMhz, maxMhz))
+        return;
+    m_tuningMinMhz = minMhz;
+    m_tuningMaxMhz = maxMhz;
+    applyTuningRangeToBandButtons();
+}
+
+void SpectrumOverlayMenu::applyTuningRangeToBandButtons()
+{
+    // "Not reported" is max <= min, which covers both the (0,0) disconnected
+    // case and any backend that never sets a range. Everything stays enabled,
+    // so this is a no-op for Flex.
+    const bool constrained = m_tuningMaxMhz > m_tuningMinMhz;
+    for (auto it = m_bandBtnFreqs.begin(); it != m_bandBtnFreqs.end(); ) {
+        QPushButton* btn = it->first;
+        if (!btn) {                       // destroyed out from under us
+            it = m_bandBtnFreqs.erase(it);
+            continue;
+        }
+        const double freq = it->second;
+        const bool reachable = !constrained
+                            || (freq >= m_tuningMinMhz && freq <= m_tuningMaxMhz);
+        btn->setEnabled(reachable);
+        btn->setToolTip(reachable
+            ? QString()
+            : tr("Outside this radio's tuning range (%1–%2 MHz)")
+                  .arg(m_tuningMinMhz, 0, 'f', 3)
+                  .arg(m_tuningMaxMhz, 0, 'f', 3));
+        ++it;
+    }
 }
 
 bool SpectrumOverlayMenu::eventFilter(QObject* obj, QEvent* event)
 {
+    if (obj == parentWidget() && event->type() == QEvent::Resize
+        && m_displayPanelVisible) {
+        layoutDisplayPanel();
+    }
+
     if (event->type() == QEvent::MouseButtonDblClick) {
         if (auto* slider = qobject_cast<QSlider*>(obj)) {
             slider->setValue(50);
             return true;
         }
     }
-    // Consume mouse/wheel events on sub-panels so they don't reach the spectrum
+    // Consume panel-background mouse events so they don't reach the spectrum.
+    // SpectrumOverlayWheelGuard owns wheel routing for panels and descendants.
     if (obj == m_bandPanel || obj == m_antPanel
         || obj == m_daxPanel || obj == m_displayPanel || obj == m_memoryPanel) {
-        if (event->type() == QEvent::Wheel
-            || event->type() == QEvent::MouseButtonPress
+        if (event->type() == QEvent::MouseButtonPress
             || event->type() == QEvent::MouseButtonRelease) {
             if (auto* panel = qobject_cast<QWidget*>(obj)) {
                 if (auto* mouseEvent = dynamic_cast<QMouseEvent*>(event);
                     mouseEvent && panel->childAt(mouseEvent->pos())) {
-                    return QWidget::eventFilter(obj, event);
-                }
-                if (auto* wheelEvent = dynamic_cast<QWheelEvent*>(event);
-                    wheelEvent && panel->childAt(wheelEvent->position().toPoint())) {
                     return QWidget::eventFilter(obj, event);
                 }
             }

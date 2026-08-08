@@ -28,9 +28,15 @@ class CwxModel;
 // (#3146).
 class CwxBubble : public QWidget {
 public:
-    CwxBubble(const QString& text, const QString& time, QWidget* parent = nullptr);
+    // `displayText` is the modifier-stripped text that is painted and whose
+    // length the `sent=N` counter advances against; `rawText` is the original
+    // input (with `+`/`-` speed modifiers intact) so Resend can re-expand it
+    // at the correct per-word speeds rather than flattening to base WPM. (#272)
+    CwxBubble(const QString& displayText, const QString& time,
+              const QString& rawText, QWidget* parent = nullptr);
 
     QString text() const { return m_text; }
+    QString rawText() const { return m_rawText; }
     int     sentCount() const { return m_sentCount; }
     bool    isAborted() const { return m_aborted; }
 
@@ -45,6 +51,7 @@ private:
     void recalcSize();
 
     QString m_text;
+    QString m_rawText;
     QString m_time;
     int     m_sentCount{0};
     bool    m_aborted{false};
@@ -59,11 +66,13 @@ public:
 
     // Optional providers used to guard the global F1-F12 / ESC shortcuts
     // so they don't fire in modes/states where they'd be surprising (#1552).
-    //  - modeProvider returns the active slice's mode ("CW", "CWL", ...)
+    //  - txModeProvider returns the TX slice's mode ("CW", "CWL", ...) — CWX
+    //    keys the TX slice, so the guard follows it, not the selected RX slice
+    //    (matches indicator availability; #4173)
     //  - transmittingProvider returns true when the radio is actively TXing
     // When unset, the shortcuts fire unconditionally (legacy behavior).
-    void setActiveModeProvider(std::function<QString()> provider) {
-        m_activeModeProvider = std::move(provider);
+    void setTxModeProvider(std::function<QString()> provider) {
+        m_txModeProvider = std::move(provider);
     }
     void setTransmittingProvider(std::function<bool()> provider) {
         m_transmittingProvider = std::move(provider);
@@ -96,7 +105,7 @@ private:
     void sendBuffer();
     void resendText(const QString& text);
     void clearHistory();
-    void appendHistoryBubble(const QString& text);
+    void appendHistoryBubble(const QString& rawText);
     void onKeyPress(const QString& text);
 
     CwxModel*       m_model{nullptr};
@@ -123,6 +132,7 @@ private:
     QWidget*        m_setupPage{nullptr};
     QTextEdit*      m_macroEdits[12]{};
     QSpinBox*       m_delaySpin{nullptr};
+    QSpinBox*       m_speedStepSpin{nullptr};
     QPushButton*    m_qskBtn{nullptr};
 
     // Bottom bar
@@ -131,7 +141,7 @@ private:
     QPushButton*    m_setupBtn{nullptr};
     QSpinBox*       m_speedSpin{nullptr};
 
-    std::function<QString()> m_activeModeProvider;
+    std::function<QString()> m_txModeProvider;
     std::function<bool()>    m_transmittingProvider;
 
     // F1-F12 + ESC shortcuts — enabled by MainWindow based on the active

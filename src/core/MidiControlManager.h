@@ -11,6 +11,8 @@
 #include <memory>
 #include <RtMidi.h>
 
+#include "MidiRelativeCcDecoder.h"
+
 namespace AetherSDR {
 
 // ── Data types ──────────────────────────────────────────────────────────────
@@ -75,6 +77,12 @@ public:
     const QVector<MidiParam>& params() const { return m_params; }
     const MidiParam* findParam(const QString& id) const;
 
+    // The VFO tune knob gets special handling in two places that must agree:
+    // Learn forces relative=true on its CC captures here, and the manual
+    // entry form mirrors that default (MidiMappingDialog).  One definition
+    // so the two can't drift.
+    static bool isVfoTuneKnob(const QString& paramId);
+
     // Binding management
     void addBinding(const MidiBinding& binding);
     void removeBinding(const QString& paramId);
@@ -82,6 +90,10 @@ public:
     QVector<MidiBinding>& bindings() { return m_bindings; }
     const QVector<MidiBinding>& bindings() const { return m_bindings; }
     void rebuildIndex();
+
+    // Automation-only injection point used by the agent bridge to exercise the
+    // same learned VFO-relative decoder without requiring physical MIDI input.
+    Q_INVOKABLE bool injectVfoCcForAutomation(int value);
 
     // MIDI Learn
     void startLearn(const QString& paramId);
@@ -123,6 +135,11 @@ private:
 
     QVector<MidiBinding> m_bindings;
     QHash<quint32, int>  m_bindingIndex; // binding key → index into m_bindings
+    QHash<quint32, MidiRelativeCcEncoding> m_relativeCcEncodings;
+    // Encoding state for the automation-only injectVfoCcForAutomation() path,
+    // kept separate from m_relativeCcEncodings so a test injection can never
+    // collide with (and mis-lock) a real controller's binding key.
+    MidiRelativeCcEncoding m_automationCcEncoding{MidiRelativeCcEncoding::Undetermined};
 
     bool    m_learning{false};
     QString m_learnParamId;
@@ -139,6 +156,7 @@ private:
     QTimer* m_relativeTimer{nullptr};
     void accumulateRelativeStep(const QString& paramId, int delta);
     void flushRelativeAccum();
+    void dispatchRelativeCc(const MidiBinding& binding, int value);
 };
 
 } // namespace AetherSDR

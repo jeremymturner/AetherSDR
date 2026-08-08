@@ -18,11 +18,7 @@ constexpr int   kPeakHoldMs =  700;
 constexpr float kPeakDecayDbPer100Ms = 1.0f;
 
 inline QColor kBarBg() { return AetherSDR::ThemeManager::instance().color("color.background.0"); }
-inline QColor kLevelLo() { return AetherSDR::ThemeManager::instance().color("color.accent.success"); }
-inline QColor kLevelMid() { return AetherSDR::ThemeManager::instance().color("color.accent.warning"); }
-inline QColor kLevelHi() { return AetherSDR::ThemeManager::instance().color("color.accent.danger"); }
 inline QColor kGrColor() { return AetherSDR::ThemeManager::instance().color("color.accent.warning"); }
-inline QColor kLabelColor() { return AetherSDR::ThemeManager::instance().color("color.text.secondary"); }
 inline QColor kPeakLine() { return AetherSDR::ThemeManager::instance().color("color.text.primary"); }
 inline QColor kCeilingLine() { return AetherSDR::ThemeManager::instance().color("color.accent.warning"); }  // bright amber — matches LIMIT button
 const QColor kCeilingZone("#3a1810");     // dim red tint for the "no-go" zone
@@ -43,8 +39,7 @@ ClientCompMeter::ClientCompMeter(QWidget* parent) : QWidget(parent)
         const bool settled = !m_smooth.tick(m_animElapsed.restart());
         if (settled)
             m_animTimer.stop();
-        if (settled || m_smooth.shouldRepaint())
-            update();
+        update();
     });
 
     // Phase 5 PR 3b — repaint when the theme changes so live edits to

@@ -13,8 +13,10 @@ namespace AetherSDR {
 
 PersistentDialog::PersistentDialog(const QString& title,
                                    const QString& geomKey,
-                                   QWidget* parent)
-    : QDialog(parent), m_geomKey(geomKey)
+                                   QWidget* parent,
+                                   bool toolWindow)
+    : QDialog(parent), m_geomKey(geomKey),
+      m_windowType(toolWindow ? Qt::Tool : Qt::Dialog)
 {
     setWindowTitle(title);
 
@@ -45,7 +47,7 @@ void PersistentDialog::setFramelessMode(bool on)
     const QRect geom = geometry();
     const bool wasVisible = isVisible();
 
-    Qt::WindowFlags flags = (windowFlags() & ~Qt::WindowType_Mask) | Qt::Dialog;
+    Qt::WindowFlags flags = (windowFlags() & ~Qt::WindowType_Mask) | m_windowType;
     flags.setFlag(Qt::FramelessWindowHint, on);
     setWindowFlags(flags);
     if (wasVisible) {
@@ -68,8 +70,17 @@ void PersistentDialog::setFramelessMode(bool on)
 void PersistentDialog::applyBodyLayoutMargins()
 {
     if (m_body && m_body->layout()) {
-        m_body->layout()->setContentsMargins(9, m_framelessOn ? 7 : 9, 9, 9);
+        m_body->layout()->setContentsMargins(
+            m_framelessOn ? m_framelessBodyMargins : m_framedBodyMargins);
     }
+}
+
+void PersistentDialog::setBodyLayoutMargins(const QMargins& framed,
+                                            const QMargins& frameless)
+{
+    m_framedBodyMargins = framed;
+    m_framelessBodyMargins = frameless;
+    applyBodyLayoutMargins();
 }
 
 void PersistentDialog::showEvent(QShowEvent* event)

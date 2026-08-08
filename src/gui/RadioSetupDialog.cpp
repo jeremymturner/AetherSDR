@@ -6,6 +6,8 @@
 #include "models/RadioModel.h"
 #include "models/XvtrPolicy.h"
 #include "core/AppSettings.h"
+#include "core/AutomationBridgeSettings.h"
+#include "core/backends/hl2/Hl2Discovery.h"   // HL2 custom-nickname settings key
 #include "core/NetworkSettings.h"
 #include "core/PanadapterStream.h"
 #include "core/KiwiSdrManager.h"
@@ -25,7 +27,10 @@
 #include "core/FirmwareStager.h"
 #include "core/TgxlConnection.h"
 #include "core/PgxlConnection.h"
+#include "core/AcomConnection.h"
 #include "core/WanConnection.h"   // PinnedCertInfo + WanCertCache (#2951)
+#include "core/CallsignLookupService.h"
+#include "core/QrzLookupSettings.h"
 #include "models/AntennaGeniusModel.h"
 
 #include <QCloseEvent>
@@ -48,10 +53,13 @@
 #include <QCheckBox>
 #include <QDoubleValidator>
 #include <QTimer>
+#include <QVector>
 #include <QDesktopServices>
 #include <QUrl>
 #include <QMediaDevices>
 #include <QAudioDevice>
+#include <QDateTime>
+#include <QDir>
 #include <QFileDialog>
 #include <QStandardPaths>
 #include <QFileInfo>
@@ -71,12 +79,16 @@
 #include <QDebug>
 #include <QGuiApplication>
 #include <QPainter>
+#include <QRandomGenerator>
 #include <QPaintEvent>
 #include <QPointer>
 #include <QScreen>
 #include <QSignalBlocker>
 #include <QSizePolicy>
 #include <QToolButton>
+#include <QTreeWidget>
+#include <QAction>
+#include <QKeySequence>
 
 #include <algorithm>
 #include <functional>
@@ -118,6 +130,16 @@ static const QString kKiwiIconButtonStyle =
     "border-radius: 4px; padding: 3px; }"
     "QPushButton:hover { background: #20465e; }"
     "QPushButton:pressed { background: #132c3d; }";
+
+// Shared indicator block for all QCheckBox instances in this dialog.
+// Uses ThemeManager tokens (Low Latency architecture) with hover + disabled
+// pseudo-states (FreeDV Reporter pattern) so boxes are visible in dark mode.
+static const QString kCheckBoxIndicator =
+    "QCheckBox::indicator { width: 14px; height: 14px; "
+    "border: 2px solid {{color.background.3}}; border-radius: 3px; background: {{color.background.0}}; }"
+    "QCheckBox::indicator:hover { border-color: {{color.accent}}; background: {{color.background.1}}; }"
+    "QCheckBox::indicator:checked { border: 2px solid {{color.accent}}; background: {{color.background.2}}; }"
+    "QCheckBox::indicator:disabled { border-color: {{color.background.2}}; background: {{color.background.0}}; }";
 
 static constexpr int kInfoLeftLabelWidth = 112;
 static constexpr int kInfoRightLabelWidth = 160;
@@ -287,7 +309,7 @@ static QString radioOptionsText(const RadioModel* model)
     if (!model->radioOptions().isEmpty()) {
         return model->radioOptions();
     }
-    return model->hasAmplifier() ? QStringLiteral("GPS, PGXL") : QStringLiteral("GPS");
+    return model->amplifier().present() ? QStringLiteral("GPS, PGXL") : QStringLiteral("GPS");
 }
 
 static void showCopiedPopup(QWidget* anchor);
@@ -570,70 +592,272 @@ static void refreshOscillatorSourceCombo(QComboBox* combo, const RadioModel* mod
     if (idx >= 0) combo->setCurrentIndex(idx);
 }
 
+#ifdef HAVE_SERIALPORT
+// Populates a serial-port combo (real ports discovered via QSerialPortInfo,
+// plus a trailing "Custom..." sentinel) and selects the entry matching
+// savedPort. If none of the discovered ports match — the saved port isn't
+// currently plugged in, or it's a non-standard path (e.g. /dev/ttyUSB0 on
+// Linux, a symlinked TTY) — falls back to "Custom..." with customEdit
+// pre-filled, so the saved value is never silently dropped. Returns true if
+// the fallback (Custom) was selected. Shared by the CW/keying Port
+// Configuration group and the ACOM Peripherals row, which independently
+// re-implemented this match/fallback logic with a subtly different
+// isCustom computation before this was factored out.
+static bool populateSerialPortCombo(QComboBox* combo, QLineEdit* customEdit,
+                                    const QString& savedPort)
+{
+    for (const auto& info : QSerialPortInfo::availablePorts())
+        combo->addItem(QString("%1 — %2").arg(info.portName(), info.description()),
+                        info.portName());
+    combo->addItem("Custom...", QStringLiteral("__custom__"));
+
+    bool isCustom = !savedPort.isEmpty();
+    for (int i = 0; i < combo->count() - 1; ++i) {
+        if (combo->itemData(i).toString() == savedPort) {
+            combo->setCurrentIndex(i);
+            isCustom = false;
+            break;
+        }
+    }
+    if (isCustom) {
+        combo->setCurrentIndex(combo->count() - 1);
+        if (customEdit) customEdit->setText(savedPort);
+    }
+    return isCustom;
+}
+#endif
+
 RadioSetupDialog::RadioSetupDialog(RadioModel* model, AudioEngine* audio,
                                    TgxlConnection* tgxl, PgxlConnection* pgxl,
                                    AntennaGeniusModel* ag,
                                    KiwiSdrManager* kiwiSdrManager,
+                                   AcomConnection* acom,
                                    QWidget* parent)
     : PersistentDialog(QStringLiteral("Radio Setup"),
                        QStringLiteral("RadioSetupDialogGeometry"), parent),
       m_model(model), m_audio(audio),
       m_tgxl(tgxl), m_pgxl(pgxl), m_ag(ag),
-      m_kiwiSdrManager(kiwiSdrManager)
+      m_kiwiSdrManager(kiwiSdrManager), m_acom(acom)
 {
     theme::setContainer(this, QStringLiteral("dialog/radioSetup"));
-    setMinimumSize(820, 620);
+    setMinimumSize(960, 680);
     AetherSDR::ThemeManager::instance().applyStyleSheet(this, "QDialog { background: {{color.background.0}}; }");
 
     auto* layout = new QVBoxLayout(bodyWidget());
 
-    auto* tabs = new QTabWidget;
-    m_tabs = tabs;
-    AetherSDR::ThemeManager::instance().applyStyleSheet(tabs, "QTabWidget::pane { border: 1px solid {{color.background.2}}; background: {{color.background.0}}; }"
-        "QTabBar::tab { background: {{color.background.1}}; color: {{color.text.secondary}}; "
-        "border: 1px solid {{color.background.2}}; padding: 4px 12px; margin-right: 2px; }"
-        "QTabBar::tab:selected { background: {{color.background.0}}; color: {{color.text.primary}}; "
-        "border-bottom-color: {{color.background.0}}; }");
+    auto* search = new QLineEdit;
+    search->setObjectName(QStringLiteral("radioSetupSearch"));
+    search->setPlaceholderText(QStringLiteral("Search settings (%1)")
+        .arg(QKeySequence(QKeySequence::Find).toString(QKeySequence::NativeText)));
+    search->setClearButtonEnabled(true);
+    search->setAccessibleName(QStringLiteral("Search Radio Setup settings"));
+    search->setAccessibleDescription(
+        QStringLiteral("Type a feature, device, or setting name to filter the navigation list."));
+    search->setMinimumHeight(38);
+    AetherSDR::ThemeManager::instance().applyStyleSheet(search,
+        "QLineEdit { background: {{color.background.1}}; color: {{color.text.primary}}; "
+        "border: 2px solid {{color.background.2}}; border-radius: 6px; padding: 7px 10px; font-size: 13px; }"
+        "QLineEdit:focus { border-color: {{color.accent.bright}}; }");
+    layout->addWidget(search);
+
+    auto* content = new QSplitter(Qt::Horizontal);
+    content->setChildrenCollapsible(false);
+
+    m_navigation = new QTreeWidget;
+    m_navigation->setObjectName(QStringLiteral("radioSetupNavigation"));
+    m_navigation->setHeaderHidden(true);
+    m_navigation->setRootIsDecorated(false);
+    m_navigation->setIndentation(14);
+    m_navigation->setUniformRowHeights(false);
+    m_navigation->setMinimumWidth(235);
+    m_navigation->setMaximumWidth(340);
+    m_navigation->setAccessibleName(QStringLiteral("Radio Setup categories"));
+    m_navigation->setAccessibleDescription(
+        QStringLiteral("Use the arrow keys to move between categories and settings pages."));
+    AetherSDR::ThemeManager::instance().applyStyleSheet(m_navigation,
+        "QTreeWidget { background: {{color.background.1}}; color: {{color.text.primary}}; "
+        "border: 1px solid {{color.background.2}}; border-radius: 6px; padding: 6px; outline: none; }"
+        "QTreeWidget::branch { image: none; border-image: none; background: transparent; }"
+        "QTreeWidget::item { min-height: 36px; padding: 3px 8px; border-radius: 4px; }"
+        "QTreeWidget::item:selected { background: {{color.accent.bright}}; color: {{color.background.0}}; }"
+        "QTreeWidget::item:hover:!selected { background: {{color.background.2}}; }");
+    content->addWidget(m_navigation);
+
+    auto* pageHost = new QWidget;
+    auto* pageLayout = new QVBoxLayout(pageHost);
+    pageLayout->setContentsMargins(16, 4, 4, 4);
+    pageLayout->setSpacing(10);
+    m_pageTitle = new QLabel;
+    m_pageTitle->setAccessibleName(QStringLiteral("Current settings page"));
+    AetherSDR::ThemeManager::instance().applyStyleSheet(m_pageTitle,
+        "QLabel { color: {{color.text.primary}}; font-size: 20px; font-weight: 600; padding: 2px 0 8px 0; }");
+    pageLayout->addWidget(m_pageTitle);
+    m_pages = new QStackedWidget;
+    m_pages->setObjectName(QStringLiteral("radioSetupPages"));
+    m_pages->setAccessibleName(QStringLiteral("Settings page content"));
+    pageLayout->addWidget(m_pages, 1);
+    content->addWidget(pageHost);
+    content->setStretchFactor(0, 0);
+    content->setStretchFactor(1, 1);
+    content->setSizes({260, 700});
+
+    auto addCategory = [this](const QString& name) {
+        auto* item = new QTreeWidgetItem(m_navigation, {name});
+        item->setFlags(Qt::ItemIsEnabled);
+        QFont font = item->font(0);
+        font.setBold(true);
+        item->setFont(0, font);
+        return item;
+    };
+
+    auto* radioCategory = addCategory(QStringLiteral("RADIO"));
+    auto* signalCategory = addCategory(QStringLiteral("RECEIVE & TRANSMIT"));
+    auto* hardwareCategory = addCategory(QStringLiteral("CONTROLLERS & HARDWARE"));
+    auto* onlineCategory = addCategory(QStringLiteral("ONLINE & APPEARANCE"));
+
+    auto addPage = [this](QTreeWidgetItem* category, const QString& name,
+                         const QString& keywords, std::function<QWidget*()> builder,
+                         bool eager = false) {
+        QWidget* placeholder = eager ? wrapTabInScrollArea(builder()) : new QWidget;
+        const int index = m_pages->addWidget(placeholder);
+        auto* item = new QTreeWidgetItem(category, {name});
+        item->setData(0, Qt::UserRole, index);
+        item->setData(0, Qt::UserRole + 1, keywords);
+        item->setToolTip(0, keywords);
+        m_pageIndexes.insert(name, index);
+        m_pageItems.insert(index, item);
+        if (!eager) {
+            m_deferredBuilders[index] = std::move(builder);
+        }
+        return item;
+    };
 
     // Build only the default (Radio) tab eagerly; defer the rest until first
     // selected.  This avoids hardware-probing calls (QSerialPortInfo,
     // QMediaDevices) during construction, which crash on some Wayland/Qt 6.11
     // configurations (#1776).
-    tabs->addTab(wrapTabInScrollArea(buildRadioTab()), "Radio");
-
-    auto addDeferred = [&](const QString& name, std::function<QWidget*()> builder) {
-        int idx = tabs->addTab(new QWidget, name);
-        m_deferredBuilders[idx] = std::move(builder);
-    };
-    addDeferred("Network",     [this] { return buildNetworkTab(); });
-    addDeferred("GPS",         [this] { return buildGpsTab(); });
-    addDeferred("Audio",       [this] { return buildAudioTab(); });
-    addDeferred("TX",          [this] { return buildTxTab(); });
-    addDeferred("Phone/CW",   [this] { return buildPhoneCwTab(); });
-    addDeferred("RX",          [this] { return buildRxTab(); });
-    addDeferred("Antennas",    [this] { return buildAntennaNamesTab(); });
-    addDeferred("Filters",     [this] { return buildFiltersTab(); });
-    addDeferred("XVTR",        [this] { return buildXvtrTab(); });
+    QTreeWidgetItem* firstItem = addPage(radioCategory, QStringLiteral("Radio"),
+        QStringLiteral("identity nickname callsign firmware license model region remote power"),
+        [this] { return buildRadioTab(); }, true);
+    addPage(radioCategory, QStringLiteral("Network"),
+        QStringLiteral("ip address dhcp static ethernet connection network"),
+        [this] { return buildNetworkTab(); });
+    addPage(radioCategory, QStringLiteral("GPS"),
+        QStringLiteral("gpsdo satellite location oscillator time"), [this] { return buildGpsTab(); });
+    addPage(signalCategory, QStringLiteral("Audio"),
+        QStringLiteral("speaker microphone device sample rate latency sound dax"), [this] { return buildAudioTab(); });
+    addPage(signalCategory, QStringLiteral("Transmit"),
+        QStringLiteral("tx transmit rf power tune ptt band settings"), [this] { return buildTxTab(); });
+    addPage(signalCategory, QStringLiteral("Phone & CW"),
+        QStringLiteral("phone cw keyer break-in sidetone microphone voice"), [this] { return buildPhoneCwTab(); });
+    addPage(signalCategory, QStringLiteral("Receive"),
+        QStringLiteral("rx receive calibration rf gain preamp"), [this] { return buildRxTab(); });
+    addPage(signalCategory, QStringLiteral("Filters"),
+        QStringLiteral("filter bandwidth low high cut mode"), [this] { return buildFiltersTab(); });
+    addPage(hardwareCategory, QStringLiteral("Antennas"),
+        QStringLiteral("antenna names ant1 ant2 rx in transverter"), [this] { return buildAntennaNamesTab(); });
+    addPage(hardwareCategory, QStringLiteral("Transverters"),
+        QStringLiteral("xvtr transverter if frequency offset power"), [this] { return buildXvtrTab(); });
     // External APD tab (#2186) — only present on radios that report
     // `apd configurable=1` (FLEX-8x00 series with SmartSDR 4.2.18+).
-    m_apdTabIndex = tabs->addTab(new QWidget, "APD");
-    m_deferredBuilders[m_apdTabIndex] = [this] { return buildApdTab(); };
-    tabs->setTabVisible(m_apdTabIndex, m_model->transmitModel().apdConfigurable());
+    QTreeWidgetItem* apdItem = addPage(hardwareCategory, QStringLiteral("APD"),
+        QStringLiteral("adaptive predistortion amplifier sampler linearization"), [this] { return buildApdTab(); });
+    m_apdPageIndex = m_pageIndexes.value(QStringLiteral("APD"));
+    apdItem->setHidden(!m_model->transmitModel().apdConfigurable());
     connect(&m_model->transmitModel(), &TransmitModel::apdStateChanged,
-            this, [this, tabs] {
-        tabs->setTabVisible(m_apdTabIndex, m_model->transmitModel().apdConfigurable());
+            this, [this, apdItem] {
+        apdItem->setHidden(!m_model->transmitModel().apdConfigurable());
     });
-    addDeferred("USB Cables",      [this] { return buildUsbCablesTab(); });
-    addDeferred("Peripherals",     [this] { return buildPeripheralsTab(); });
-    addDeferred("Themes",          [this] { return buildUiEnhancementsTab(); });
-    addDeferred("SmartLink",       [this] { return buildSmartLinkTab(); });
+    addPage(hardwareCategory, QStringLiteral("USB Cables"),
+        QStringLiteral("usb cable gpio bit bcd amplifier tuner accessory"), [this] { return buildUsbCablesTab(); });
+    addPage(hardwareCategory, QStringLiteral("Peripherals"),
+        QStringLiteral("controllers amplifier tuner antenna genius pgxl tgxl manual ip"), [this] { return buildPeripheralsTab(); });
+    addPage(onlineCategory, QStringLiteral("Appearance & Behavior"),
+        QStringLiteral("themes colors display font vision contrast click wheel ui enhancements"), [this] { return buildUiEnhancementsTab(); });
+    addPage(onlineCategory, QStringLiteral("SmartLink"),
+        QStringLiteral("remote internet certificate security pin wan"), [this] { return buildSmartLinkTab(); });
+    addPage(onlineCategory, QStringLiteral("QRZ & Callsigns"),
+        QStringLiteral("qrz callsign lookup spots contact online account"), [this] { return buildQrzTab(); });
 #ifdef HAVE_SERIALPORT
-    addDeferred("Serial",          [this] { return buildSerialTab(); });
+    addPage(hardwareCategory, QStringLiteral("Serial & Controllers"),
+        QStringLiteral("serial flexcontrol midi controller knob com port baud ptt cw"), [this] { return buildSerialTab(); });
 #endif
 
-    connect(tabs, &QTabWidget::currentChanged, this, &RadioSetupDialog::buildDeferredTab);
-
-    layout->addWidget(tabs);
+    m_navigation->expandAll();
+    connect(m_navigation, &QTreeWidget::currentItemChanged, this,
+            [this](QTreeWidgetItem* current, QTreeWidgetItem* previous) {
+        if (!current) {
+            return;
+        }
+        if (!current->parent()) {
+            QTreeWidgetItem* next = previous && m_navigation->itemAbove(current) == previous
+                ? m_navigation->itemBelow(current)
+                : m_navigation->itemAbove(current);
+            // Arrowing up onto the topmost "RADIO" header has nothing above it,
+            // so itemAbove() is null and the highlight would rest on the header.
+            // Clamp to the first child page below instead (#4183).
+            if (!next || !next->parent()) {
+                next = m_navigation->itemBelow(current);
+            }
+            if (next && next->parent()) {
+                m_navigation->setCurrentItem(next);
+            }
+            return;
+        }
+        const int index = current->data(0, Qt::UserRole).toInt();
+        buildDeferredTab(index);
+        m_pages->setCurrentIndex(index);
+        m_pageTitle->setText(current->text(0));
+    });
+    connect(search, &QLineEdit::textChanged, this, [this](const QString& text) {
+        const QString needle = text.trimmed();
+        QTreeWidgetItem* firstVisible = nullptr;
+        for (int i = 0; i < m_navigation->topLevelItemCount(); ++i) {
+            QTreeWidgetItem* category = m_navigation->topLevelItem(i);
+            bool anyVisible = false;
+            for (int j = 0; j < category->childCount(); ++j) {
+                QTreeWidgetItem* item = category->child(j);
+                const QString haystack = item->text(0) + QStringLiteral(" ")
+                    + item->data(0, Qt::UserRole + 1).toString();
+                const bool matches = needle.isEmpty()
+                    || haystack.contains(needle, Qt::CaseInsensitive);
+                const bool apdRow = item == m_pageItems.value(m_apdPageIndex);
+                if (!apdRow || m_model->transmitModel().apdConfigurable()) {
+                    item->setHidden(!matches);
+                }
+                anyVisible = anyVisible || !item->isHidden();
+                if (!item->isHidden() && !firstVisible) {
+                    firstVisible = item;
+                }
+            }
+            category->setHidden(!anyVisible);
+            category->setExpanded(true);
+        }
+        // Stash the first match but do NOT make it current here: selecting it
+        // fires currentItemChanged → buildDeferredTab, which would eagerly
+        // construct and hardware-probe deferred pages (Audio, Serial,
+        // Peripherals) on every keystroke — the probe-on-navigate deferral
+        // #1776 exists to avoid. Enter commits the highlight instead (#4183).
+        // With an empty needle every page "matches", so leave the stash null —
+        // Enter with no query typed is then a no-op rather than jumping to (and
+        // building) the first page.
+        m_searchFirstMatch = needle.isEmpty() ? nullptr : firstVisible;
+    });
+    connect(search, &QLineEdit::returnPressed, this, [this] {
+        if (m_searchFirstMatch && !m_searchFirstMatch->isHidden()) {
+            m_navigation->setCurrentItem(m_searchFirstMatch);
+        }
+    });
+    auto* findAction = new QAction(this);
+    findAction->setShortcut(QKeySequence::Find);
+    findAction->setShortcutContext(Qt::WidgetWithChildrenShortcut);
+    connect(findAction, &QAction::triggered, search, [search] {
+        search->setFocus();
+        search->selectAll();
+    });
+    addAction(findAction);
+    m_navigation->setCurrentItem(firstItem);
+    layout->addWidget(content, 1);
 
     auto* buttons = new QDialogButtonBox(QDialogButtonBox::Close);
     AetherSDR::ThemeManager::instance().applyStyleSheet(buttons, "QPushButton { background: {{color.background.1}}; border: 1px solid {{color.background.2}}; "
@@ -669,7 +893,7 @@ QWidget* RadioSetupDialog::buildRadioTab()
         "border: 1px solid #20a040; }";
 
     auto makeToggle = [](bool checked) {
-        auto* btn = new QPushButton("Enabled");
+        auto* btn = new QPushButton(checked ? "Enabled" : "Disabled");
         btn->setCheckable(true);
         btn->setChecked(checked);
         btn->setStyleSheet(kToggleStyle);
@@ -710,6 +934,7 @@ QWidget* RadioSetupDialog::buildRadioTab()
 
         m_remoteOnBtn = makeToggle(m_model->remoteOnEnabled());
         connect(m_remoteOnBtn, &QPushButton::toggled, this, [this](bool on) {
+            m_remoteOnBtn->setText(on ? "Enabled" : "Disabled");
             m_model->setRemoteOnEnabled(on);
         });
         grid->addWidget(makeInfoField(QStringLiteral("Remote On:"), m_remoteOnBtn,
@@ -723,13 +948,37 @@ QWidget* RadioSetupDialog::buildRadioTab()
                                               m_optionsLabel),
                         2, 0);
 
-        auto* fcBtn = makeToggle(true);
-        grid->addWidget(makeInfoField(QStringLiteral("FlexControl:"), fcBtn,
+        // FlexControl support isn't a user-facing setting — it just reflects
+        // whether AetherSDR currently holds control of the radio via the
+        // FlexRadio API, so it's a status label (like Region:/HW Version:
+        // above), not a checkable button. It used to be a makeToggle(true)
+        // QPushButton with no toggled handler wired up (hardcoded true, no
+        // connection to isConnected() either) — clicking it could visually
+        // uncheck to the "off" gray style while the text stayed stuck on
+        // "Enabled", and it kept saying "Enabled" even with no radio
+        // connected at all. Now it tracks isConnected() live, the same way
+        // rebootBtn does a few lines above.
+        auto* fcLbl = new QLabel;
+        auto updateFcLbl = [fcLbl](bool connected) {
+            fcLbl->setText(connected ? "Enabled" : "Disabled");
+            AetherSDR::ThemeManager::instance().applyStyleSheet(fcLbl, connected
+                ? "QLabel { background: #1a5030; border: 1px solid #20a040; "
+                  "border-radius: 3px; color: {{color.accent.success}}; font-size: 11px; font-weight: bold; "
+                  "padding: 3px 10px; }"
+                : "QLabel { background: {{color.background.1}}; border: 1px solid {{color.background.2}}; "
+                  "border-radius: 3px; color: {{color.text.primary}}; font-size: 11px; font-weight: bold; "
+                  "padding: 3px 10px; }");
+        };
+        updateFcLbl(m_model->isConnected());
+        fcLbl->setAlignment(Qt::AlignCenter);
+        connect(m_model, &RadioModel::connectionStateChanged, this, updateFcLbl);
+        grid->addWidget(makeInfoField(QStringLiteral("FlexControl:"), fcLbl,
                                       kInfoRightLabelWidth),
                         2, 1);
 
         auto* mfBtn = makeToggle(m_model->multiFlexEnabled());
-        connect(mfBtn, &QPushButton::toggled, this, [this](bool on) {
+        connect(mfBtn, &QPushButton::toggled, this, [this, mfBtn](bool on) {
+            mfBtn->setText(on ? "Enabled" : "Disabled");
             m_model->setMultiFlexEnabled(on);
         });
         grid->addWidget(makeInfoField(QStringLiteral("multiFLEX:"), mfBtn,
@@ -746,9 +995,14 @@ QWidget* RadioSetupDialog::buildRadioTab()
         // disables/re-enables the button without the user having to reopen the
         // dialog. rebootRadio() also early-returns on disconnected, but the
         // disabled state makes the affordance discoverable rather than silent.
-        rebootBtn->setEnabled(m_model->isConnected());
-        connect(m_model, &RadioModel::connectionStateChanged,
-                rebootBtn, &QPushButton::setEnabled);
+        // F3 (#4448): also gate on the backend supporting a client reboot — HL2
+        // is RX-only with no reboot command, and offering it would send a
+        // meaningless command and trigger a forced disconnect.
+        rebootBtn->setEnabled(m_model->isConnected() && m_model->backendCapabilities().canReboot);
+        connect(m_model, &RadioModel::connectionStateChanged, rebootBtn,
+                [this, rebootBtn](bool connected) {
+            rebootBtn->setEnabled(connected && m_model->backendCapabilities().canReboot);
+        });
         connect(rebootBtn, &QPushButton::clicked, this, [this] {
             const bool wan = m_model->isWan();
             const QString body = wan
@@ -810,8 +1064,24 @@ QWidget* RadioSetupDialog::buildRadioTab()
                                               m_modelLabel),
                         0, 0);
 
-        m_nicknameEdit = new QLineEdit(m_model->nickname().isEmpty()
-            ? m_model->name() : m_model->nickname());
+        // Initial nickname text. For a non-Flex radio the name lives in
+        // AppSettings (keyed by serial/MAC), not on the radio, so read it back
+        // from there — otherwise the field would show the model default even
+        // after the operator set a custom name. Flex keeps its existing
+        // model-sourced behaviour. This must gate on exactly the same
+        // "is it Flex?" test as the editingFinished handler below: gating the
+        // read on family=="hl2" while the write covers every non-Flex family
+        // would persist a name for e.g. kiwi that the field then never shows.
+        QString initialNickname = m_model->nickname().isEmpty()
+            ? m_model->name() : m_model->nickname();
+        {
+            const RadioInfo info = m_model->lastRadioInfo();
+            if (!hl2::Hl2Discovery::nicknameLivesOnRadio(info))
+                initialNickname = hl2::Hl2Discovery::effectiveNickname(
+                    info.family, info.serial,
+                    info.model.isEmpty() ? m_model->name() : info.model);
+        }
+        m_nicknameEdit = new QLineEdit(initialNickname);
         m_nicknameEdit->setStyleSheet(kEditStyle);
         grid->addWidget(makeInfoField(QStringLiteral("Nickname:"), m_nicknameEdit,
                                       kInfoRightLabelWidth),
@@ -819,14 +1089,64 @@ QWidget* RadioSetupDialog::buildRadioTab()
 
         m_callsignEdit = new QLineEdit(m_model->callsign());
         m_callsignEdit->setStyleSheet(kEditStyle);
+        // Named for the screen reader and for the automation bridge, which
+        // resolves controls by objectName / class / accessibleName. Both of
+        // these fields were anonymous QLineEdits among many, so neither could
+        // be driven in a test nor announced to a screen reader.
+        m_callsignEdit->setAccessibleName(tr("Station callsign"));
+        m_callsignEdit->setAccessibleDescription(
+            tr("Your callsign, used for PSK Reporter, WSPR and spotting"));
+        m_nicknameEdit->setAccessibleName(tr("Radio nickname"));
         grid->addWidget(makeInfoField(QStringLiteral("Callsign:"), m_callsignEdit),
                         1, 0);
 
         connect(m_nicknameEdit, &QLineEdit::editingFinished, this, [this] {
-            m_model->sendCommand("radio name " + m_nicknameEdit->text());
+            const RadioInfo info = m_model->lastRadioInfo();
+            // Only FlexRadio has an on-radio name store ("radio name" command).
+            // Every other family (HL2, the sim demo, any future non-Flex backend)
+            // has no wire to store a name, so the "radio name" command is a silent
+            // no-op there. For those, persist the operator's nickname client-side,
+            // keyed by the radio's stable serial, so discovery shows it in the
+            // picker on the next sweep and RadioSetup reads it back on reopen.
+            if (hl2::Hl2Discovery::nicknameLivesOnRadio(info)) {
+                m_model->sendCommand("radio name " + m_nicknameEdit->text());
+            } else {
+                // Commits eagerly inside; don't rely on the shutdown save.
+                hl2::Hl2Discovery::setNickname(info.family, info.serial,
+                                               m_nicknameEdit->text());
+            }
         });
         connect(m_callsignEdit, &QLineEdit::editingFinished, this, [this] {
-            m_model->sendCommand("radio callsign " + m_callsignEdit->text());
+            // Persist client-side on EVERY family, then additionally write the
+            // radio's own copy when there is one to write.
+            //
+            // This used to be the sendCommand alone. On anything but a Flex that
+            // is text nobody is listening for: the edit was accepted, went
+            // nowhere, and the field read back blank on reopen — while PSK
+            // Reporter, the WSPR beacon and QRZ own-callsign lookup all behaved
+            // as if the station had no identity. See RadioModel::callsign().
+            //
+            // Order matters. setStationCallsign() emits callsignChanged, and
+            // RadioModel::callsign() prefers the radio's value, so on a Flex the
+            // signal must not fire before the radio has been told — otherwise a
+            // corrected callsign would publish the OLD radio value and listeners
+            // would restart against it. Send first, persist second.
+            const QString entered = m_callsignEdit->text().trimmed().toUpper();
+            // Empty is "no change", never "erase". Before the station-callsign
+            // setting existed, blanking this field sent `radio callsign ` with
+            // an empty argument and was otherwise harmless; now it would ALSO
+            // wipe a persisted setting that PSK Reporter, the WSPR beacon and
+            // QRZ lookup all read. A silent wipe of persisted state is not an
+            // acceptable cost for a stray keystroke. (PR #4537 review.)
+            if (entered.isEmpty()) {
+                m_callsignEdit->setText(m_model->callsign());
+                return;
+            }
+            if (m_model->usesFlexCommandPlane()) {
+                m_model->sendCommand("radio callsign " + entered);
+            }
+            m_model->setStationCallsign(entered);
+            m_callsignEdit->setText(entered);
         });
 
         connect(m_model, &RadioModel::infoChanged, this, [this] {
@@ -1186,7 +1506,7 @@ QWidget* RadioSetupDialog::buildNetworkTab()
         grid->setSpacing(6);
 
         grid->addWidget(new QLabel("Enforce Private IP Connections:"), 0, 0);
-        auto* enforceBtn = new QPushButton("Enabled");
+        auto* enforceBtn = new QPushButton(m_model->enforcePrivateIp() ? "Enabled" : "Disabled");
         enforceBtn->setCheckable(true);
         enforceBtn->setChecked(m_model->enforcePrivateIp());
         AetherSDR::ThemeManager::instance().applyStyleSheet(enforceBtn, "QPushButton { background: {{color.background.1}}; border: 1px solid {{color.background.2}}; "
@@ -1194,13 +1514,241 @@ QWidget* RadioSetupDialog::buildNetworkTab()
             "padding: 3px 10px; }"
             "QPushButton:checked { background: #1a5030; color: {{color.accent.success}}; "
             "border: 1px solid #20a040; }");
-        connect(enforceBtn, &QPushButton::toggled, this, [this](bool on) {
+        connect(enforceBtn, &QPushButton::toggled, this, [this, enforceBtn](bool on) {
+            enforceBtn->setText(on ? "Enabled" : "Disabled");
             m_model->sendCommand(
                 QString("radio set enforce_private_ip_connections=%1").arg(on ? 1 : 0));
         });
         grid->addWidget(enforceBtn, 0, 1);
 
-        grid->addWidget(new QLabel("Network MTU:"), 1, 0);
+        // 128-bit hex token generator — plenty for a local same-user secret.
+        auto genToken = []() -> QString {
+            quint64 a = QRandomGenerator::global()->generate64();
+            quint64 b = QRandomGenerator::global()->generate64();
+            return QStringLiteral("%1%2")
+                .arg(a, 16, 16, QLatin1Char('0'))
+                .arg(b, 16, 16, QLatin1Char('0'));
+        };
+        // The token field is created here (before the toggle) so the toggle's
+        // enable handler can auto-fill it — enabling the bridge without a
+        // token would leave it open, which defeats the point. The token lives
+        // in the OS secret store and reads ASYNCHRONOUSLY; tokenLoaded gates
+        // the auto-mint so a toggle fired before the read lands can't clobber
+        // an existing token.
+        auto* tokenEdit = new QLineEdit;
+        tokenEdit->setReadOnly(true);
+        tokenEdit->setPlaceholderText("(loading…)");
+        tokenEdit->setToolTip(
+            "Paste this into your AI assistant's MCP server config as the\n"
+            "AETHER_MCP_TOKEN environment variable. Only a client holding\n"
+            "this token can drive the radio. Stored in your OS secret store.");
+        AetherSDR::ThemeManager::instance().applyStyleSheet(tokenEdit,
+            "QLineEdit { background: {{color.background.0}}; border: 1px solid {{color.background.2}}; "
+            "border-radius: 3px; color: {{color.text.primary}}; font-family: monospace; "
+            "font-size: 11px; padding: 3px 6px; }");
+        auto tokenLoaded = std::make_shared<bool>(false);
+        AutomationBridgeSettings::loadToken(this,
+            [tokenEdit, tokenLoaded](const QString& tok) {
+                tokenEdit->setText(tok);
+                tokenEdit->setPlaceholderText(
+                    "(none — enable the bridge or click Rotate)");
+                *tokenLoaded = true;
+            });
+
+        // Agent automation bridge (#3646) — the endpoint MCP clients (AI
+        // coding assistants) connect to for validating changes against the
+        // running app. Off by default; the operator opts in here. The
+        // AETHER_AUTOMATION launch env var still force-enables it regardless
+        // of this toggle (headless/CI path), so we reflect either source.
+        {
+            grid->addWidget(new QLabel("Agent Automation (MCP):"), 1, 0);
+            const bool bridgeOn = AutomationBridgeSettings::enabled()
+                || qEnvironmentVariableIsSet("AETHER_AUTOMATION");
+            auto* mcpBtn = new QPushButton(bridgeOn ? "Enabled" : "Disabled");
+            mcpBtn->setCheckable(true);
+            mcpBtn->setChecked(bridgeOn);
+            AetherSDR::ThemeManager::instance().applyStyleSheet(mcpBtn, "QPushButton { background: {{color.background.1}}; border: 1px solid {{color.background.2}}; "
+                "border-radius: 3px; color: {{color.text.primary}}; font-size: 11px; font-weight: bold; "
+                "padding: 3px 10px; }"
+                "QPushButton:checked { background: #1a5030; color: {{color.accent.success}}; "
+                "border: 1px solid #20a040; }");
+            mcpBtn->setToolTip(
+                "Enable the in-app automation bridge so an AI coding assistant "
+                "(via the MCP server, tools/aether_mcp.py) can introspect and\n"
+                "drive this app to validate changes. Off by default. Transmit-"
+                "keying controls stay blocked unless the app is launched with\n"
+                "AETHER_AUTOMATION_ALLOW_TX. See docs/automation-bridge.md.");
+            // Env-var force-enable wins and can't be turned off from the UI —
+            // make that visible rather than letting a toggle silently no-op.
+            if (qEnvironmentVariableIsSet("AETHER_AUTOMATION")) {
+                mcpBtn->setEnabled(false);
+                mcpBtn->setToolTip(mcpBtn->toolTip()
+                    + "\n\nForced on by the AETHER_AUTOMATION launch environment variable.");
+            }
+            connect(mcpBtn, &QPushButton::toggled, this,
+                    [this, mcpBtn, tokenEdit, genToken, tokenLoaded](bool on) {
+                mcpBtn->setText(on ? "Enabled" : "Disabled");
+                AutomationBridgeSettings::setEnabled(on);
+                // Enabling with no token yet → mint one so the bridge is never
+                // exposed without auth. Only when the async token read has
+                // landed (tokenLoaded) so we can't clobber an existing token.
+                if (on && *tokenLoaded && tokenEdit->text().isEmpty()) {
+                    const QString tok = genToken();
+                    tokenEdit->setText(tok);
+                    AutomationBridgeSettings::saveToken(tok);
+                    QGuiApplication::clipboard()->setText(tok);
+                    emit automationBridgeTokenRotated(tok);
+                }
+                emit automationBridgeToggled(on);
+            });
+            grid->addWidget(mcpBtn, 1, 1);
+        }
+
+        // Access token row — display the shared secret with Copy + Rotate.
+        // Rotate makes a new token and applies it immediately, locking out any
+        // client still using the old one.
+        {
+            grid->addWidget(new QLabel("Access Token:"), 2, 0);
+            auto* tokenRow = new QWidget;
+            auto* tokLay = new QHBoxLayout(tokenRow);
+            tokLay->setContentsMargins(0, 0, 0, 0);
+            tokLay->setSpacing(6);
+
+            auto* copyBtn = new QPushButton("Copy");
+            auto* rotateBtn = new QPushButton("Rotate");
+            for (auto* b : {copyBtn, rotateBtn})
+                AetherSDR::ThemeManager::instance().applyStyleSheet(b,
+                    "QPushButton { background: {{color.background.1}}; border: 1px solid {{color.background.2}}; "
+                    "border-radius: 3px; color: {{color.text.primary}}; font-size: 11px; "
+                    "padding: 3px 10px; }");
+            copyBtn->setToolTip("Copy the token to the clipboard.");
+            rotateBtn->setToolTip(
+                "Generate a new token and apply it immediately. Any client still\n"
+                "using the old token is locked out until you update its config.");
+
+            connect(copyBtn, &QPushButton::clicked, this, [tokenEdit]() {
+                if (!tokenEdit->text().isEmpty())
+                    QGuiApplication::clipboard()->setText(tokenEdit->text());
+            });
+            connect(rotateBtn, &QPushButton::clicked, this,
+                    [this, tokenEdit, genToken]() {
+                const QString tok = genToken();
+                tokenEdit->setText(tok);
+                AutomationBridgeSettings::saveToken(tok);
+                QGuiApplication::clipboard()->setText(tok);
+                emit automationBridgeTokenRotated(tok);
+            });
+
+            tokLay->addWidget(tokenEdit, 1);
+            tokLay->addWidget(copyBtn);
+            tokLay->addWidget(rotateBtn);
+            grid->addWidget(tokenRow, 2, 1);
+        }
+
+        // Allow TX via MCP — the transmit-keying guard. Off by default; the
+        // bridge refuses MOX/PTT/TUNE/ATU/CWX unless this (or the
+        // AETHER_AUTOMATION_ALLOW_TX env var) is set. Checking the box the
+        // first time raises a confirmation with the operator-responsibility
+        // warning; once confirmed the choice persists and is not re-prompted.
+        {
+            grid->addWidget(new QLabel("Allow TX via MCP:"), 3, 0);
+            auto* txCheck = new QCheckBox("Enable transmit control");
+            const bool envForcesTx = qEnvironmentVariableIsSet("AETHER_AUTOMATION_ALLOW_TX");
+            const bool envBlocksTx = qEnvironmentVariableIsSet("AETHER_AUTOMATION_NO_TX");
+            txCheck->setChecked(!envBlocksTx
+                                && (AutomationBridgeSettings::txAllowed() || envForcesTx));
+            txCheck->setToolTip(
+                "Let an MCP client key the transmitter (MOX/PTT/TUNE/ATU/CWX).\n"
+                "OFF by default — the bridge blocks all transmit-keying otherwise.\n"
+                "Bridge-originated TX is limited by a force-unkey watchdog. You are\n"
+                "responsible for anything transmitted. See docs/automation-bridge.md.");
+            AetherSDR::ThemeManager::instance().applyStyleSheet(txCheck,
+                "QCheckBox { color: {{color.text.primary}}; font-size: 11px; }"
+                "QCheckBox::indicator { width: 14px; height: 14px; }");
+            if (envBlocksTx) {
+                txCheck->setEnabled(false);
+                txCheck->setToolTip(txCheck->toolTip()
+                    + "\n\nPinned off by the AETHER_AUTOMATION_NO_TX launch variable.");
+            } else if (envForcesTx) {
+                txCheck->setEnabled(false);
+                txCheck->setToolTip(txCheck->toolTip()
+                    + "\n\nForced on by the AETHER_AUTOMATION_ALLOW_TX launch variable.");
+            }
+            connect(txCheck, &QCheckBox::toggled, this, [this, txCheck](bool on) {
+                if (on && !AutomationBridgeSettings::txAck()) {
+                    // First-time enable → confirm. Operator must acknowledge.
+                    QMessageBox box(this);
+                    box.setIcon(QMessageBox::Warning);
+                    box.setWindowTitle("Allow TX via MCP?");
+                    box.setText("Allow an AI assistant / MCP client to key the transmitter?");
+                    box.setInformativeText(
+                        "This lets any MCP client holding the access token drive "
+                        "transmit-keying controls — MOX/PTT, TUNE, the ATU, and CWX "
+                        "send — on your radio. Automated software will be able to put "
+                        "a signal on the air.\n\n"
+                        "A force-unkey watchdog limits bridge-originated TX, but it is "
+                        "a backstop, not a guarantee. You, the operator, are "
+                        "ultimately responsible for all transmissions from your station "
+                        "— including their content, timing, frequency, power, and "
+                        "compliance with your license and local regulations.\n\n"
+                        "Only enable this if you understand and accept that "
+                        "responsibility. You can turn it off again at any time.");
+                    auto* confirm = box.addButton("Confirm — allow TX", QMessageBox::AcceptRole);
+                    box.addButton("Cancel", QMessageBox::RejectRole);
+                    box.setDefaultButton(qobject_cast<QPushButton*>(box.buttons().value(1)));
+                    box.exec();
+                    if (box.clickedButton() != confirm) {
+                        // Cancelled — revert without persisting or emitting.
+                        QSignalBlocker blocker(txCheck);
+                        txCheck->setChecked(false);
+                        return;
+                    }
+                    // Confirmed — remember the acknowledgement so we never
+                    // prompt again on a future enable.
+                    AutomationBridgeSettings::setTxAck(true);
+                }
+                AutomationBridgeSettings::setTxAllowed(on);
+                emit automationBridgeTxAllowedChanged(on);
+            });
+            grid->addWidget(txCheck, 3, 1);
+        }
+
+        // Observe only — the read-only gate (#4188 area 6). When checked, the
+        // bridge refuses every mutating verb (set/invoke/connect/tune/capture…)
+        // and answers only pure-introspection reads. Enforced in the bridge, so
+        // no MCP client can flip it off. Lets the operator start the app, arm
+        // observe-only, then start the MCP server for a look-but-don't-touch
+        // session. An env override (AETHER_AUTOMATION_READONLY) pins it for
+        // headless/CI runs.
+        {
+            grid->addWidget(new QLabel("Observe only:"), 4, 0);
+            auto* roCheck = new QCheckBox("Read-only (block all driving)");
+            roCheck->setObjectName(QStringLiteral("automationReadOnlyCheck"));
+            const bool envForcesRo = qEnvironmentVariableIsSet("AETHER_AUTOMATION_READONLY");
+            roCheck->setChecked(AutomationBridgeSettings::readOnly() || envForcesRo);
+            roCheck->setToolTip(
+                "Make the bridge observe-only: MCP clients can read state\n"
+                "(ping/whoami/get/dumpTree/grab, read-only log and streams\n"
+                "actions, floors, and hitTest)\n"
+                "but every mutating verb is refused. Enforced in the app, so a\n"
+                "client cannot bypass it. Toggle takes effect immediately on the\n"
+                "running bridge. See docs/automation-bridge.md.");
+            AetherSDR::ThemeManager::instance().applyStyleSheet(roCheck,
+                "QCheckBox { color: {{color.text.primary}}; font-size: 11px; }"
+                "QCheckBox::indicator { width: 14px; height: 14px; }");
+            if (envForcesRo) {
+                roCheck->setEnabled(false);
+                roCheck->setToolTip(roCheck->toolTip()
+                    + "\n\nForced on by the AETHER_AUTOMATION_READONLY launch variable.");
+            }
+            connect(roCheck, &QCheckBox::toggled, this, [this](bool on) {
+                AutomationBridgeSettings::setReadOnly(on);
+                emit automationBridgeReadOnlyChanged(on);
+            });
+            grid->addWidget(roCheck, 4, 1);
+        }
+
+        grid->addWidget(new QLabel("Network MTU:"), 5, 0);
         auto* mtuSpin = new QSpinBox;
         mtuSpin->setRange(576, 9000);
         mtuSpin->setValue(AppSettings::instance().value("NetworkMtu", "1450").toInt());
@@ -1212,7 +1760,7 @@ QWidget* RadioSetupDialog::buildNetworkTab()
             AppSettings::instance().setValue("NetworkMtu", QString::number(val));
             AppSettings::instance().save();
         });
-        grid->addWidget(mtuSpin, 1, 1);
+        grid->addWidget(mtuSpin, 5, 1);
 
         // VITA-49 UDP receive buffer (SO_RCVBUF). Snap-to-preset slider; the
         // kernel clamps the grant at net.core.rmem_max, so we show the granted
@@ -1229,7 +1777,7 @@ QWidget* RadioSetupDialog::buildNetworkTab()
             return QStringLiteral("%1 KB").arg(b / 1024);
         };
 
-        grid->addWidget(new QLabel("VITA-49 RX buffer:"), 2, 0);
+        grid->addWidget(new QLabel("VITA-49 RX buffer:"), 6, 0);
         auto* bufRow = new QWidget;
         auto* bufLay = new QHBoxLayout(bufRow);
         bufLay->setContentsMargins(0, 0, 0, 0);
@@ -1257,7 +1805,7 @@ QWidget* RadioSetupDialog::buildNetworkTab()
         bufValLabel->setMinimumWidth(48);
         bufLay->addWidget(bufSlider, 1);
         bufLay->addWidget(bufValLabel);
-        grid->addWidget(bufRow, 2, 1);
+        grid->addWidget(bufRow, 6, 1);
 
         auto* bufGrantedLabel = new QLabel;
         if (m_model && m_model->panStream()) {
@@ -1265,7 +1813,7 @@ QWidget* RadioSetupDialog::buildNetworkTab()
             bufGrantedLabel->setText(g > 0 ? QString("granted: %1").arg(fmtBytes(g))
                                            : QStringLiteral("granted: — (applies on connect)"));
         }
-        grid->addWidget(bufGrantedLabel, 3, 1);
+        grid->addWidget(bufGrantedLabel, 7, 1);
 
         connect(bufSlider, &QSlider::valueChanged, this,
                 [this, bufValLabel, fmtBytes](int idx) {
@@ -1623,7 +2171,7 @@ QWidget* RadioSetupDialog::buildTxTab()
         auto* swLbl = new QLabel("Show TX in Waterfall:");
         swLbl->setStyleSheet(kLabelStyle);
         grid->addWidget(swLbl, 1, 0);
-        auto* swBtn = new QPushButton("Enabled");
+        auto* swBtn = new QPushButton(tx.showTxInWaterfall() ? "Enabled" : "Disabled");
         swBtn->setCheckable(true);
         swBtn->setChecked(tx.showTxInWaterfall());
         AetherSDR::ThemeManager::instance().applyStyleSheet(swBtn, "QPushButton { background: {{color.background.1}}; border: 1px solid {{color.background.2}}; "
@@ -1631,7 +2179,8 @@ QWidget* RadioSetupDialog::buildTxTab()
             "padding: 3px 10px; }"
             "QPushButton:checked { background: #1a5030; color: {{color.accent.success}}; "
             "border: 1px solid #20a040; }");
-        connect(swBtn, &QPushButton::toggled, this, [this](bool on) {
+        connect(swBtn, &QPushButton::toggled, this, [this, swBtn](bool on) {
+            swBtn->setText(on ? "Enabled" : "Disabled");
             m_model->sendCommand(
                 QString("transmit set show_tx_in_waterfall=%1").arg(on ? 1 : 0));
         });
@@ -1756,8 +2305,9 @@ QWidget* RadioSetupDialog::buildPhoneCwTab()
         connect(boostBtn, &QPushButton::toggled, this, [this](bool on) {
             m_model->transmitModel().setMicBoost(on);
         });
-        auto* metBtn = mkTogBtn("Enabled", tx.metInRx());
-        connect(metBtn, &QPushButton::toggled, this, [this](bool on) {
+        auto* metBtn = mkTogBtn(tx.metInRx() ? "Enabled" : "Disabled", tx.metInRx());
+        connect(metBtn, &QPushButton::toggled, this, [this, metBtn](bool on) {
+            metBtn->setText(on ? "Enabled" : "Disabled");
             m_model->sendCommand(QString("transmit set met_in_rx=%1").arg(on ? 1 : 0));
         });
 
@@ -1779,8 +2329,9 @@ QWidget* RadioSetupDialog::buildPhoneCwTab()
         auto* iamLbl = new QLabel("Iambic:");
         iamLbl->setStyleSheet(kLabelStyle);
         grid->addWidget(iamLbl, 0, 0);
-        auto* iamBtn = mkTogBtn("Enabled", tx.cwIambic());
-        connect(iamBtn, &QPushButton::toggled, this, [this](bool on) {
+        auto* iamBtn = mkTogBtn(tx.cwIambic() ? "Enabled" : "Disabled", tx.cwIambic());
+        connect(iamBtn, &QPushButton::toggled, this, [this, iamBtn](bool on) {
+            iamBtn->setText(on ? "Enabled" : "Disabled");
             m_model->sendCommand(QString("cw iambic %1").arg(on ? 1 : 0));
         });
         grid->addWidget(iamBtn, 0, 1);
@@ -2170,11 +2721,12 @@ QWidget* RadioSetupDialog::buildRxTab()
             auto* lbl = new QLabel(label);
             lbl->setStyleSheet(kLabelStyle);
             grid->addWidget(lbl, row, 0);
-            auto* btn = new QPushButton("Enabled");
+            auto* btn = new QPushButton(checked ? "Enabled" : "Disabled");
             btn->setCheckable(true);
             btn->setChecked(checked);
             btn->setStyleSheet(kTogStyle);
-            connect(btn, &QPushButton::toggled, this, [this, cmd](bool on) {
+            connect(btn, &QPushButton::toggled, this, [this, cmd, btn](bool on) {
+                btn->setText(on ? "Enabled" : "Disabled");
                 m_model->sendCommand(
                     QString("%1=%2").arg(cmd).arg(on ? 1 : 0));
             });
@@ -2359,7 +2911,9 @@ QWidget* RadioSetupDialog::buildAudioTab()
     {
         auto* plcCheck = new QCheckBox(
             "Smooth packet loss (conceal dropped audio packets)");
-        AetherSDR::ThemeManager::instance().applyStyleSheet(plcCheck, "QCheckBox { color: {{color.text.primary}}; font-size: 11px; }");
+        AetherSDR::ThemeManager::instance().applyStyleSheet(plcCheck,
+            "QCheckBox { color: {{color.text.primary}}; font-size: 11px; spacing: 8px; }"
+            + kCheckBoxIndicator);
         plcCheck->setToolTip(
             "When the radio's audio stream loses a UDP packet, fade the gap\n"
             "to silence (uncompressed) or synthesize a perceptually smooth\n"
@@ -2392,7 +2946,9 @@ QWidget* RadioSetupDialog::buildAudioTab()
     // ── Prevent Sleep ───────────────────────────────────────────────────
     {
         auto* sleepCheck = new QCheckBox("Prevent system sleep while connected");
-        AetherSDR::ThemeManager::instance().applyStyleSheet(sleepCheck, "QCheckBox { color: {{color.text.primary}}; font-size: 11px; }");
+        AetherSDR::ThemeManager::instance().applyStyleSheet(sleepCheck,
+            "QCheckBox { color: {{color.text.primary}}; font-size: 11px; spacing: 8px; }"
+            + kCheckBoxIndicator);
         sleepCheck->setToolTip("Hold a system power assertion to prevent idle sleep\n"
                                "while connected to a radio. Keeps TCP/UDP/audio\n"
                                "streams alive during long sessions.");
@@ -2449,7 +3005,9 @@ QWidget* RadioSetupDialog::buildAudioTab()
     pcLayout->addLayout(outRow);
 
     auto* promptCheck = new QCheckBox("Prompt on Audio Device Changes");
-    AetherSDR::ThemeManager::instance().applyStyleSheet(promptCheck, "QCheckBox { color: {{color.text.primary}}; font-size: 11px; }");
+    AetherSDR::ThemeManager::instance().applyStyleSheet(promptCheck,
+        "QCheckBox { color: {{color.text.primary}}; font-size: 11px; spacing: 8px; }"
+        + kCheckBoxIndicator);
     promptCheck->setToolTip("Show the Audio Device Detected dialog when a new PC audio device appears.");
     const bool suppressAudioDeviceNotifications =
         AppSettings::instance()
@@ -2495,7 +3053,7 @@ QWidget* RadioSetupDialog::buildAudioTab()
         boostLabel->setStyleSheet(kLabelStyle);
         boostLabel->setFixedWidth(90);
         bool boostOn = AppSettings::instance().value("AudioBoost", "False").toString() == "True";
-        auto* boostBtn = new QPushButton("Enabled");
+        auto* boostBtn = new QPushButton(boostOn ? "Enabled" : "Disabled");
         boostBtn->setCheckable(true);
         boostBtn->setChecked(boostOn);
         boostBtn->setToolTip("Apply 50% software gain boost to PC audio output.\n"
@@ -2505,7 +3063,8 @@ QWidget* RadioSetupDialog::buildAudioTab()
             "padding: 3px 10px; }"
             "QPushButton:checked { background: #1a5030; color: {{color.accent.success}}; "
             "border: 1px solid #20a040; }");
-        connect(boostBtn, &QPushButton::toggled, this, [this](bool on) {
+        connect(boostBtn, &QPushButton::toggled, this, [this, boostBtn](bool on) {
+            boostBtn->setText(on ? "Enabled" : "Disabled");
             auto& s = AppSettings::instance();
             s.setValue("AudioBoost", on ? "True" : "False");
             s.save();
@@ -2647,7 +3206,9 @@ QWidget* RadioSetupDialog::buildAudioTab()
         // Auto-record on TX
         auto* autoRow = new QHBoxLayout;
         auto* autoCheck = new QCheckBox("Auto-record on TX");
-        AetherSDR::ThemeManager::instance().applyStyleSheet(autoCheck, "QCheckBox { color: {{color.text.primary}}; }");
+        AetherSDR::ThemeManager::instance().applyStyleSheet(autoCheck,
+            "QCheckBox { color: {{color.text.primary}}; spacing: 8px; }"
+            + kCheckBoxIndicator);
         autoCheck->setChecked(settings.value("QsoRecordingAutoRecord", "False").toString() == "True");
         connect(autoCheck, &QCheckBox::toggled, this, [](bool on) {
             auto& s = AppSettings::instance();
@@ -2790,10 +3351,9 @@ QWidget* RadioSetupDialog::buildFiltersTab()
 
         auto* chk = new QCheckBox("Use Low Latency Filters for Digital Modes");
         chk->setChecked(m_model->lowLatencyDigital());
-        AetherSDR::ThemeManager::instance().applyStyleSheet(chk, "QCheckBox { color: {{color.text.primary}}; font-size: 12px; spacing: 8px; }"
-            "QCheckBox::indicator { width: 16px; height: 16px; "
-            "border: 2px solid {{color.background.3}}; border-radius: 3px; background: {{color.background.0}}; }"
-            "QCheckBox::indicator:checked { background: {{color.background.2}}; border: 2px solid #00a0e0; }");
+        AetherSDR::ThemeManager::instance().applyStyleSheet(chk,
+            "QCheckBox { color: {{color.text.primary}}; font-size: 12px; spacing: 8px; }"
+            + kCheckBoxIndicator);
         connect(chk, &QCheckBox::toggled, this, [this](bool on) {
             m_model->sendCommand(
                 QString("radio set low_latency_digital_modes=%1").arg(on ? 1 : 0));
@@ -2865,7 +3425,7 @@ QWidget* RadioSetupDialog::buildXvtrTab()
         auto* rxOnlyLbl = new QLabel("RX Only:");
         rxOnlyLbl->setStyleSheet(kLabelStyle);
         grid->addWidget(rxOnlyLbl, 3, 2);
-        auto* rxOnlyBtn = new QPushButton("Enabled");
+        auto* rxOnlyBtn = new QPushButton(x.rxOnly ? "Enabled" : "Disabled");
         rxOnlyBtn->setCheckable(true);
         rxOnlyBtn->setChecked(x.rxOnly);
         AetherSDR::ThemeManager::instance().applyStyleSheet(rxOnlyBtn, "QPushButton { background: {{color.background.1}}; border: 1px solid {{color.background.2}}; "
@@ -2873,7 +3433,8 @@ QWidget* RadioSetupDialog::buildXvtrTab()
             "padding: 3px 10px; }"
             "QPushButton:checked { background: #1a5030; color: {{color.accent.success}}; "
             "border: 1px solid #20a040; }");
-        connect(rxOnlyBtn, &QPushButton::toggled, this, [this, idx](bool on) {
+        connect(rxOnlyBtn, &QPushButton::toggled, this, [this, idx, rxOnlyBtn](bool on) {
+            rxOnlyBtn->setText(on ? "Enabled" : "Disabled");
             m_model->sendCommand(
                 QString("xvtr set %1 rx_only=%2").arg(idx).arg(on ? 1 : 0));
         });
@@ -2982,7 +3543,7 @@ QWidget* RadioSetupDialog::buildXvtrTab()
         "QPushButton:hover { background: {{color.background.1}}; }");
     connect(addBtn, &QPushButton::clicked, this, [this, xvtrTabs, buildXvtrPage] {
         m_model->sendCmdPublic("xvtr create",
-            [this, xvtrTabs, buildXvtrPage](int code, const QString& body) {
+            [this, xvtrTabs, buildXvtrPage](int code, const QString& /* body */) {
                 if (code != 0) return;
                 // Wait briefly for the radio's status update to arrive
                 QTimer::singleShot(300, this, [this, xvtrTabs, buildXvtrPage] {
@@ -3057,12 +3618,74 @@ QWidget* RadioSetupDialog::buildAntennaNamesTab()
     vbox->addWidget(group, 1);
 
     QVBoxLayout* kiwiRowsLayout = nullptr;
+    QVBoxLayout* kiwiLayout = nullptr;
+
+#ifdef HAVE_KEYCHAIN
+    const QString kiwiPasswordHelpText =
+        QStringLiteral("Configure receive-only KiwiSDR servers. Passwords "
+                       "are saved separately for each receiver in the "
+                       "operating system credential store when available. "
+                       "The status below each password confirms the result.");
+    const QString kiwiPasswordDescription =
+        QStringLiteral("Optional password for this KiwiSDR receiver. Type "
+                       "over the current value to replace it; the storage "
+                       "status below confirms whether the operating system "
+                       "credential store accepted it.");
+#else
+    const QString kiwiPasswordHelpText =
+        QStringLiteral("Configure receive-only KiwiSDR servers. This build "
+                       "keeps passwords only for the current session.");
+    const QString kiwiPasswordDescription =
+        QStringLiteral("Optional password for this KiwiSDR receiver. This "
+                       "build keeps it only for the current session.");
+#endif
 
     if (m_kiwiSdrManager) {
         auto* kiwiGroup = new QGroupBox("KiwiSDR RX Antennas");
         kiwiGroup->setStyleSheet(kGroupStyle);
-        auto* kiwiLayout = new QVBoxLayout(kiwiGroup);
+        kiwiLayout = new QVBoxLayout(kiwiGroup);
         kiwiLayout->setSpacing(6);
+
+        auto* kiwiHelp = new QLabel(
+            kiwiPasswordHelpText);
+        kiwiHelp->setWordWrap(true);
+        kiwiHelp->setAccessibleName("KiwiSDR receiver configuration help");
+        AetherSDR::ThemeManager::instance().applyStyleSheet(
+            kiwiHelp,
+            "QLabel { color: {{color.text.secondary}}; font-size: 11px; "
+            "padding: 0 4px 4px 4px; }");
+        kiwiLayout->addWidget(kiwiHelp);
+
+        auto* kiwiCredentialNotice = new QLabel;
+        kiwiCredentialNotice->setWordWrap(true);
+        kiwiCredentialNotice->setAccessibleName(
+            "KiwiSDR credential storage notice");
+        kiwiCredentialNotice->setVisible(false);
+        AetherSDR::ThemeManager::instance().applyStyleSheet(
+            kiwiCredentialNotice,
+            "QLabel { color: {{color.accent.danger}}; font-size: 11px; "
+            "padding: 4px; }");
+        kiwiLayout->addWidget(kiwiCredentialNotice);
+        connect(
+            m_kiwiSdrManager,
+            &KiwiSdrManager::profilePasswordPersistenceChanged,
+            kiwiCredentialNotice,
+            [kiwiCredentialNotice](
+                const QString& id, KiwiSdrPasswordPersistenceState state,
+                const QString& detail) {
+                if (state != KiwiSdrPasswordPersistenceState::Error) {
+                    if (kiwiCredentialNotice->property("profileId").toString()
+                        == id) {
+                        kiwiCredentialNotice->clear();
+                        kiwiCredentialNotice->setVisible(false);
+                    }
+                    return;
+                }
+                kiwiCredentialNotice->setProperty("profileId", id);
+                kiwiCredentialNotice->setText(detail);
+                kiwiCredentialNotice->setAccessibleDescription(detail);
+                kiwiCredentialNotice->setVisible(true);
+            });
 
         auto* kiwiScroll = new QScrollArea;
         kiwiScroll->setWidgetResizable(true);
@@ -3082,6 +3705,7 @@ QWidget* RadioSetupDialog::buildAntennaNamesTab()
         kiwiRowsLayout->setAlignment(Qt::AlignTop);
         kiwiScroll->setWidget(kiwiRowsWidget);
         kiwiLayout->addWidget(kiwiScroll);
+
         vbox->addWidget(kiwiGroup, 0);
     }
 
@@ -3269,7 +3893,8 @@ QWidget* RadioSetupDialog::buildAntennaNamesTab()
         };
 
         *refreshKiwi = [this, kiwiRowsLayout, stateText, styleKiwiEdit,
-                        styleKiwiButton, styleKiwiIconButton] {
+                        styleKiwiButton, styleKiwiIconButton,
+                        kiwiPasswordDescription] {
             while (QLayoutItem* item = kiwiRowsLayout->takeAt(0)) {
                 if (QWidget* widget = item->widget()) {
                     widget->deleteLater();
@@ -3279,54 +3904,244 @@ QWidget* RadioSetupDialog::buildAntennaNamesTab()
 
             const QVector<KiwiSdrAntennaProfile> profiles =
                 m_kiwiSdrManager->profiles();
-            for (int row = 0; row < profiles.size(); ++row) {
-                const KiwiSdrAntennaProfile profile = profiles[row];
+            auto addSectionHeader = [kiwiRowsLayout](const QString& text) {
+                auto* header = new QLabel(text);
+                AetherSDR::ThemeManager::instance().applyStyleSheet(
+                    header,
+                    "QLabel { color: {{color.accent.bright}}; font-size: 11px; "
+                    "font-weight: bold; padding: 4px 2px 1px 2px; }");
+                kiwiRowsLayout->addWidget(header);
+            };
+            auto addFieldLabel = [](QGridLayout* layout, const QString& text,
+                                    int column) {
+                auto* label = new QLabel(text);
+                AetherSDR::ThemeManager::instance().applyStyleSheet(
+                    label,
+                    "QLabel { color: {{color.text.secondary}}; font-size: 10px; "
+                    "font-weight: bold; }");
+                layout->addWidget(label, 1, column);
+            };
+            auto passwordPersistenceText = [](KiwiSdrPasswordPersistenceState state,
+                                              const QString& detail) {
+                switch (state) {
+                case KiwiSdrPasswordPersistenceState::Loading:
+                    return QStringLiteral("Loading secure password…");
+                case KiwiSdrPasswordPersistenceState::NoPassword:
+                    return QStringLiteral("No password stored");
+                case KiwiSdrPasswordPersistenceState::Saving:
+                    return QStringLiteral("Saving securely…");
+                case KiwiSdrPasswordPersistenceState::Stored:
+                    return QStringLiteral("Stored securely");
+                case KiwiSdrPasswordPersistenceState::SessionOnly:
+                    return QStringLiteral("Current session only");
+                case KiwiSdrPasswordPersistenceState::Error:
+                    return detail.isEmpty()
+                        ? QStringLiteral("Password was not stored")
+                        : detail;
+                }
+                return QString();
+            };
+
+            addSectionHeader("CONFIGURED RECEIVERS");
+            if (profiles.isEmpty()) {
+                auto* empty = new QLabel("No KiwiSDR receivers configured.");
+                empty->setAccessibleName("No configured KiwiSDR receivers");
+                AetherSDR::ThemeManager::instance().applyStyleSheet(
+                    empty,
+                    "QLabel { color: {{color.text.label}}; font-size: 12px; "
+                    "padding: 8px; }");
+                kiwiRowsLayout->addWidget(empty);
+            }
+
+            for (const KiwiSdrAntennaProfile& profile : profiles) {
 
                 auto* rowFrame = new QFrame;
                 rowFrame->setObjectName("kiwiAntennaRow");
+                rowFrame->setAccessibleName(
+                    QStringLiteral("KiwiSDR receiver %1").arg(profile.name));
                 rowFrame->setStyleSheet(kKiwiRowStyle);
                 auto* rowLayout = new QGridLayout(rowFrame);
-                rowLayout->setContentsMargins(6, 5, 6, 5);
-                rowLayout->setHorizontalSpacing(6);
-                rowLayout->setVerticalSpacing(3);
+                rowLayout->setContentsMargins(10, 8, 10, 8);
+                rowLayout->setHorizontalSpacing(8);
+                rowLayout->setVerticalSpacing(4);
                 rowLayout->setColumnStretch(0, 1);
+                rowLayout->setColumnStretch(1, 1);
+                rowLayout->setColumnStretch(2, 1);
+
+                auto* title = new QLabel(profile.name);
+                title->setAccessibleName("KiwiSDR receiver name");
+                AetherSDR::ThemeManager::instance().applyStyleSheet(
+                    title,
+                    "QLabel { color: {{color.text.primary}}; font-size: 14px; "
+                    "font-weight: bold; }");
+                rowLayout->addWidget(title, 0, 0, 1, 2);
+
+                const KiwiSdrClient::State kiwiState =
+                    m_kiwiSdrManager->state(profile.id);
+                auto* status = new QLabel(stateText(profile.id));
+                status->setAccessibleName("KiwiSDR antenna status");
+                status->setAccessibleDescription(status->text());
+                QString statusColor = QStringLiteral("{{color.text.secondary}}");
+                if (kiwiState == KiwiSdrClient::State::Connected
+                    || kiwiState == KiwiSdrClient::State::Camping) {
+                    statusColor = QStringLiteral("{{color.accent.success}}");
+                } else if (kiwiState == KiwiSdrClient::State::Error) {
+                    statusColor = QStringLiteral("{{color.accent.danger}}");
+                } else if (kiwiState == KiwiSdrClient::State::Connecting
+                           || kiwiState == KiwiSdrClient::State::Waiting) {
+                    statusColor = QStringLiteral("{{color.accent.bright}}");
+                }
+                AetherSDR::ThemeManager::instance().applyStyleSheet(
+                    status,
+                    QStringLiteral("QLabel { color: %1; font-size: 12px; "
+                                   "padding-left: 6px; }")
+                        .arg(statusColor));
+                status->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+                status->setWordWrap(true);
+                status->setToolTip(status->text());
+                rowLayout->addWidget(status, 0, 2, 1, 2);
+
+                addFieldLabel(rowLayout, "NAME", 0);
+                addFieldLabel(rowLayout, "SERVER", 1);
+                addFieldLabel(rowLayout, "PASSWORD", 2);
 
                 auto* nameEdit = new QLineEdit(profile.name);
                 nameEdit->setMaxLength(16);
-                nameEdit->setPlaceholderText("Custom Name");
                 nameEdit->setAccessibleName("KiwiSDR antenna name");
                 nameEdit->setAccessibleDescription(
                     "Required display name for this KiwiSDR receive antenna.");
                 styleKiwiEdit(nameEdit);
-                rowLayout->addWidget(nameEdit, 0, 0);
-
-                auto* status = new QLabel(stateText(profile.id));
-                status->setAccessibleName("KiwiSDR antenna status");
-                status->setAccessibleDescription(status->text());
-                status->setStyleSheet(
-                    "QLabel { color: #c8d8e8; font-size: 12px; padding-left: 6px; }");
-                status->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
-                status->setWordWrap(true);
-                status->setToolTip(status->text());
-                rowLayout->addWidget(status, 0, 1, 1, 3);
+                rowLayout->addWidget(nameEdit, 2, 0);
 
                 auto* endpointEdit = new QLineEdit(profile.endpoint);
                 endpointEdit->setAccessibleName("KiwiSDR server");
                 endpointEdit->setAccessibleDescription(
                     "Hostname or hostname:port for this KiwiSDR endpoint.");
                 styleKiwiEdit(endpointEdit);
-                rowLayout->addWidget(endpointEdit, 1, 0);
+                rowLayout->addWidget(endpointEdit, 2, 1);
+
+                auto* passwordEdit = new QLineEdit(
+                    m_kiwiSdrManager->profilePassword(profile.id));
+                passwordEdit->setEchoMode(QLineEdit::Password);
+                passwordEdit->setMaxLength(256);
+                passwordEdit->setObjectName(
+                    QStringLiteral("kiwiPassword_%1").arg(profile.id));
+                passwordEdit->setAccessibleName("KiwiSDR password");
+                passwordEdit->setAccessibleDescription(
+                    kiwiPasswordDescription);
+                if (!m_kiwiSdrManager->isProfilePasswordLoaded(profile.id)) {
+                    passwordEdit->setPlaceholderText("Loading secure password…");
+                    passwordEdit->setEnabled(false);
+                }
+                styleKiwiEdit(passwordEdit);
+                rowLayout->addWidget(passwordEdit, 2, 2, 1, 2);
+
+                const KiwiSdrPasswordPersistenceState persistenceState =
+                    m_kiwiSdrManager->profilePasswordPersistenceState(
+                        profile.id);
+                auto* passwordStatus = new QLabel(passwordPersistenceText(
+                    persistenceState,
+                    m_kiwiSdrManager->profilePasswordPersistenceDetail(
+                        profile.id)));
+                passwordStatus->setObjectName(
+                    QStringLiteral("kiwiPasswordStatus_%1").arg(profile.id));
+                passwordStatus->setAccessibleName(
+                    "KiwiSDR password storage status");
+                passwordStatus->setAccessibleDescription(
+                    passwordStatus->text());
+                passwordStatus->setWordWrap(true);
+                AetherSDR::ThemeManager::instance().applyStyleSheet(
+                    passwordStatus,
+                    persistenceState == KiwiSdrPasswordPersistenceState::Error
+                        ? "QLabel { color: {{color.accent.danger}}; "
+                          "font-size: 10px; padding: 0 2px; }"
+                        : "QLabel { color: {{color.text.secondary}}; "
+                          "font-size: 10px; padding: 0 2px; }");
+                rowLayout->addWidget(passwordStatus, 3, 2, 1, 2);
+                connect(
+                    m_kiwiSdrManager,
+                    &KiwiSdrManager::profilePasswordChanged,
+                    passwordEdit,
+                    [manager = m_kiwiSdrManager, profileId = profile.id,
+                     passwordEdit](const QString& changedId) {
+                        if (changedId != profileId) {
+                            return;
+                        }
+                        const QSignalBlocker blocker(passwordEdit);
+                        passwordEdit->setText(
+                            manager->profilePassword(profileId));
+                        passwordEdit->setPlaceholderText(QString());
+                        passwordEdit->setEnabled(true);
+                    });
+                connect(
+                    m_kiwiSdrManager,
+                    &KiwiSdrManager::profilePasswordPersistenceChanged,
+                    passwordStatus,
+                    [profileId = profile.id, passwordStatus,
+                     passwordPersistenceText](
+                        const QString& changedId,
+                        KiwiSdrPasswordPersistenceState state,
+                        const QString& detail) {
+                        if (changedId != profileId) {
+                            return;
+                        }
+                        const QString text =
+                            passwordPersistenceText(state, detail);
+                        passwordStatus->setText(text);
+                        passwordStatus->setAccessibleDescription(text);
+                        AetherSDR::ThemeManager::instance().applyStyleSheet(
+                            passwordStatus,
+                            state == KiwiSdrPasswordPersistenceState::Error
+                                ? "QLabel { color: {{color.accent.danger}}; "
+                                  "font-size: 10px; padding: 0 2px; }"
+                                : "QLabel { color: {{color.text.secondary}}; "
+                                  "font-size: 10px; padding: 0 2px; }");
+                    });
 
                 auto* autoCheck = new QCheckBox;
-                autoCheck->setText("Auto");
+                autoCheck->setText("Auto-connect");
                 autoCheck->setChecked(profile.autoConnect);
                 autoCheck->setAccessibleName("Auto connect KiwiSDR antenna");
-                autoCheck->setStyleSheet(
-                    "QCheckBox { color: #c8d8e8; font-size: 12px; spacing: 4px; }");
-                rowLayout->addWidget(autoCheck, 1, 1, Qt::AlignCenter);
+                AetherSDR::ThemeManager::instance().applyStyleSheet(autoCheck,
+                    "QCheckBox { color: {{color.text.primary}}; font-size: 12px; spacing: 8px; }"
+                    + kCheckBoxIndicator);
+                rowLayout->addWidget(autoCheck, 4, 0, 1, 2, Qt::AlignLeft);
 
-                const KiwiSdrClient::State kiwiState =
-                    m_kiwiSdrManager->state(profile.id);
+                auto* keepTxAudioCheck = new QCheckBox;
+                keepTxAudioCheck->setText("Keep audio during TX");
+                keepTxAudioCheck->setChecked(profile.keepAudioDuringTx);
+                keepTxAudioCheck->setAccessibleName(
+                    "Keep KiwiSDR audio during transmit");
+                keepTxAudioCheck->setToolTip(
+                    "Keep playing this receiver's audio while transmitting.\n"
+                    "Off: its audio is silenced during TX and resumes "
+                    "immediately at unkey.");
+                AetherSDR::ThemeManager::instance().applyStyleSheet(
+                    keepTxAudioCheck,
+                    "QCheckBox { color: {{color.text.primary}}; font-size: 12px; spacing: 8px; }"
+                    + kCheckBoxIndicator);
+                rowLayout->addWidget(keepTxAudioCheck, 5, 0, 1, 2,
+                                     Qt::AlignLeft);
+
+                auto* resumeDelayCheck = new QCheckBox;
+                resumeDelayCheck->setText("Resume audio after TX delay");
+                resumeDelayCheck->setChecked(profile.resumeAudioAfterTxDelay);
+                resumeDelayCheck->setEnabled(!profile.keepAudioDuringTx);
+                resumeDelayCheck->setAccessibleName(
+                    "Resume KiwiSDR audio after transmit delay");
+                resumeDelayCheck->setToolTip(
+                    "After unkeying, wait out this receiver's stream delay "
+                    "before unmuting, so you rejoin on audio received after "
+                    "your transmission ended instead of hearing your own "
+                    "delayed TX tail.\nNo effect while \"Keep audio during "
+                    "TX\" is on.");
+                AetherSDR::ThemeManager::instance().applyStyleSheet(
+                    resumeDelayCheck,
+                    "QCheckBox { color: {{color.text.primary}}; font-size: 12px; spacing: 8px; }"
+                    + kCheckBoxIndicator);
+                rowLayout->addWidget(resumeDelayCheck, 6, 0, 1, 2,
+                                     Qt::AlignLeft);
+
                 const bool activeSession =
                     kiwiState == KiwiSdrClient::State::Connecting
                     || kiwiState == KiwiSdrClient::State::Waiting
@@ -3337,18 +4152,19 @@ QWidget* RadioSetupDialog::buildAntennaNamesTab()
                     activeSession ? "Disconnect KiwiSDR antenna"
                                   : "Connect KiwiSDR antenna");
                 styleKiwiButton(connectButton);
-                rowLayout->addWidget(connectButton, 1, 2);
+                rowLayout->addWidget(connectButton, 4, 2);
 
                 auto* removeButton = new QPushButton;
                 removeButton->setIcon(style()->standardIcon(QStyle::SP_TrashIcon));
                 removeButton->setToolTip("Remove");
                 removeButton->setAccessibleName("Remove KiwiSDR antenna");
                 styleKiwiIconButton(removeButton);
-                rowLayout->addWidget(removeButton, 1, 3);
+                rowLayout->addWidget(removeButton, 4, 3);
                 kiwiRowsLayout->addWidget(rowFrame);
 
                 auto updateProfile = [this, profile, nameEdit, endpointEdit,
-                                      autoCheck] {
+                                      autoCheck, keepTxAudioCheck,
+                                      resumeDelayCheck] {
                     const QString name = nameEdit->text().trimmed();
                     const QString endpoint =
                         KiwiSdrClient::normalizeEndpoint(endpointEdit->text());
@@ -3370,6 +4186,9 @@ QWidget* RadioSetupDialog::buildAntennaNamesTab()
                     updated.name = name;
                     updated.endpoint = endpoint;
                     updated.autoConnect = autoCheck->isChecked();
+                    updated.keepAudioDuringTx = keepTxAudioCheck->isChecked();
+                    updated.resumeAudioAfterTxDelay =
+                        resumeDelayCheck->isChecked();
                     m_kiwiSdrManager->updateProfile(updated);
                 };
                 connect(nameEdit, &QLineEdit::editingFinished,
@@ -3380,7 +4199,19 @@ QWidget* RadioSetupDialog::buildAntennaNamesTab()
                         this, updateProfile);
                 connect(endpointEdit, &QLineEdit::returnPressed,
                         this, updateProfile);
+                connect(passwordEdit, &QLineEdit::editingFinished,
+                        this, [this, profile, passwordEdit] {
+                    m_kiwiSdrManager->setProfilePassword(
+                        profile.id, passwordEdit->text());
+                });
                 connect(autoCheck, &QCheckBox::toggled,
+                        this, [updateProfile](bool) { updateProfile(); });
+                connect(keepTxAudioCheck, &QCheckBox::toggled,
+                        this, [updateProfile, resumeDelayCheck](bool on) {
+                    resumeDelayCheck->setEnabled(!on);
+                    updateProfile();
+                });
+                connect(resumeDelayCheck, &QCheckBox::toggled,
                         this, [updateProfile](bool) { updateProfile(); });
                 connect(connectButton, &QPushButton::clicked,
                         this, [this, profile, activeSession] {
@@ -3396,14 +4227,21 @@ QWidget* RadioSetupDialog::buildAntennaNamesTab()
                 });
             }
 
+            addSectionHeader("ADD RECEIVER");
             auto* rowFrame = new QFrame;
             rowFrame->setObjectName("kiwiAntennaRow");
             rowFrame->setStyleSheet(kKiwiRowStyle);
             auto* rowLayout = new QGridLayout(rowFrame);
-            rowLayout->setContentsMargins(6, 5, 6, 5);
-            rowLayout->setHorizontalSpacing(6);
-            rowLayout->setVerticalSpacing(3);
+            rowLayout->setContentsMargins(10, 8, 10, 8);
+            rowLayout->setHorizontalSpacing(8);
+            rowLayout->setVerticalSpacing(4);
             rowLayout->setColumnStretch(0, 1);
+            rowLayout->setColumnStretch(1, 1);
+            rowLayout->setColumnStretch(2, 1);
+
+            addFieldLabel(rowLayout, "NAME", 0);
+            addFieldLabel(rowLayout, "SERVER", 1);
+            addFieldLabel(rowLayout, "PASSWORD", 2);
 
             auto* nameEdit = new QLineEdit;
             nameEdit->setMaxLength(16);
@@ -3412,7 +4250,7 @@ QWidget* RadioSetupDialog::buildAntennaNamesTab()
             nameEdit->setAccessibleDescription(
                 "Required display name for the new KiwiSDR receive antenna.");
             styleKiwiEdit(nameEdit);
-            rowLayout->addWidget(nameEdit, 0, 0);
+            rowLayout->addWidget(nameEdit, 2, 0);
 
             auto* endpointEdit = new QLineEdit;
             endpointEdit->setPlaceholderText("host:8073");
@@ -3420,18 +4258,29 @@ QWidget* RadioSetupDialog::buildAntennaNamesTab()
             endpointEdit->setAccessibleDescription(
                 "Hostname or hostname:port for the new KiwiSDR receive antenna.");
             styleKiwiEdit(endpointEdit);
-            rowLayout->addWidget(endpointEdit, 1, 0);
+            rowLayout->addWidget(endpointEdit, 2, 1);
+
+            auto* passwordEdit = new QLineEdit;
+            passwordEdit->setEchoMode(QLineEdit::Password);
+            passwordEdit->setMaxLength(256);
+            passwordEdit->setObjectName("newKiwiPassword");
+            passwordEdit->setAccessibleName("New KiwiSDR password");
+            passwordEdit->setAccessibleDescription(
+                kiwiPasswordDescription);
+            styleKiwiEdit(passwordEdit);
+            rowLayout->addWidget(passwordEdit, 2, 2);
 
             auto* autoCheck = new QCheckBox;
-            autoCheck->setText("Auto");
+            autoCheck->setText("Auto-connect");
             autoCheck->setAccessibleName("Auto connect new KiwiSDR antenna");
-            autoCheck->setStyleSheet(
-                "QCheckBox { color: #c8d8e8; font-size: 12px; spacing: 4px; }");
-            rowLayout->addWidget(autoCheck, 1, 1, Qt::AlignCenter);
+            AetherSDR::ThemeManager::instance().applyStyleSheet(autoCheck,
+                "QCheckBox { color: {{color.text.primary}}; font-size: 12px; spacing: 8px; }"
+                + kCheckBoxIndicator);
+            rowLayout->addWidget(autoCheck, 3, 0, Qt::AlignLeft);
 
             auto committed = std::make_shared<bool>(false);
-            auto commitNewRow = [this, nameEdit, endpointEdit, autoCheck,
-                                 committed] {
+            auto commitNewRow = [this, nameEdit, endpointEdit, passwordEdit,
+                                 autoCheck, committed] {
                 if (*committed) {
                     return;
                 }
@@ -3443,45 +4292,51 @@ QWidget* RadioSetupDialog::buildAntennaNamesTab()
                 }
                 *committed = true;
                 const QString id = m_kiwiSdrManager->addProfile(name, endpoint);
-                if (autoCheck->isChecked()) {
-                    KiwiSdrAntennaProfile profile = m_kiwiSdrManager->profile(id);
-                    profile.autoConnect = true;
-                    m_kiwiSdrManager->updateProfile(profile);
+                if (id.isEmpty()) {
+                    *committed = false;
+                    return;
                 }
+                m_kiwiSdrManager->setProfilePassword(id, passwordEdit->text());
+                KiwiSdrAntennaProfile profile = m_kiwiSdrManager->profile(id);
+                profile.autoConnect = autoCheck->isChecked();
+                m_kiwiSdrManager->updateProfile(profile);
             };
 
             // Browse the public KiwiSDR directory to fill in a receiver. Only
             // API-permitting receivers are listed (web-only operators honored).
-            // Picking one adds the profile immediately — no extra Tab/confirm.
+            // Picking one fills the fields; Add receiver commits the profile.
             auto* browseButton = new QPushButton("Browse public…");
             browseButton->setAccessibleName("Browse public KiwiSDR receivers");
             browseButton->setAccessibleDescription(
                 "Choose from the public KiwiSDR directory; receivers whose "
                 "operator disabled the external API are not shown.");
-            rowLayout->addWidget(browseButton, 0, 1);
+            styleKiwiButton(browseButton);
+            rowLayout->addWidget(browseButton, 3, 1);
             connect(browseButton, &QPushButton::clicked, this,
-                    [this, nameEdit, endpointEdit, commitNewRow] {
+                    [this, nameEdit, endpointEdit] {
                 KiwiPublicReceiverPicker picker(this);
                 if (picker.exec() == QDialog::Accepted
                     && !picker.selectedEndpoint().isEmpty()) {
                     endpointEdit->setText(picker.selectedEndpoint());
-                    if (nameEdit->text().trimmed().isEmpty())
+                    if (nameEdit->text().trimmed().isEmpty()) {
                         nameEdit->setText(picker.selectedName());
-                    commitNewRow();  // add directly; no Tab-out needed
+                    }
                 }
             });
+
+            auto* addButton = new QPushButton("Add receiver");
+            addButton->setAccessibleName("Add KiwiSDR receiver");
+            styleKiwiButton(addButton);
+            rowLayout->addWidget(addButton, 3, 2);
+            connect(addButton, &QPushButton::clicked, this, commitNewRow);
             kiwiRowsLayout->addWidget(rowFrame);
 
-            connect(nameEdit, &QLineEdit::editingFinished,
-                    this, commitNewRow);
             connect(nameEdit, &QLineEdit::returnPressed,
-                    this, commitNewRow);
-            connect(endpointEdit, &QLineEdit::editingFinished,
                     this, commitNewRow);
             connect(endpointEdit, &QLineEdit::returnPressed,
                     this, commitNewRow);
-            connect(autoCheck, &QCheckBox::toggled,
-                    this, [commitNewRow](bool) { commitNewRow(); });
+            connect(passwordEdit, &QLineEdit::returnPressed,
+                    this, commitNewRow);
 
             kiwiRowsLayout->addStretch(1);
         };
@@ -3501,6 +4356,127 @@ QWidget* RadioSetupDialog::buildAntennaNamesTab()
                 kiwiTelemetryRefreshTimer->start();
             }
         });
+
+        // Import/export the receiver list as a CSV (#4586) — passwords are
+        // never included (they live in the OS credential store), so a
+        // password-protected receiver needs its password re-entered after
+        // import. Remembers its own last-used folder, independent of any
+        // other CSV import/export elsewhere in the app (mirrors
+        // ShortcutDialog's pattern). Reuses styleKiwiButton (declared above
+        // for the per-row Connect/Add-receiver buttons) instead of adding a
+        // fresh setStyleSheet() call site the colour-audit ratchet counts.
+        auto kiwiTransferDirectory = [] {
+            const QString saved = AppSettings::instance()
+                .value(QStringLiteral("KiwiSdrImportExportPath"), QString())
+                .toString();
+            if (!saved.isEmpty() && QDir(saved).exists()) {
+                return saved;
+            }
+            const QString docs = QStandardPaths::writableLocation(
+                QStandardPaths::DocumentsLocation);
+            return docs.isEmpty() ? QDir::homePath() : docs;
+        };
+        auto rememberKiwiTransferDirectory = [](const QString& path) {
+            const QFileInfo info(path);
+            if (!info.absolutePath().isEmpty()) {
+                AppSettings::instance().setValue(
+                    QStringLiteral("KiwiSdrImportExportPath"), info.absolutePath());
+            }
+        };
+
+        auto* kiwiTransferRow = new QHBoxLayout;
+        kiwiTransferRow->addStretch(1);
+
+        auto* kiwiImportBtn = new QPushButton("Import...");
+        kiwiImportBtn->setObjectName(QStringLiteral("kiwiImportButton"));
+        kiwiImportBtn->setAccessibleName("Import KiwiSDR receivers");
+        kiwiImportBtn->setAccessibleDescription(
+            "Import KiwiSDR receivers from a CSV file. A receiver whose "
+            "endpoint matches one already saved is updated in place.");
+        styleKiwiButton(kiwiImportBtn);
+        connect(kiwiImportBtn, &QPushButton::clicked, this,
+                [this, kiwiTransferDirectory, rememberKiwiTransferDirectory] {
+            QFileDialog dialog(this, QStringLiteral("Import KiwiSDR Receivers"),
+                               kiwiTransferDirectory(),
+                               QStringLiteral("CSV Files (*.csv)"));
+            dialog.setAcceptMode(QFileDialog::AcceptOpen);
+            dialog.setFileMode(QFileDialog::ExistingFile);
+            dialog.setDefaultSuffix(QStringLiteral("csv"));
+            if (dialog.exec() != QDialog::Accepted || dialog.selectedFiles().isEmpty()) {
+                return;
+            }
+            const QString path = dialog.selectedFiles().first();
+            rememberKiwiTransferDirectory(path);
+
+            const KiwiSdrCsvImportResult result =
+                m_kiwiSdrManager->importFromFile(path);
+            if (!result.ok() && result.addedCount == 0 && result.mergedCount == 0) {
+                QMessageBox box(QMessageBox::Warning,
+                                QStringLiteral("Import KiwiSDR Receivers"),
+                                QStringLiteral("No receivers were imported from %1.")
+                                    .arg(QFileInfo(path).fileName()),
+                                QMessageBox::Ok, this);
+                box.setDetailedText(result.errors.join(QLatin1Char('\n')));
+                box.exec();
+                return;
+            }
+
+            QMessageBox box(result.errors.isEmpty()
+                                ? QMessageBox::Information : QMessageBox::Warning,
+                            QStringLiteral("Import KiwiSDR Receivers"),
+                            QStringLiteral("Added %1 and updated %2 receiver(s) from %3.")
+                                .arg(result.addedCount)
+                                .arg(result.mergedCount)
+                                .arg(QFileInfo(path).fileName()),
+                            QMessageBox::Ok, this);
+            if (!result.errors.isEmpty()) {
+                box.setInformativeText(
+                    QStringLiteral("%1 row(s) could not be imported.")
+                        .arg(result.errors.size()));
+                box.setDetailedText(result.errors.join(QLatin1Char('\n')));
+            }
+            box.exec();
+        });
+        kiwiTransferRow->addWidget(kiwiImportBtn);
+
+        auto* kiwiExportBtn = new QPushButton("Export...");
+        kiwiExportBtn->setObjectName(QStringLiteral("kiwiExportButton"));
+        kiwiExportBtn->setAccessibleName("Export KiwiSDR receivers");
+        kiwiExportBtn->setAccessibleDescription(
+            "Export the saved KiwiSDR receivers to a CSV file. Passwords "
+            "are not included.");
+        styleKiwiButton(kiwiExportBtn);
+        connect(kiwiExportBtn, &QPushButton::clicked, this,
+                [this, kiwiTransferDirectory, rememberKiwiTransferDirectory] {
+            const QString fileName = QStringLiteral("AetherSDR_KiwiSDR_Receivers_%1.csv")
+                                         .arg(QDateTime::currentDateTime().toString(
+                                             QStringLiteral("yyyyMMdd_HHmmss")));
+            QFileDialog dialog(this, QStringLiteral("Export KiwiSDR Receivers"),
+                               QDir(kiwiTransferDirectory()).filePath(fileName),
+                               QStringLiteral("CSV Files (*.csv)"));
+            dialog.setAcceptMode(QFileDialog::AcceptSave);
+            dialog.setDefaultSuffix(QStringLiteral("csv"));
+            if (dialog.exec() != QDialog::Accepted || dialog.selectedFiles().isEmpty()) {
+                return;
+            }
+            const QString path = dialog.selectedFiles().first();
+            rememberKiwiTransferDirectory(path);
+
+            const KiwiSdrCsvExportResult result = m_kiwiSdrManager->exportToFile(path);
+            if (!result.ok()) {
+                QMessageBox::warning(this, QStringLiteral("Export KiwiSDR Receivers"),
+                                     result.error);
+                return;
+            }
+            QMessageBox::information(
+                this, QStringLiteral("Export KiwiSDR Receivers"),
+                QStringLiteral("Exported %1 receiver(s) to %2. Passwords are not "
+                               "included; re-enter them after importing elsewhere.")
+                    .arg(result.exportedCount)
+                    .arg(QFileInfo(path).fileName()));
+        });
+        kiwiTransferRow->addWidget(kiwiExportBtn);
+        kiwiLayout->addLayout(kiwiTransferRow);
     }
 
     (*refresh)();
@@ -3638,8 +4614,12 @@ QWidget* RadioSetupDialog::buildUsbCablesTab()
     static const QString kSpin =
         "QSpinBox { background: #1a2a3a; border: 1px solid #304050; "
         "color: #c8d8e8; font-size: 11px; padding: 2px; }";
+    // Token template (applied via applyStyleSheet) so the indicator is visible
+    // in dark mode, matching the other checkboxes in this dialog. #c8d8e8 is
+    // exactly {{color.text.primary}}, so the text colour is unchanged (#4012).
     static const QString kCheck =
-        "QCheckBox { color: #c8d8e8; font-size: 11px; }";
+        "QCheckBox { color: {{color.text.primary}}; font-size: 11px; spacing: 8px; }"
+        + kCheckBoxIndicator;
 
     // ── Left: cable list ────────────────────────────────────────────────
     auto* listGroup = new QGroupBox("Cables");
@@ -3672,10 +4652,16 @@ QWidget* RadioSetupDialog::buildUsbCablesTab()
 
     // Helper: create source combo (shared across CAT, BCD, Bit)
     auto makeSourceCombo = []() {
-        auto* combo = new QComboBox;
+        // GuardedComboBox: this combo lives in the scroll-wrapped USB Cables
+        // tab and sends a destructive `source=` set on change, so a stray
+        // wheel-scroll must not silently re-route a live cable's source.
+        auto* combo = new GuardedComboBox;
         combo->addItems({"None", "TX Pan", "TX Slice", "Active Slice",
                          "TX Ant", "RX Ant", "Ordinal Slice"});
         combo->setStyleSheet(kCombo);
+        combo->setAccessibleName("Cable source");
+        combo->setAccessibleDescription(
+            "Signal source routed to this cable");
         return combo;
     };
     // Map source display name → protocol value
@@ -3698,8 +4684,163 @@ QWidget* RadioSetupDialog::buildUsbCablesTab()
         return 0;  // None
     };
 
+    struct SerialWidgets {
+        QGroupBox* group{nullptr};
+        QComboBox* speed{nullptr};
+        QComboBox* data{nullptr};
+        QComboBox* parity{nullptr};
+        QComboBox* stop{nullptr};
+        QComboBox* flow{nullptr};
+    };
+
+    // Cable Type combo: values match FlexLib's UsbCableType enum, listed here
+    // in enum order as the single source of truth for the combo's item
+    // order, the proto string sent on the wire, and the index recovered when
+    // a status arrives — collapses what used to be three hand-synced lists
+    // (combo item order, typeIndexToProto, protoToTypeIndex) into one.
+    // "Invalid" is the unconfigured sentinel, not a menu entry. Selecting
+    // BCD sends bare type=bcd; the existing bcdTypeCombo refines the specific
+    // bcd/vbcd/bcd_vbcd sub-type afterward (matches FlexLib's own default-
+    // then-refine behavior for this exact transition).
+    struct CableTypeEntry { QString proto; QString label; };
+    static const QVector<CableTypeEntry> kCableTypes = {
+        {"cat",         "CAT"},
+        {"bit",         "Bit"},
+        {"bcd",         "BCD"},
+        {"ldpa",        "LDPA"},
+        {"passthrough", "Passthrough"},
+    };
+    // Helper: create Cable Type combo (shared across all pages). Guarded
+    // against accidental wheel-scroll retyping a live cable (#570/#676-style
+    // hazard — this combo's value change sends a destructive command).
+    auto makeTypeCombo = []() {
+        auto* combo = new GuardedComboBox;
+        for (const auto& entry : kCableTypes) {
+            combo->addItem(entry.label);
+        }
+        combo->setStyleSheet(kCombo);
+        combo->setAccessibleName("Cable Type");
+        combo->setAccessibleDescription(
+            "Selects this cable's protocol type: CAT, Bit, BCD, LDPA, or Passthrough");
+        return combo;
+    };
+    auto typeIndexToProto = [](int idx) -> QString {
+        if (idx >= 0 && idx < kCableTypes.size()) {
+            return kCableTypes[idx].proto;
+        }
+        return kCableTypes[0].proto;  // default: CAT
+    };
+    auto protoToTypeIndex = [](const QString& proto) -> int {
+        // bcd/vbcd/bcd_vbcd are one family in FlexLib's UsbCableType — collapse
+        // before lookup so any of the three sub-types selects the BCD entry.
+        const QString family = (proto == "vbcd" || proto == "bcd_vbcd") ? "bcd" : proto;
+        for (int i = 0; i < kCableTypes.size(); ++i) {
+            if (kCableTypes[i].proto == family) {
+                return i;
+            }
+        }
+        return -1;  // invalid / unrecognized — leave the combo unset
+    };
+
+    // Helper: build the "Cable Settings" header group (Name/[Enabled]/Status/
+    // Type) shared by all six cable pages. `includeEnabled` is false only for
+    // the Unconfigured page, which has no enable state to toggle yet.
+    struct CableHeaderWidgets {
+        QGroupBox* group{nullptr};
+        QLineEdit* nameEdit{nullptr};
+        QCheckBox* enabledCheck{nullptr};  // nullptr when !includeEnabled
+        QLabel*    statusLabel{nullptr};
+        QComboBox* typeCombo{nullptr};
+    };
+    auto makeCableHeader = [makeTypeCombo](bool includeEnabled) -> CableHeaderWidgets {
+        auto* group = new QGroupBox("Cable Settings");
+        group->setStyleSheet(kGroupStyle);
+        auto* hg = new QGridLayout(group);
+        hg->setSpacing(4);
+
+        int row = 0;
+        hg->addWidget(new QLabel("Name:"), row, 0);
+        auto* nameEdit = new QLineEdit;
+        nameEdit->setStyleSheet(kEdit);
+        nameEdit->setAccessibleName("Cable name");
+        hg->addWidget(nameEdit, row, 1);
+        ++row;
+
+        QCheckBox* enabledCheck = nullptr;
+        if (includeEnabled) {
+            enabledCheck = new QCheckBox("Enabled");
+            AetherSDR::ThemeManager::instance().applyStyleSheet(enabledCheck, kCheck);
+            hg->addWidget(enabledCheck, row, 0, 1, 2);
+            ++row;
+        }
+
+        auto* statusLabel = new QLabel("Unplugged");
+        AetherSDR::ThemeManager::instance().applyStyleSheet(
+            statusLabel, "QLabel { color: {{color.text.label}}; font-size: 11px; }");
+        hg->addWidget(new QLabel("Status:"), row, 0);
+        hg->addWidget(statusLabel, row, 1);
+        ++row;
+
+        hg->addWidget(new QLabel("Type:"), row, 0);
+        auto* typeCombo = makeTypeCombo();
+        hg->addWidget(typeCombo, row, 1);
+
+        return CableHeaderWidgets{group, nameEdit, enabledCheck, statusLabel, typeCombo};
+    };
+
+    // Tracks the serial number of a cable currently being retyped, so the
+    // cableAdded handler (fired once the radio's fresh status for the new
+    // type arrives — see "Wire model signals" below) knows to reselect it
+    // and repopulate the detail panel. Without this, a successful retype
+    // leaves the panel stuck on the empty-state page until manually
+    // re-clicked, since a type change tears the old cable entry down and
+    // rebuilds it fresh (UsbCableModel::applyStatus).
+    //
+    // Cleared two ways beyond the normal matching-cableAdded path, so a
+    // rejected/never-echoed retype can't hijack a later unplug/replug's
+    // selection: (1) cableRemoved for this serial defers a clear via a 0ms
+    // timer — harmless for a genuine retype, since its own cableAdded fires
+    // synchronously first (in the same applyStatus() call) and clears the
+    // pointer before the deferred callback runs; (2) a bounded timeout armed
+    // on send, in case the radio never echoes back at all.
+    auto pendingTypeChangeSn = std::make_shared<QString>();
+    // Generation counter so the bounded timeout can't clear a *newer* pending.
+    // Each send bumps the generation; the timer captures its own generation and
+    // only clears if it's still current. Without this, retyping the same serial
+    // twice within 5s would let the first timer clear the second retype's
+    // pending (QTimer::singleShot is fire-and-forget and can't be cancelled),
+    // reintroducing the stuck-panel bug on exactly the lossy radios the timeout
+    // exists to protect.
+    auto pendingTypeChangeGen = std::make_shared<quint64>(0);
+    auto sendCableType = [cableModel, cableList, pendingTypeChangeSn,
+                          pendingTypeChangeGen](const QString& proto) {
+        auto* item = cableList->currentItem();
+        if (!item) {
+            return;
+        }
+        const QString sn = item->data(Qt::UserRole).toString();
+        *pendingTypeChangeSn = sn;
+        const quint64 gen = ++(*pendingTypeChangeGen);
+        cableModel->sendSet(sn, "type", proto);
+        QTimer::singleShot(5000, [pendingTypeChangeSn, pendingTypeChangeGen, gen]() {
+            if (*pendingTypeChangeGen == gen) {
+                pendingTypeChangeSn->clear();
+            }
+        });
+    };
+    // Wires a Cable Type combo's index changes to sendCableType — collapses
+    // what used to be six copy-pasted connect() blocks into one call site.
+    auto wireTypeCombo = [this, sendCableType, typeIndexToProto](QComboBox* combo) {
+        connect(combo, &QComboBox::currentIndexChanged, this,
+                [sendCableType, typeIndexToProto](int idx) {
+            if (idx >= 0) {
+                sendCableType(typeIndexToProto(idx));
+            }
+        });
+    };
+
     // Helper: serial parameter group (shared by CAT and Passthrough)
-    auto makeSerialGroup = [](const QString& title) {
+    auto makeSerialGroup = [](const QString& title) -> SerialWidgets {
         auto* group = new QGroupBox(title);
         group->setStyleSheet(kGroupStyle);
         auto* grid = new QGridLayout(group);
@@ -3738,10 +4879,7 @@ QWidget* RadioSetupDialog::buildUsbCablesTab()
         grid->addWidget(new QLabel("Flow:"), 4, 0);
         grid->addWidget(flowCombo, 4, 1);
 
-        struct SerialWidgets { QComboBox *speed, *data, *parity, *stop, *flow; QGroupBox* group; };
-        auto* w = new SerialWidgets{speedCombo, dataCombo, parityCombo, stopCombo, flowCombo, group};
-        group->setProperty("_widgets", QVariant::fromValue(static_cast<void*>(w)));
-        return group;
+        return SerialWidgets{group, speedCombo, dataCombo, parityCombo, stopCombo, flowCombo};
     };
 
     // Page 1: CAT cable
@@ -3751,33 +4889,24 @@ QWidget* RadioSetupDialog::buildUsbCablesTab()
     QLabel*    catStatusLabel;
     QComboBox* catSourceCombo;
     QCheckBox* catAutoReportCheck;
-    QGroupBox* catSerialGroup;
+    SerialWidgets catSerialWidgets;
+    QComboBox* catTypeCombo;
     {
         catPage = new QWidget;
         auto* vbox = new QVBoxLayout(catPage);
         vbox->setSpacing(6);
 
         // Common header
-        auto* headerGroup = new QGroupBox("Cable Settings");
-        headerGroup->setStyleSheet(kGroupStyle);
-        auto* hg = new QGridLayout(headerGroup);
-        hg->setSpacing(4);
-        hg->addWidget(new QLabel("Name:"), 0, 0);
-        catNameEdit = new QLineEdit;
-        catNameEdit->setStyleSheet(kEdit);
-        hg->addWidget(catNameEdit, 0, 1);
-        catEnabledCheck = new QCheckBox("Enabled");
-        catEnabledCheck->setStyleSheet(kCheck);
-        hg->addWidget(catEnabledCheck, 1, 0, 1, 2);
-        catStatusLabel = new QLabel("Unplugged");
-        AetherSDR::ThemeManager::instance().applyStyleSheet(catStatusLabel, "QLabel { color: {{color.text.label}}; font-size: 11px; }");
-        hg->addWidget(new QLabel("Status:"), 2, 0);
-        hg->addWidget(catStatusLabel, 2, 1);
-        vbox->addWidget(headerGroup);
+        auto catHeader = makeCableHeader(/*includeEnabled=*/true);
+        catNameEdit = catHeader.nameEdit;
+        catEnabledCheck = catHeader.enabledCheck;
+        catStatusLabel = catHeader.statusLabel;
+        catTypeCombo = catHeader.typeCombo;
+        vbox->addWidget(catHeader.group);
 
         // Serial params
-        catSerialGroup = makeSerialGroup("Serial Parameters");
-        vbox->addWidget(catSerialGroup);
+        catSerialWidgets = makeSerialGroup("Serial Parameters");
+        vbox->addWidget(catSerialWidgets.group);
 
         // CAT source
         auto* srcGroup = new QGroupBox("CAT Source");
@@ -3788,7 +4917,7 @@ QWidget* RadioSetupDialog::buildUsbCablesTab()
         catSourceCombo = makeSourceCombo();
         sg->addWidget(catSourceCombo, 0, 1);
         catAutoReportCheck = new QCheckBox("Auto Report");
-        catAutoReportCheck->setStyleSheet(kCheck);
+        AetherSDR::ThemeManager::instance().applyStyleSheet(catAutoReportCheck, kCheck);
         sg->addWidget(catAutoReportCheck, 1, 0, 1, 2);
         vbox->addWidget(srcGroup);
 
@@ -3804,41 +4933,41 @@ QWidget* RadioSetupDialog::buildUsbCablesTab()
     QComboBox* bcdSourceCombo;
     QComboBox* bcdTypeCombo;
     QComboBox* bcdPolarityCombo;
+    QComboBox* bcdCableTypeCombo;
     {
         bcdPage = new QWidget;
         auto* vbox = new QVBoxLayout(bcdPage);
         vbox->setSpacing(6);
 
-        auto* headerGroup = new QGroupBox("Cable Settings");
-        headerGroup->setStyleSheet(kGroupStyle);
-        auto* hg = new QGridLayout(headerGroup);
-        hg->setSpacing(4);
-        hg->addWidget(new QLabel("Name:"), 0, 0);
-        bcdNameEdit = new QLineEdit;
-        bcdNameEdit->setStyleSheet(kEdit);
-        hg->addWidget(bcdNameEdit, 0, 1);
-        bcdEnabledCheck = new QCheckBox("Enabled");
-        bcdEnabledCheck->setStyleSheet(kCheck);
-        hg->addWidget(bcdEnabledCheck, 1, 0, 1, 2);
-        bcdStatusLabel = new QLabel("Unplugged");
-        AetherSDR::ThemeManager::instance().applyStyleSheet(bcdStatusLabel, "QLabel { color: {{color.text.label}}; font-size: 11px; }");
-        hg->addWidget(new QLabel("Status:"), 2, 0);
-        hg->addWidget(bcdStatusLabel, 2, 1);
-        vbox->addWidget(headerGroup);
+        auto bcdHeader = makeCableHeader(/*includeEnabled=*/true);
+        bcdNameEdit = bcdHeader.nameEdit;
+        bcdEnabledCheck = bcdHeader.enabledCheck;
+        bcdStatusLabel = bcdHeader.statusLabel;
+        bcdCableTypeCombo = bcdHeader.typeCombo;
+        vbox->addWidget(bcdHeader.group);
 
         auto* bcdGroup = new QGroupBox("BCD Settings");
         bcdGroup->setStyleSheet(kGroupStyle);
         auto* bg = new QGridLayout(bcdGroup);
         bg->setSpacing(4);
         bg->addWidget(new QLabel("BCD Type:"), 0, 0);
-        bcdTypeCombo = new QComboBox;
+        // GuardedComboBox: scroll-wrapped tab + destructive `type=` on change.
+        // NB this sub-type combo sends `type=` via sendBcdProp, which does NOT
+        // arm pendingTypeChangeSn. That is correct only because
+        // UsbCableModel::normalizeTypeFamily() collapses bcd/vbcd/bcd_vbcd to
+        // one family, so a sub-type change updates in place (cableChanged) and
+        // never triggers the remove+recreate path that would need a reselect.
+        // If that invariant ever changes, route this through sendCableType.
+        bcdTypeCombo = new GuardedComboBox;
         bcdTypeCombo->addItems({"HF (bcd)", "VHF (vbcd)", "HF+VHF (bcd_vbcd)"});
         bcdTypeCombo->setStyleSheet(kCombo);
+        bcdTypeCombo->setAccessibleName("BCD sub-type");
         bg->addWidget(bcdTypeCombo, 0, 1);
         bg->addWidget(new QLabel("Polarity:"), 1, 0);
-        bcdPolarityCombo = new QComboBox;
+        bcdPolarityCombo = new GuardedComboBox;  // destructive polarity= on change
         bcdPolarityCombo->addItems({"Active High", "Active Low"});
         bcdPolarityCombo->setStyleSheet(kCombo);
+        bcdPolarityCombo->setAccessibleName("BCD polarity");
         bg->addWidget(bcdPolarityCombo, 1, 1);
         bg->addWidget(new QLabel("Source:"), 2, 0);
         bcdSourceCombo = makeSourceCombo();
@@ -3850,148 +4979,312 @@ QWidget* RadioSetupDialog::buildUsbCablesTab()
     }
 
     // Page 3: Bit cable
+    // Master-detail sub-view (Bit 0-7 list + one detail form), mirroring the
+    // outer cable-list/stack pattern above — a flat 8-row grid can't fit
+    // PTT-dependent/PTT-delay/TX-delay/freq-range/antenna-slice fields
+    // without becoming unreadably cramped at this panel's width (#3607).
     QWidget* bitPage;
     QLineEdit* bitNameEdit;
     QCheckBox* bitEnabledCheck;
     QLabel*    bitStatusLabel;
+    QListWidget* bitIndexList;
+    struct BitWidgets {
+        QCheckBox* enabled{nullptr};
+        QComboBox* source{nullptr};
+        QComboBox* sourceDetail{nullptr};
+        QLabel*    sourceDetailLabel{nullptr};
+        QComboBox* output{nullptr};
+        QLineEdit* band{nullptr};
+        QLabel*    bandLabel{nullptr};
+        QLineEdit* lowFreq{nullptr};
+        QLabel*    lowFreqLabel{nullptr};
+        QLineEdit* highFreq{nullptr};
+        QLabel*    highFreqLabel{nullptr};
+        QComboBox* polarity{nullptr};
+        QCheckBox* pttDependent{nullptr};
+        QSpinBox*  pttDelay{nullptr};
+        QSpinBox*  txDelay{nullptr};
+    };
+    BitWidgets bitWidgets;
+    auto currentBit = std::make_shared<int>(0);
+    QComboBox* bitTypeCombo;
     {
         bitPage = new QWidget;
         auto* vbox = new QVBoxLayout(bitPage);
         vbox->setSpacing(6);
 
-        auto* headerGroup = new QGroupBox("Cable Settings");
-        headerGroup->setStyleSheet(kGroupStyle);
-        auto* hg = new QGridLayout(headerGroup);
-        hg->setSpacing(4);
-        hg->addWidget(new QLabel("Name:"), 0, 0);
-        bitNameEdit = new QLineEdit;
-        bitNameEdit->setStyleSheet(kEdit);
-        hg->addWidget(bitNameEdit, 0, 1);
-        bitEnabledCheck = new QCheckBox("Enabled");
-        bitEnabledCheck->setStyleSheet(kCheck);
-        hg->addWidget(bitEnabledCheck, 1, 0, 1, 2);
-        bitStatusLabel = new QLabel("Unplugged");
-        AetherSDR::ThemeManager::instance().applyStyleSheet(bitStatusLabel, "QLabel { color: {{color.text.label}}; font-size: 11px; }");
-        hg->addWidget(new QLabel("Status:"), 2, 0);
-        hg->addWidget(bitStatusLabel, 2, 1);
-        vbox->addWidget(headerGroup);
+        auto bitHeader = makeCableHeader(/*includeEnabled=*/true);
+        bitNameEdit = bitHeader.nameEdit;
+        bitEnabledCheck = bitHeader.enabledCheck;
+        bitStatusLabel = bitHeader.statusLabel;
+        bitTypeCombo = bitHeader.typeCombo;
+        vbox->addWidget(bitHeader.group);
 
-        // 8-row bit grid
-        auto* bitGroup = new QGroupBox("Bit Configuration (0-7)");
-        bitGroup->setStyleSheet(kGroupStyle);
-        auto* bitGrid = new QGridLayout(bitGroup);
-        bitGrid->setSpacing(2);
+        auto* bitSplit = new QHBoxLayout;
 
-        // Header row
-        int col = 0;
-        for (const auto& h : {"Bit", "En", "Source", "Output", "Polarity", "Band"}) {
-            auto* lbl = new QLabel(h);
-            AetherSDR::ThemeManager::instance().applyStyleSheet(lbl, "QLabel { color: {{color.text.secondary}}; font-size: 10px; font-weight: bold; }");
-            lbl->setAlignment(Qt::AlignCenter);
-            bitGrid->addWidget(lbl, 0, col++);
-        }
+        auto* bitListGroup = new QGroupBox("Bits");
+        bitListGroup->setStyleSheet(kGroupStyle);
+        bitListGroup->setFixedWidth(90);
+        auto* bitListVbox = new QVBoxLayout(bitListGroup);
+        bitIndexList = new QListWidget;
+        AetherSDR::ThemeManager::instance().applyStyleSheet(bitIndexList,
+            "QListWidget { background: {{color.background.0}}; color: {{color.text.primary}}; border: 1px solid {{color.background.1}}; "
+            "font-size: 11px; }"
+            "QListWidget::item { padding: 4px; }"
+            "QListWidget::item:selected { background: {{color.accent}}; color: {{color.background.0}}; }");
+        for (int b = 0; b < 8; ++b)
+            bitIndexList->addItem(QString("Bit %1").arg(b));
+        bitListVbox->addWidget(bitIndexList);
+        bitSplit->addWidget(bitListGroup);
 
-        for (int b = 0; b < 8; ++b) {
-            int row = b + 1;
-            auto* bitLabel = new QLabel(QString::number(b));
-            bitLabel->setAlignment(Qt::AlignCenter);
-            AetherSDR::ThemeManager::instance().applyStyleSheet(bitLabel, "QLabel { color: {{color.text.primary}}; font-size: 10px; }");
-            bitGrid->addWidget(bitLabel, row, 0);
+        auto* bitDetailGroup = new QGroupBox("Bit Settings");
+        bitDetailGroup->setStyleSheet(kGroupStyle);
+        auto* bd = new QGridLayout(bitDetailGroup);
+        bd->setSpacing(6);
 
-            auto* enCheck = new QCheckBox;
-            bitGrid->addWidget(enCheck, row, 1, Qt::AlignCenter);
+        int row = 0;
+        auto addRow = [&](const QString& label, QWidget* w) -> QLabel* {
+            auto* lbl = new QLabel(label);
+            bd->addWidget(lbl, row, 0);
+            bd->addWidget(w, row, 1);
+            ++row;
+            return lbl;
+        };
 
-            auto* srcCombo = new QComboBox;
-            srcCombo->addItems({"None", "Active Slice", "TX Slice"});
-            srcCombo->setStyleSheet(kCombo + "QComboBox { font-size: 9px; }");
-            srcCombo->setFixedWidth(90);
-            bitGrid->addWidget(srcCombo, row, 2);
+        bitWidgets.enabled = new QCheckBox;
+        AetherSDR::ThemeManager::instance().applyStyleSheet(bitWidgets.enabled, kCheck);
+        addRow("Enabled:", bitWidgets.enabled);
 
-            auto* outCombo = new QComboBox;
-            outCombo->addItems({"band", "freq_range"});
-            outCombo->setStyleSheet(kCombo + "QComboBox { font-size: 9px; }");
-            outCombo->setFixedWidth(80);
-            bitGrid->addWidget(outCombo, row, 3);
+        bitWidgets.source = makeSourceCombo();
+        addRow("Source:", bitWidgets.source);
 
-            auto* polCombo = new QComboBox;
-            polCombo->addItems({"High", "Low"});
-            polCombo->setStyleSheet(kCombo + "QComboBox { font-size: 9px; }");
-            polCombo->setFixedWidth(50);
-            bitGrid->addWidget(polCombo, row, 4);
+        bitWidgets.sourceDetail = new QComboBox;
+        bitWidgets.sourceDetail->setEditable(true);
+        bitWidgets.sourceDetail->setStyleSheet(kCombo);
+        bitWidgets.sourceDetailLabel = addRow("Antenna/Slice:", bitWidgets.sourceDetail);
 
-            auto* bandEdit = new QLineEdit;
-            bandEdit->setPlaceholderText("e.g. 20");
-            bandEdit->setFixedWidth(50);
-            bandEdit->setStyleSheet(kEdit + "QLineEdit { font-size: 9px; }");
-            bitGrid->addWidget(bandEdit, row, 5);
+        bitWidgets.output = new QComboBox;
+        bitWidgets.output->addItems({"band", "freq_range"});
+        bitWidgets.output->setStyleSheet(kCombo);
+        addRow("Output:", bitWidgets.output);
 
-            // Wire signals to send commands
-            connect(enCheck, &QCheckBox::toggled, this, [cableModel, cableList, b](bool on) {
-                auto* item = cableList->currentItem();
-                if (!item) return;
-                cableModel->sendSetBit(item->data(Qt::UserRole).toString(), b,
-                                       "enable", on ? "1" : "0");
-            });
-            connect(outCombo, &QComboBox::currentTextChanged, this,
-                    [cableModel, cableList, b](const QString& text) {
-                auto* item = cableList->currentItem();
-                if (!item) return;
-                cableModel->sendSetBit(item->data(Qt::UserRole).toString(), b, "output", text);
-            });
-            connect(polCombo, &QComboBox::currentTextChanged, this,
-                    [cableModel, cableList, b](const QString& text) {
-                auto* item = cableList->currentItem();
-                if (!item) return;
-                cableModel->sendSetBit(item->data(Qt::UserRole).toString(), b,
-                                       "polarity", text == "High" ? "active_high" : "active_low");
-            });
-            connect(bandEdit, &QLineEdit::editingFinished, this,
-                    [cableModel, cableList, b, bandEdit]() {
-                auto* item = cableList->currentItem();
-                if (!item) return;
-                cableModel->sendSetBit(item->data(Qt::UserRole).toString(), b,
-                                       "band", bandEdit->text());
-            });
-        }
+        bitWidgets.band = new QLineEdit;
+        bitWidgets.band->setPlaceholderText("e.g. 20");
+        bitWidgets.band->setStyleSheet(kEdit);
+        bitWidgets.bandLabel = addRow("Band:", bitWidgets.band);
 
-        vbox->addWidget(bitGroup);
+        bitWidgets.lowFreq = new QLineEdit;
+        bitWidgets.lowFreq->setPlaceholderText("e.g. 0.100");
+        bitWidgets.lowFreq->setStyleSheet(kEdit);
+        bitWidgets.lowFreqLabel = addRow("Low Freq (MHz):", bitWidgets.lowFreq);
+
+        bitWidgets.highFreq = new QLineEdit;
+        bitWidgets.highFreq->setPlaceholderText("e.g. 54.000");
+        bitWidgets.highFreq->setStyleSheet(kEdit);
+        bitWidgets.highFreqLabel = addRow("High Freq (MHz):", bitWidgets.highFreq);
+
+        bitWidgets.polarity = new QComboBox;
+        bitWidgets.polarity->addItems({"High", "Low"});
+        bitWidgets.polarity->setStyleSheet(kCombo);
+        addRow("Polarity:", bitWidgets.polarity);
+
+        bitWidgets.pttDependent = new QCheckBox;
+        AetherSDR::ThemeManager::instance().applyStyleSheet(bitWidgets.pttDependent, kCheck);
+        addRow("PTT Dependent:", bitWidgets.pttDependent);
+
+        bitWidgets.pttDelay = new QSpinBox;
+        bitWidgets.pttDelay->setRange(0, 10000);
+        bitWidgets.pttDelay->setSingleStep(5);
+        bitWidgets.pttDelay->setSuffix(" ms");
+        bitWidgets.pttDelay->setStyleSheet(kSpin);
+        addRow("PTT Delay:", bitWidgets.pttDelay);
+
+        bitWidgets.txDelay = new QSpinBox;
+        bitWidgets.txDelay->setRange(0, 10000);
+        bitWidgets.txDelay->setSingleStep(5);
+        bitWidgets.txDelay->setSuffix(" ms");
+        bitWidgets.txDelay->setStyleSheet(kSpin);
+        addRow("TX Delay:", bitWidgets.txDelay);
+
+        bd->setRowStretch(row, 1);
+        bitSplit->addWidget(bitDetailGroup, 1);
+
+        vbox->addLayout(bitSplit);
         vbox->addStretch();
         stack->addWidget(bitPage);  // index 3
     }
+
+    // Bit detail refresh helpers — output mode (band vs freq-range) and
+    // source (antenna/slice sub-selector) each drive which sibling fields
+    // are visible; kept as named lambdas so both the interactive wiring
+    // below and the model-driven repopulation in showCableProps can call
+    // the exact same logic.
+    auto refreshBitOutputVisibility = [bitWidgets]() {
+        const bool isFreqRange = (bitWidgets.output->currentText() == "freq_range");
+        bitWidgets.band->setVisible(!isFreqRange);
+        bitWidgets.bandLabel->setVisible(!isFreqRange);
+        bitWidgets.lowFreq->setVisible(isFreqRange);
+        bitWidgets.lowFreqLabel->setVisible(isFreqRange);
+        bitWidgets.highFreq->setVisible(isFreqRange);
+        bitWidgets.highFreqLabel->setVisible(isFreqRange);
+    };
+    auto refreshBitSourceDetail = [bitWidgets, sourceToProto, this]() {
+        const QString proto = sourceToProto(bitWidgets.source->currentText());
+        const bool needsDetail = (proto == "tx_ant" || proto == "rx_ant" || proto == "ordinal_slice");
+        bitWidgets.sourceDetail->setVisible(needsDetail);
+        bitWidgets.sourceDetailLabel->setVisible(needsDetail);
+        if (!needsDetail) return;
+        QSignalBlocker blocker(bitWidgets.sourceDetail);
+        bitWidgets.sourceDetail->clear();
+        if (proto == "ordinal_slice") {
+            for (int i = 0; i < m_model->maxSlices(); ++i)
+                bitWidgets.sourceDetail->addItem(QString::number(i));
+        } else {
+            bitWidgets.sourceDetail->addItems(m_model->knownAntennaTokens());
+        }
+    };
+    refreshBitOutputVisibility();
+    refreshBitSourceDetail();
+
+    auto refreshBitDetail = [=]() {
+        auto* item = cableList->currentItem();
+        if (!item) return;
+        const QString sn = item->data(Qt::UserRole).toString();
+        if (!cableModel->cables().contains(sn)) return;
+        const auto& cable = cableModel->cables()[sn];
+        if (cable.type != "bit") return;
+        const int b = qBound(0, *currentBit, 7);
+        const auto& bit = cable.bits[b];
+
+        QSignalBlocker blk1(bitWidgets.enabled), blk2(bitWidgets.source),
+                       blk3(bitWidgets.sourceDetail), blk4(bitWidgets.output),
+                       blk5(bitWidgets.band), blk6(bitWidgets.lowFreq),
+                       blk7(bitWidgets.highFreq), blk8(bitWidgets.polarity),
+                       blk9(bitWidgets.pttDependent), blk10(bitWidgets.pttDelay),
+                       blk11(bitWidgets.txDelay);
+
+        bitWidgets.enabled->setChecked(bit.enabled);
+        bitWidgets.source->setCurrentIndex(protoToSource(bit.source));
+        bitWidgets.output->setCurrentText(bit.output.isEmpty() ? "band" : bit.output);
+        bitWidgets.band->setText(bit.band);
+        bitWidgets.lowFreq->setText(QString::number(bit.lowFreqMhz, 'f', 3));
+        bitWidgets.highFreq->setText(QString::number(bit.highFreqMhz, 'f', 3));
+        bitWidgets.polarity->setCurrentIndex(bit.activeHigh ? 0 : 1);
+        bitWidgets.pttDependent->setChecked(bit.pttDependent);
+        bitWidgets.pttDelay->setValue(bit.pttDelayMs);
+        bitWidgets.txDelay->setValue(bit.txDelayMs);
+
+        refreshBitOutputVisibility();
+        refreshBitSourceDetail();
+        QString detailValue;
+        if (bit.source == "tx_ant")           detailValue = bit.sourceTxAnt;
+        else if (bit.source == "rx_ant")      detailValue = bit.sourceRxAnt;
+        else if (bit.source == "ordinal_slice") detailValue = bit.sourceSlice;
+        bitWidgets.sourceDetail->setCurrentText(detailValue);
+    };
 
     // Page 4: Passthrough cable
     QWidget* ptPage;
     QLineEdit* ptNameEdit;
     QCheckBox* ptEnabledCheck;
     QLabel*    ptStatusLabel;
-    QGroupBox* ptSerialGroup;
+    SerialWidgets ptSerialWidgets;
+    QComboBox* ptTypeCombo;
     {
         ptPage = new QWidget;
         auto* vbox = new QVBoxLayout(ptPage);
         vbox->setSpacing(6);
 
-        auto* headerGroup = new QGroupBox("Cable Settings");
-        headerGroup->setStyleSheet(kGroupStyle);
-        auto* hg = new QGridLayout(headerGroup);
-        hg->setSpacing(4);
-        hg->addWidget(new QLabel("Name:"), 0, 0);
-        ptNameEdit = new QLineEdit;
-        ptNameEdit->setStyleSheet(kEdit);
-        hg->addWidget(ptNameEdit, 0, 1);
-        ptEnabledCheck = new QCheckBox("Enabled");
-        ptEnabledCheck->setStyleSheet(kCheck);
-        hg->addWidget(ptEnabledCheck, 1, 0, 1, 2);
-        ptStatusLabel = new QLabel("Unplugged");
-        AetherSDR::ThemeManager::instance().applyStyleSheet(ptStatusLabel, "QLabel { color: {{color.text.label}}; font-size: 11px; }");
-        hg->addWidget(new QLabel("Status:"), 2, 0);
-        hg->addWidget(ptStatusLabel, 2, 1);
-        vbox->addWidget(headerGroup);
+        auto ptHeader = makeCableHeader(/*includeEnabled=*/true);
+        ptNameEdit = ptHeader.nameEdit;
+        ptEnabledCheck = ptHeader.enabledCheck;
+        ptStatusLabel = ptHeader.statusLabel;
+        ptTypeCombo = ptHeader.typeCombo;
+        vbox->addWidget(ptHeader.group);
 
-        ptSerialGroup = makeSerialGroup("Serial Parameters");
-        vbox->addWidget(ptSerialGroup);
+        ptSerialWidgets = makeSerialGroup("Serial Parameters");
+        vbox->addWidget(ptSerialWidgets.group);
 
         vbox->addStretch();
         stack->addWidget(ptPage);  // index 4
+    }
+
+    // Page 5: LDPA cable
+    QWidget* ldpaPage;
+    QLineEdit* ldpaNameEdit;
+    QCheckBox* ldpaEnabledCheck;
+    QLabel*    ldpaStatusLabel;
+    QComboBox* ldpaTypeCombo;
+    QComboBox* ldpaBandCombo;
+    QCheckBox* ldpaPreampCheck;
+    QComboBox* ldpaSourceCombo;
+    {
+        ldpaPage = new QWidget;
+        auto* vbox = new QVBoxLayout(ldpaPage);
+        vbox->setSpacing(6);
+
+        auto ldpaHeader = makeCableHeader(/*includeEnabled=*/true);
+        ldpaNameEdit = ldpaHeader.nameEdit;
+        ldpaEnabledCheck = ldpaHeader.enabledCheck;
+        ldpaStatusLabel = ldpaHeader.statusLabel;
+        ldpaTypeCombo = ldpaHeader.typeCombo;
+        vbox->addWidget(ldpaHeader.group);
+
+        auto* ldpaGroup = new QGroupBox("LDPA Settings");
+        ldpaGroup->setStyleSheet(kGroupStyle);
+        auto* lg = new QGridLayout(ldpaGroup);
+        lg->setSpacing(4);
+        lg->addWidget(new QLabel("Band:"), 0, 0);
+        // GuardedComboBox: scroll-wrapped tab + destructive `band=` on change.
+        ldpaBandCombo = new GuardedComboBox;
+        ldpaBandCombo->addItems({"2m", "4m"});
+        ldpaBandCombo->setStyleSheet(kCombo);
+        ldpaBandCombo->setAccessibleName("LDPA band");
+        ldpaBandCombo->setAccessibleDescription("LDPA amplifier band (2m or 4m)");
+        lg->addWidget(ldpaBandCombo, 0, 1);
+        ldpaPreampCheck = new QCheckBox("Preamp");
+        AetherSDR::ThemeManager::instance().applyStyleSheet(ldpaPreampCheck, kCheck);
+        lg->addWidget(ldpaPreampCheck, 1, 0, 1, 2);
+        lg->addWidget(new QLabel("Source:"), 2, 0);
+        ldpaSourceCombo = makeSourceCombo();
+        lg->addWidget(ldpaSourceCombo, 2, 1);
+        vbox->addWidget(ldpaGroup);
+
+        vbox->addStretch();
+        stack->addWidget(ldpaPage);  // index 5
+    }
+
+    // Page 6: Unconfigured cable (type is "invalid" or otherwise unrecognized —
+    // a real, present cable that hasn't been assigned a type yet, distinct
+    // from "nothing plugged in" at index 0)
+    QWidget* unconfiguredPage;
+    QLineEdit* unconfiguredNameEdit;
+    QLabel*    unconfiguredStatusLabel;
+    QComboBox* unconfiguredTypeCombo;
+    QPushButton* unconfiguredRemoveBtn;
+    {
+        unconfiguredPage = new QWidget;
+        auto* vbox = new QVBoxLayout(unconfiguredPage);
+        vbox->setSpacing(6);
+
+        auto unconfiguredHeader = makeCableHeader(/*includeEnabled=*/false);
+        unconfiguredNameEdit = unconfiguredHeader.nameEdit;
+        unconfiguredStatusLabel = unconfiguredHeader.statusLabel;
+        unconfiguredTypeCombo = unconfiguredHeader.typeCombo;
+        unconfiguredTypeCombo->setCurrentIndex(-1);  // force a real choice, no default
+        vbox->addWidget(unconfiguredHeader.group);
+
+        auto* note = new QLabel("Select a cable type to configure this device.");
+        note->setStyleSheet("QLabel { color: #606880; font-size: 12px; }");
+        note->setWordWrap(true);
+        vbox->addWidget(note);
+
+        unconfiguredRemoveBtn = new QPushButton("Remove This Cable");
+        unconfiguredRemoveBtn->setAutoDefault(false);
+        vbox->addWidget(unconfiguredRemoveBtn);
+
+        vbox->addStretch();
+        stack->addWidget(unconfiguredPage);  // index 6
     }
 
     hbox->addWidget(stack, 1);
@@ -4033,7 +5326,11 @@ QWidget* RadioSetupDialog::buildUsbCablesTab()
 
         if (t == "cat") {
             stack->setCurrentIndex(1);
-            QSignalBlocker b1(catNameEdit), b2(catEnabledCheck), b3(catSourceCombo), b4(catAutoReportCheck);
+            QSignalBlocker b1(catNameEdit), b2(catEnabledCheck), b3(catSourceCombo),
+                           b4(catAutoReportCheck), b5(catTypeCombo);
+            QSignalBlocker b6(catSerialWidgets.speed), b7(catSerialWidgets.data),
+                           b8(catSerialWidgets.parity), b9(catSerialWidgets.stop),
+                           b10(catSerialWidgets.flow);
             catNameEdit->setText(cable.name);
             catEnabledCheck->setChecked(cable.enabled);
             catStatusLabel->setText(cable.present ? "Plugged In" : "Unplugged");
@@ -4042,10 +5339,17 @@ QWidget* RadioSetupDialog::buildUsbCablesTab()
                 : "QLabel { color: #808080; font-size: 11px; }");
             catSourceCombo->setCurrentIndex(protoToSource(cable.source));
             catAutoReportCheck->setChecked(cable.autoReport);
+            catTypeCombo->setCurrentIndex(protoToTypeIndex(t));
+
+            catSerialWidgets.speed->setCurrentText(QString::number(cable.speed));
+            catSerialWidgets.data->setCurrentText(QString::number(cable.dataBits));
+            catSerialWidgets.parity->setCurrentText(cable.parity);
+            catSerialWidgets.stop->setCurrentText(QString::number(cable.stopBits));
+            catSerialWidgets.flow->setCurrentText(cable.flowControl);
         } else if (t == "bcd" || t == "vbcd" || t == "bcd_vbcd") {
             stack->setCurrentIndex(2);
             QSignalBlocker b1(bcdNameEdit), b2(bcdEnabledCheck), b3(bcdSourceCombo),
-                           b4(bcdTypeCombo), b5(bcdPolarityCombo);
+                           b4(bcdTypeCombo), b5(bcdPolarityCombo), b6(bcdCableTypeCombo);
             bcdNameEdit->setText(cable.name);
             bcdEnabledCheck->setChecked(cable.enabled);
             bcdStatusLabel->setText(cable.present ? "Plugged In" : "Unplugged");
@@ -4057,30 +5361,68 @@ QWidget* RadioSetupDialog::buildUsbCablesTab()
             else if (t == "bcd_vbcd") bcdTypeCombo->setCurrentIndex(2);
             else bcdTypeCombo->setCurrentIndex(0);
             bcdPolarityCombo->setCurrentIndex(cable.activeHigh ? 0 : 1);
+            bcdCableTypeCombo->setCurrentIndex(protoToTypeIndex(t));
         } else if (t == "bit") {
             stack->setCurrentIndex(3);
-            QSignalBlocker b1(bitNameEdit), b2(bitEnabledCheck);
+            QSignalBlocker b1(bitNameEdit), b2(bitEnabledCheck), b3(bitTypeCombo);
             bitNameEdit->setText(cable.name);
             bitEnabledCheck->setChecked(cable.enabled);
             bitStatusLabel->setText(cable.present ? "Plugged In" : "Unplugged");
             bitStatusLabel->setStyleSheet(cable.present
                 ? "QLabel { color: #30d050; font-size: 11px; }"
                 : "QLabel { color: #808080; font-size: 11px; }");
-            // Update bit grid rows
-            auto* bitGroup = bitPage->findChild<QGroupBox*>("Bit Configuration (0-7)");
-            // Bit grid cells are updated by index in the grid layout — skip for now,
-            // per-bit UI refresh would iterate the grid children
+            bitTypeCombo->setCurrentIndex(protoToTypeIndex(t));
+            if (bitIndexList->currentRow() < 0) {
+                QSignalBlocker blk(bitIndexList);
+                bitIndexList->setCurrentRow(0);
+            }
+            refreshBitDetail();
         } else if (t == "passthrough") {
             stack->setCurrentIndex(4);
-            QSignalBlocker b1(ptNameEdit), b2(ptEnabledCheck);
+            QSignalBlocker b1(ptNameEdit), b2(ptEnabledCheck), b3(ptTypeCombo);
+            QSignalBlocker b4(ptSerialWidgets.speed), b5(ptSerialWidgets.data),
+                           b6(ptSerialWidgets.parity), b7(ptSerialWidgets.stop),
+                           b8(ptSerialWidgets.flow);
             ptNameEdit->setText(cable.name);
             ptEnabledCheck->setChecked(cable.enabled);
             ptStatusLabel->setText(cable.present ? "Plugged In" : "Unplugged");
             ptStatusLabel->setStyleSheet(cable.present
                 ? "QLabel { color: #30d050; font-size: 11px; }"
                 : "QLabel { color: #808080; font-size: 11px; }");
+            ptTypeCombo->setCurrentIndex(protoToTypeIndex(t));
+
+            ptSerialWidgets.speed->setCurrentText(QString::number(cable.speed));
+            ptSerialWidgets.data->setCurrentText(QString::number(cable.dataBits));
+            ptSerialWidgets.parity->setCurrentText(cable.parity);
+            ptSerialWidgets.stop->setCurrentText(QString::number(cable.stopBits));
+            ptSerialWidgets.flow->setCurrentText(cable.flowControl);
+        } else if (t == "ldpa") {
+            stack->setCurrentIndex(5);
+            QSignalBlocker b1(ldpaNameEdit), b2(ldpaEnabledCheck), b3(ldpaTypeCombo),
+                           b4(ldpaBandCombo), b5(ldpaPreampCheck), b6(ldpaSourceCombo);
+            ldpaNameEdit->setText(cable.name);
+            ldpaEnabledCheck->setChecked(cable.enabled);
+            ldpaStatusLabel->setText(cable.present ? "Plugged In" : "Unplugged");
+            ldpaStatusLabel->setStyleSheet(cable.present
+                ? "QLabel { color: #30d050; font-size: 11px; }"
+                : "QLabel { color: #808080; font-size: 11px; }");
+            ldpaTypeCombo->setCurrentIndex(protoToTypeIndex(t));
+            ldpaBandCombo->setCurrentIndex(cable.ldpaBand == "4" ? 1 : 0);
+            ldpaPreampCheck->setChecked(cable.preamp);
+            ldpaSourceCombo->setCurrentIndex(protoToSource(cable.source));
         } else {
-            stack->setCurrentIndex(0);
+            // "invalid" or any other unrecognized type: a real, present cable
+            // that hasn't been assigned a type yet — distinct from "nothing
+            // plugged in" (index 0), which is handled by the isEmpty()/
+            // not-found guard above and by the cableRemoved handler.
+            stack->setCurrentIndex(6);
+            QSignalBlocker b1(unconfiguredNameEdit), b2(unconfiguredTypeCombo);
+            unconfiguredNameEdit->setText(cable.name);
+            unconfiguredStatusLabel->setText(cable.present ? "Plugged In" : "Unplugged");
+            unconfiguredStatusLabel->setStyleSheet(cable.present
+                ? "QLabel { color: #30d050; font-size: 11px; }"
+                : "QLabel { color: #808080; font-size: 11px; }");
+            unconfiguredTypeCombo->setCurrentIndex(-1);
         }
     };
 
@@ -4091,12 +5433,43 @@ QWidget* RadioSetupDialog::buildUsbCablesTab()
     });
 
     // ── Wire model signals ──────────────────────────────────────────────
-    connect(cableModel, &UsbCableModel::cableAdded, this, [refreshList](const QString&) {
+    connect(cableModel, &UsbCableModel::cableAdded, this,
+            [refreshList, cableList, showCableProps, pendingTypeChangeSn](const QString& sn) {
         refreshList();
+        // A retype tears the old cable entry down and rebuilds it fresh
+        // (UsbCableModel::applyStatus), which drops the list selection along
+        // the way (see the cableRemoved handler below). Reselect and
+        // repopulate the detail panel so a successful retype doesn't leave
+        // it stuck on the empty-state page until manually re-clicked.
+        if (*pendingTypeChangeSn == sn) {
+            pendingTypeChangeSn->clear();
+            for (int i = 0; i < cableList->count(); ++i) {
+                if (cableList->item(i)->data(Qt::UserRole).toString() == sn) {
+                    cableList->setCurrentItem(cableList->item(i));
+                    break;
+                }
+            }
+            showCableProps(sn);
+        }
     });
-    connect(cableModel, &UsbCableModel::cableRemoved, this, [refreshList, stack](const QString&) {
+    connect(cableModel, &UsbCableModel::cableRemoved, this,
+            [refreshList, stack, pendingTypeChangeSn](const QString& sn) {
         refreshList();
         stack->setCurrentIndex(0);
+        // Defer the clear to the next event-loop tick: a genuine retype's own
+        // cableAdded for this serial fires synchronously right after this
+        // handler returns (same applyStatus() call) and clears the pointer
+        // itself first, so this is a no-op for that case. It only matters for
+        // a standalone removal unrelated to any pending retype, preventing a
+        // later unplug/replug's cableAdded from being mistaken for a retype
+        // completion.
+        if (*pendingTypeChangeSn == sn) {
+            QTimer::singleShot(0, [pendingTypeChangeSn, sn]() {
+                if (*pendingTypeChangeSn == sn) {
+                    pendingTypeChangeSn->clear();
+                }
+            });
+        }
     });
     connect(cableModel, &UsbCableModel::cableChanged, this,
             [refreshList, cableList, showCableProps](const QString& sn) {
@@ -4126,6 +5499,13 @@ QWidget* RadioSetupDialog::buildUsbCablesTab()
     connect(catAutoReportCheck, &QCheckBox::toggled, this, [sendCatProp](bool on) {
         sendCatProp("auto_report", on ? "1" : "0");
     });
+    wireTypeCombo(catTypeCombo);
+
+    connect(catSerialWidgets.speed, &QComboBox::currentTextChanged, this, [sendCatProp](const QString& val) { sendCatProp("speed", val); });
+    connect(catSerialWidgets.data, &QComboBox::currentTextChanged, this, [sendCatProp](const QString& val) { sendCatProp("data_bits", val); });
+    connect(catSerialWidgets.parity, &QComboBox::currentTextChanged, this, [sendCatProp](const QString& val) { sendCatProp("parity", val); });
+    connect(catSerialWidgets.stop, &QComboBox::currentTextChanged, this, [sendCatProp](const QString& val) { sendCatProp("stop_bits", val); });
+    connect(catSerialWidgets.flow, &QComboBox::currentTextChanged, this, [sendCatProp](const QString& val) { sendCatProp("flow_control", val); });
 
     // BCD
     auto sendBcdProp = [cableModel, cableList](const QString& key, const QString& val) {
@@ -4152,8 +5532,9 @@ QWidget* RadioSetupDialog::buildUsbCablesTab()
             [sendBcdProp, sourceToProto](const QString& text) {
         sendBcdProp("source", sourceToProto(text));
     });
+    wireTypeCombo(bcdCableTypeCombo);
 
-    // Bit cable header
+    // Bit cable header (whole-cable name/enable, cableModel->sendSet)
     auto sendBitProp = [cableModel, cableList](const QString& key, const QString& val) {
         auto* item = cableList->currentItem();
         if (!item) return;
@@ -4164,6 +5545,65 @@ QWidget* RadioSetupDialog::buildUsbCablesTab()
     });
     connect(bitEnabledCheck, &QCheckBox::toggled, this, [sendBitProp](bool on) {
         sendBitProp("enable", on ? "1" : "0");
+    });
+    wireTypeCombo(bitTypeCombo);
+
+    // Bit detail fields (per-bit, cableModel->sendSetBit against *currentBit)
+    auto sendBitFieldProp = [cableModel, cableList, currentBit](const QString& key, const QString& val) {
+        auto* item = cableList->currentItem();
+        if (!item) return;
+        cableModel->sendSetBit(item->data(Qt::UserRole).toString(), *currentBit, key, val);
+    };
+    connect(bitWidgets.enabled, &QCheckBox::toggled, this, [sendBitFieldProp](bool on) {
+        sendBitFieldProp("enable", on ? "1" : "0");
+    });
+    connect(bitWidgets.source, &QComboBox::currentTextChanged, this,
+            [sendBitFieldProp, sourceToProto, refreshBitSourceDetail](const QString& text) {
+        sendBitFieldProp("source", sourceToProto(text));
+        refreshBitSourceDetail();
+    });
+    connect(bitWidgets.sourceDetail, &QComboBox::currentTextChanged, this,
+            [sendBitFieldProp, sourceToProto, bitWidgets](const QString& text) {
+        if (text.isEmpty()) return;
+        const QString proto = sourceToProto(bitWidgets.source->currentText());
+        if (proto == "tx_ant") sendBitFieldProp("source_tx_ant", text);
+        else if (proto == "rx_ant") sendBitFieldProp("source_rx_ant", text);
+        else if (proto == "ordinal_slice") sendBitFieldProp("source_slice", text);
+    });
+    connect(bitWidgets.output, &QComboBox::currentTextChanged, this,
+            [sendBitFieldProp, refreshBitOutputVisibility](const QString& text) {
+        sendBitFieldProp("output", text);
+        refreshBitOutputVisibility();
+    });
+    connect(bitWidgets.band, &QLineEdit::editingFinished, this, [sendBitFieldProp, bitWidgets]() {
+        sendBitFieldProp("band", bitWidgets.band->text());
+    });
+    connect(bitWidgets.lowFreq, &QLineEdit::editingFinished, this, [sendBitFieldProp, bitWidgets]() {
+        sendBitFieldProp("low_freq", QString::number(bitWidgets.lowFreq->text().toDouble(), 'f', 3));
+    });
+    connect(bitWidgets.highFreq, &QLineEdit::editingFinished, this, [sendBitFieldProp, bitWidgets]() {
+        sendBitFieldProp("high_freq", QString::number(bitWidgets.highFreq->text().toDouble(), 'f', 3));
+    });
+    connect(bitWidgets.polarity, &QComboBox::currentTextChanged, this,
+            [sendBitFieldProp](const QString& text) {
+        sendBitFieldProp("polarity", text == "High" ? "active_high" : "active_low");
+    });
+    connect(bitWidgets.pttDependent, &QCheckBox::toggled, this, [sendBitFieldProp](bool on) {
+        sendBitFieldProp("ptt_dependent", on ? "1" : "0");
+    });
+    connect(bitWidgets.pttDelay, QOverload<int>::of(&QSpinBox::valueChanged), this,
+            [sendBitFieldProp](int val) {
+        sendBitFieldProp("ptt_delay", QString::number(val));
+    });
+    connect(bitWidgets.txDelay, QOverload<int>::of(&QSpinBox::valueChanged), this,
+            [sendBitFieldProp](int val) {
+        sendBitFieldProp("tx_delay", QString::number(val));
+    });
+    connect(bitIndexList, &QListWidget::currentRowChanged, this,
+            [currentBit, refreshBitDetail](int row) {
+        if (row < 0) return;
+        *currentBit = row;
+        refreshBitDetail();
     });
 
     // Passthrough
@@ -4178,6 +5618,55 @@ QWidget* RadioSetupDialog::buildUsbCablesTab()
     connect(ptEnabledCheck, &QCheckBox::toggled, this, [sendPtProp](bool on) {
         sendPtProp("enable", on ? "1" : "0");
     });
+    wireTypeCombo(ptTypeCombo);
+
+    // LDPA
+    auto sendLdpaProp = [cableModel, cableList](const QString& key, const QString& val) {
+        auto* item = cableList->currentItem();
+        if (!item) return;
+        cableModel->sendSet(item->data(Qt::UserRole).toString(), key, val);
+    };
+    connect(ldpaNameEdit, &QLineEdit::editingFinished, this, [ldpaNameEdit, sendLdpaProp]() {
+        sendLdpaProp("name", QString(ldpaNameEdit->text()).replace(' ', QChar(0x7F)));
+    });
+    connect(ldpaEnabledCheck, &QCheckBox::toggled, this, [sendLdpaProp](bool on) {
+        sendLdpaProp("enable", on ? "1" : "0");
+    });
+    wireTypeCombo(ldpaTypeCombo);
+    connect(ldpaBandCombo, &QComboBox::currentIndexChanged, this,
+            [sendLdpaProp](int idx) {
+        sendLdpaProp("band", idx == 1 ? "4" : "2");
+    });
+    connect(ldpaPreampCheck, &QCheckBox::toggled, this, [sendLdpaProp](bool on) {
+        sendLdpaProp("preamp", on ? "1" : "0");
+    });
+    connect(ldpaSourceCombo, &QComboBox::currentTextChanged, this,
+            [sendLdpaProp, sourceToProto](const QString& text) {
+        sendLdpaProp("source", sourceToProto(text));
+    });
+
+    // Unconfigured cable
+    auto sendUnconfiguredProp = [cableModel, cableList](const QString& key, const QString& val) {
+        auto* item = cableList->currentItem();
+        if (!item) return;
+        cableModel->sendSet(item->data(Qt::UserRole).toString(), key, val);
+    };
+    connect(unconfiguredNameEdit, &QLineEdit::editingFinished, this,
+            [unconfiguredNameEdit, sendUnconfiguredProp]() {
+        sendUnconfiguredProp("name", QString(unconfiguredNameEdit->text()).replace(' ', QChar(0x7F)));
+    });
+    wireTypeCombo(unconfiguredTypeCombo);
+    connect(unconfiguredRemoveBtn, &QPushButton::clicked, this, [cableModel, cableList]() {
+        auto* item = cableList->currentItem();
+        if (!item) return;
+        cableModel->sendRemove(item->data(Qt::UserRole).toString());
+    });
+
+    connect(ptSerialWidgets.speed, &QComboBox::currentTextChanged, this, [sendPtProp](const QString& val) { sendPtProp("speed", val); });
+    connect(ptSerialWidgets.data, &QComboBox::currentTextChanged, this, [sendPtProp](const QString& val) { sendPtProp("data_bits", val); });
+    connect(ptSerialWidgets.parity, &QComboBox::currentTextChanged, this, [sendPtProp](const QString& val) { sendPtProp("parity", val); });
+    connect(ptSerialWidgets.stop, &QComboBox::currentTextChanged, this, [sendPtProp](const QString& val) { sendPtProp("stop_bits", val); });
+    connect(ptSerialWidgets.flow, &QComboBox::currentTextChanged, this, [sendPtProp](const QString& val) { sendPtProp("flow_control", val); });
 
     // Initial populate
     refreshList();
@@ -4222,7 +5711,8 @@ QWidget* RadioSetupDialog::buildSerialTab()
 
         auto* ulanziEnable = new QCheckBox("Enable Ulanzi Dial");
         AetherSDR::ThemeManager::instance().applyStyleSheet(
-            ulanziEnable, "QCheckBox { color: {{color.text.primary}}; }");
+            ulanziEnable, "QCheckBox { color: {{color.text.primary}}; spacing: 8px; }"
+            + kCheckBoxIndicator);
         ulanziEnable->setChecked(
             settings.value("UlanziDialEnabled", "False").toString() == "True");
         connect(ulanziEnable, &QCheckBox::toggled, this, [this](bool on) {
@@ -4237,7 +5727,8 @@ QWidget* RadioSetupDialog::buildSerialTab()
         auto* hidEnable = new QCheckBox(
             "Enable HID encoders / StreamDeck+ (RC-28, PowerMate, ShuttleXpress, …)");
         AetherSDR::ThemeManager::instance().applyStyleSheet(
-            hidEnable, "QCheckBox { color: {{color.text.primary}}; }");
+            hidEnable, "QCheckBox { color: {{color.text.primary}}; spacing: 8px; }"
+            + kCheckBoxIndicator);
         hidEnable->setChecked(
             settings.value("HidEncoderEnabled", "False").toString() == "True");
         connect(hidEnable, &QCheckBox::toggled, this, [this](bool on) {
@@ -4263,22 +5754,10 @@ QWidget* RadioSetupDialog::buildSerialTab()
         grid->addWidget(new QLabel("Port:"), 0, 0);
         auto* portCombo = new QComboBox;
         portCombo->setMinimumWidth(200);
-        for (const auto& info : QSerialPortInfo::availablePorts())
-            portCombo->addItem(QString("%1 — %2").arg(info.portName(), info.description()),
-                               info.portName());
-        // "Custom..." sentinel triggers manual entry field
-        portCombo->addItem("Custom...", QStringLiteral("__custom__"));
         QString savedPort = settings.value("SerialPortName", "").toString();
-        bool isCustom = false;
-        for (int i = 0; i < portCombo->count() - 1; ++i) {
-            if (portCombo->itemData(i).toString() == savedPort) {
-                portCombo->setCurrentIndex(i);
-                break;
-            }
-            if (i == portCombo->count() - 2) {
-                isCustom = !savedPort.isEmpty();
-            }
-        }
+        auto* customEdit = new QLineEdit;
+        customEdit->setPlaceholderText("/dev/ttyr0");
+        bool isCustom = populateSerialPortCombo(portCombo, customEdit, savedPort);
         grid->addWidget(portCombo, 0, 1);
 
         auto* refreshBtn = new QPushButton("Refresh");
@@ -4289,14 +5768,8 @@ QWidget* RadioSetupDialog::buildSerialTab()
 
         // Custom port row — hidden unless "Custom..." selected or saved port is custom
         auto* customLabel = new QLabel("Path:");
-        auto* customEdit = new QLineEdit;
-        customEdit->setPlaceholderText("/dev/ttyr0");
         customLabel->setVisible(isCustom);
         customEdit->setVisible(isCustom);
-        if (isCustom) {
-            customEdit->setText(savedPort);
-            portCombo->setCurrentIndex(portCombo->count() - 1);  // select "Custom..."
-        }
         grid->addWidget(customLabel, 1, 0);
         grid->addWidget(customEdit, 1, 1, 1, 3);
 
@@ -4486,7 +5959,9 @@ QWidget* RadioSetupDialog::buildSerialTab()
 
         // Paddle swap
         auto* swapCb = new QCheckBox("Paddle Swap (swap dit/dah)");
-        AetherSDR::ThemeManager::instance().applyStyleSheet(swapCb, "QCheckBox { color: {{color.text.primary}}; }");
+        AetherSDR::ThemeManager::instance().applyStyleSheet(swapCb,
+            "QCheckBox { color: {{color.text.primary}}; spacing: 8px; }"
+            + kCheckBoxIndicator);
         swapCb->setChecked(AppSettings::instance().value("SerialPaddleSwap", "False").toString() == "True");
         connect(swapCb, &QCheckBox::toggled, this, [](bool on) {
             auto& s = AppSettings::instance();
@@ -4559,7 +6034,9 @@ QWidget* RadioSetupDialog::buildSerialTab()
         vbox->addLayout(row);
 
         auto* autoOpen = new QCheckBox("Auto-open serial port on startup");
-        AetherSDR::ThemeManager::instance().applyStyleSheet(autoOpen, "QCheckBox { color: {{color.text.primary}}; }");
+        AetherSDR::ThemeManager::instance().applyStyleSheet(autoOpen,
+            "QCheckBox { color: {{color.text.primary}}; spacing: 8px; }"
+            + kCheckBoxIndicator);
         autoOpen->setChecked(settings.value("SerialAutoOpen", "False").toString() == "True");
         connect(autoOpen, &QCheckBox::toggled, this, [](bool on) {
             auto& s = AppSettings::instance();
@@ -4687,7 +6164,9 @@ QWidget* RadioSetupDialog::buildSerialTab()
 
         // Auto-detect checkbox
         auto* autoDetect = new QCheckBox("Auto-detect on startup");
-        AetherSDR::ThemeManager::instance().applyStyleSheet(autoDetect, "QCheckBox { color: {{color.text.primary}}; }");
+        AetherSDR::ThemeManager::instance().applyStyleSheet(autoDetect,
+            "QCheckBox { color: {{color.text.primary}}; spacing: 8px; }"
+            + kCheckBoxIndicator);
         autoDetect->setChecked(settings.value("FlexControlAutoDetect", "True").toString() == "True");
         connect(autoDetect, &QCheckBox::toggled, this, [this](bool on) {
             auto& s = AppSettings::instance();
@@ -4698,7 +6177,9 @@ QWidget* RadioSetupDialog::buildSerialTab()
         grid->addWidget(autoDetect, 5, 0, 1, 3);
 
         auto* invertDir = new QCheckBox("Invert tuning direction");
-        AetherSDR::ThemeManager::instance().applyStyleSheet(invertDir, "QCheckBox { color: {{color.text.primary}}; }");
+        AetherSDR::ThemeManager::instance().applyStyleSheet(invertDir,
+            "QCheckBox { color: {{color.text.primary}}; spacing: 8px; }"
+            + kCheckBoxIndicator);
         invertDir->setChecked(settings.value("FlexControlInvertDir", "False").toString() == "True");
         m_flexControlInvertCheck = invertDir;
         connect(invertDir, &QCheckBox::toggled, this, [this](bool on) {
@@ -5414,7 +6895,7 @@ QWidget* RadioSetupDialog::buildPeripheralsTab()
             [this]() { m_ag->disconnectFromDevice(); },
             isSsConnected,
             [this]() { return m_ag->peerAddress(); },
-            [this]() { return (quint16)9007; });
+            []() { return (quint16)9007; });
         connect(m_ag, &AntennaGeniusModel::connected,    this, updateSs);
         connect(m_ag, &AntennaGeniusModel::disconnected, this, updateSs);
 
@@ -5446,6 +6927,201 @@ QWidget* RadioSetupDialog::buildPeripheralsTab()
         });
     }
 
+    // Row 5: ACOM S-series amplifier — serial OR ser2net network, unlike the
+    // rows above (which are network-only). See
+    // docs/architecture/acom-600s-amplifier-design.md for the design note.
+    if (m_acom) {
+        const int row = 5;
+        static const QString kComboStyle =
+            "QComboBox { background: #1a2a3a; border: 1px solid #304050; "
+            "border-radius: 3px; color: #c8d8e8; font-size: 12px; padding: 2px 4px; }"
+            "QComboBox::drop-down { border: none; }";
+
+        auto* devWidget = new QWidget;
+        auto* devLay = new QVBoxLayout(devWidget);
+        devLay->setContentsMargins(0, 0, 0, 0);
+        devLay->setSpacing(2);
+        auto* devLbl = new QLabel("ACOM Amplifier");
+        devLbl->setStyleSheet(kLabelStyle);
+        devLay->addWidget(devLbl);
+        auto* modeCombo = new QComboBox;
+        modeCombo->setStyleSheet(kComboStyle);
+#ifdef HAVE_SERIALPORT
+        modeCombo->addItem("Serial", "Serial");
+#endif
+        modeCombo->addItem("Network", "Network");
+        devLay->addWidget(modeCombo);
+        grid->addWidget(devWidget, row, 0);
+
+        // Address column: serial-port combo (with "Custom..." fallback, same
+        // pattern as the CW/keying Port Configuration group) OR a plain IP
+        // field, swapped via a QStackedWidget.
+        auto* addrStack = new QStackedWidget;
+        int serialPageIdx = -1;
+        QComboBox* serialCombo = nullptr;
+        QLineEdit* serialCustomEdit = nullptr;
+#ifdef HAVE_SERIALPORT
+        {
+            auto* serialPage = new QWidget;
+            auto* lay = new QHBoxLayout(serialPage);
+            lay->setContentsMargins(0, 0, 0, 0);
+            serialCombo = new QComboBox;
+            serialCombo->setStyleSheet(kComboStyle);
+            serialCustomEdit = new QLineEdit;
+            serialCustomEdit->setPlaceholderText("/dev/ttyUSB0");
+            serialCustomEdit->setStyleSheet(kEditStyle);
+            const QString savedSerialPort = PeripheralSettings::deviceString("Acom", "SerialPort");
+            populateSerialPortCombo(serialCombo, serialCustomEdit, savedSerialPort);
+            serialCustomEdit->setVisible(serialCombo->currentData().toString() == "__custom__");
+            connect(serialCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this,
+                    [serialCombo, serialCustomEdit](int idx) {
+                serialCustomEdit->setVisible(serialCombo->itemData(idx).toString() == "__custom__");
+            });
+            lay->addWidget(serialCombo, 1);
+            lay->addWidget(serialCustomEdit, 1);
+            serialPageIdx = addrStack->addWidget(serialPage);
+        }
+#endif
+        auto* netPage = new QWidget;
+        auto* netLay = new QHBoxLayout(netPage);
+        netLay->setContentsMargins(0, 0, 0, 0);
+        auto* netIpEdit = new QLineEdit;
+        netIpEdit->setPlaceholderText("ser2net host, raw mode — e.g. 192.168.1.52");
+        netIpEdit->setStyleSheet(kEditStyle);
+        netIpEdit->setText(PeripheralSettings::deviceString("Acom", "ManualIp"));
+        netLay->addWidget(netIpEdit);
+        const int netPageIdx = addrStack->addWidget(netPage);
+        grid->addWidget(addrStack, row, 1);
+
+        // Port/baud column: fixed "9600 8N1" text for serial (not
+        // user-configurable — mandated by the amplifier's own protocol
+        // spec) OR a port spin box for network mode.
+        auto* portStack = new QStackedWidget;
+        int serialBaudIdx = -1;
+#ifdef HAVE_SERIALPORT
+        {
+            auto* fixedLbl = new QLabel("9600 8N1");
+            fixedLbl->setStyleSheet("QLabel { color: #8aa8c0; font-size: 11px; }");
+            serialBaudIdx = portStack->addWidget(fixedLbl);
+        }
+#endif
+        auto* netPortSpin = new QSpinBox;
+        netPortSpin->setRange(1, 65535);
+        netPortSpin->setValue(PeripheralSettings::deviceInt("Acom", "ManualPort", 7000));
+        AetherSDR::ThemeManager::instance().applyStyleSheet(netPortSpin,
+            "QSpinBox { background: {{color.background.1}}; border: 1px solid {{color.background.2}}; "
+            "border-radius: 3px; color: {{color.text.primary}}; font-size: 12px; padding: 2px; }");
+        const int netPortIdx = portStack->addWidget(netPortSpin);
+        grid->addWidget(portStack, row, 2);
+
+        auto applyMode = [=](const QString& mode) {
+#ifdef HAVE_SERIALPORT
+            if (mode == "Serial" && serialPageIdx >= 0) {
+                addrStack->setCurrentIndex(serialPageIdx);
+                portStack->setCurrentIndex(serialBaudIdx);
+                return;
+            }
+#endif
+            addrStack->setCurrentIndex(netPageIdx);
+            portStack->setCurrentIndex(netPortIdx);
+        };
+        const QString savedMode = PeripheralSettings::deviceString("Acom", "ConnectionMode",
+#ifdef HAVE_SERIALPORT
+            "Serial"
+#else
+            "Network"
+#endif
+        );
+        {
+            const int idx = modeCombo->findData(savedMode);
+            modeCombo->setCurrentIndex(idx >= 0 ? idx : 0);
+        }
+        applyMode(modeCombo->currentData().toString());
+        connect(modeCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this,
+                [=](int idx) {
+            const QString mode = modeCombo->itemData(idx).toString();
+            PeripheralSettings::setDeviceString("Acom", "ConnectionMode", mode);
+            applyMode(mode);
+        });
+
+        auto* statusLbl = new QLabel(m_acom->isConnected() ? "Connected" : "Not connected");
+        statusLbl->setStyleSheet(m_acom->isConnected()
+            ? "QLabel { color: #00e060; font-size: 11px; }"
+            : "QLabel { color: #8aa8c0; font-size: 11px; }");
+        grid->addWidget(statusLbl, row, 4);
+
+        auto* acomBtn = new QPushButton(m_acom->isConnected() ? "Disconnect" : "Connect");
+        acomBtn->setStyleSheet(kBtnStyle);
+        grid->addWidget(acomBtn, row, 3);
+
+        auto updateAcomState = [this, acomBtn, statusLbl]() {
+            const bool conn = m_acom->isConnected();
+            acomBtn->setText(conn ? "Disconnect" : "Connect");
+            statusLbl->setText(conn ? "Connected" : "Not connected");
+            statusLbl->setStyleSheet(conn
+                ? "QLabel { color: #00e060; font-size: 11px; }"
+                : "QLabel { color: #8aa8c0; font-size: 11px; }");
+        };
+        connect(m_acom, &AcomConnection::connected, this, updateAcomState);
+        connect(m_acom, &AcomConnection::disconnected, this, updateAcomState);
+        connect(m_acom, &AcomConnection::connectionFailed, this,
+                [statusLbl](const QString& err) {
+            statusLbl->setText("Error: " + err);
+            statusLbl->setStyleSheet("QLabel { color: #e06060; font-size: 11px; }");
+        });
+
+        connect(acomBtn, &QPushButton::clicked, this, [=, this]() {
+            if (m_acom->isConnected()) {
+                m_acom->disconnect();
+                return;
+            }
+            const QString mode = modeCombo->currentData().toString();
+            if (mode == "Network") {
+                const QString ip = netIpEdit->text().trimmed();
+                if (ip.isEmpty()) return;
+                const int port = netPortSpin->value();
+                PeripheralSettings::setDeviceString("Acom", "ManualIp", ip);
+                PeripheralSettings::setDeviceInt("Acom", "ManualPort", port);
+                m_acom->connectNetwork(ip, static_cast<quint16>(port));
+            }
+#ifdef HAVE_SERIALPORT
+            else {
+                QString port = serialCombo->currentData().toString();
+                if (port == "__custom__")
+                    port = serialCustomEdit->text().trimmed();
+                if (port.isEmpty()) return;
+                PeripheralSettings::setDeviceString("Acom", "SerialPort", port);
+                m_acom->connectSerial(port);
+            }
+#endif
+        });
+
+        // Save-on-close: same "user cleared the field and closed the dialog
+        // without clicking Connect/Disconnect" handling the network-only
+        // rows get via buildRow() above — wipe the saved manual network IP
+        // (and its port) so a cleared field does not leave a stale
+        // auto-connect target behind. Serial mode has no equivalent free-text
+        // field to leak (the combo always resolves to either a discovered
+        // port or the explicit "Custom..." edit, which is only committed on
+        // a Connect click), so this only covers Acom's ManualIp/ManualPort.
+        m_peripheralRowSavers.append([netIpEdit, this]() {
+            if (!netIpEdit) return;
+            const QString ip = netIpEdit->text().trimmed();
+            if (!ip.isEmpty()) return;
+            const QString savedIp = PeripheralSettings::deviceString("Acom", "ManualIp");
+            if (savedIp.isEmpty()) return;
+            PeripheralSettings::clearDeviceField("Acom", "ManualIp");
+            PeripheralSettings::clearDeviceField("Acom", "ManualPort");
+            // Only disconnect if the live connection is actually the network
+            // target being cleared — ACOM, unlike the network-only rows
+            // above, may currently be connected over Serial instead, which
+            // this saved IP has nothing to do with.
+            if (m_acom->isConnected() && m_acom->description().startsWith(savedIp + ":")) {
+                m_acom->disconnect();
+            }
+        });
+    }
+
     for (auto* lbl : group->findChildren<QLabel*>())
         if (lbl->styleSheet().isEmpty()) lbl->setStyleSheet(kLabelStyle);
 
@@ -5454,7 +7130,8 @@ QWidget* RadioSetupDialog::buildPeripheralsTab()
     // Auto-reconnect checkbox
     auto* reconnectCheck = new QCheckBox("Auto-reconnect to peripherals on connection drop");
     AetherSDR::ThemeManager::instance().applyStyleSheet(reconnectCheck,
-        "QCheckBox { color: {{color.text.primary}}; font-size: 11px; }");
+        "QCheckBox { color: {{color.text.primary}}; font-size: 11px; spacing: 8px; }"
+        + kCheckBoxIndicator);
     const bool autoReconnect = PeripheralSettings::autoReconnect();
     reconnectCheck->setChecked(autoReconnect);
     connect(reconnectCheck, &QCheckBox::toggled, this, [this](bool on) {
@@ -5468,6 +7145,9 @@ QWidget* RadioSetupDialog::buildPeripheralsTab()
         }
         if (m_ag) {
             m_ag->setAutoReconnect(on);
+        }
+        if (m_acom) {
+            m_acom->setAutoReconnect(on);
         }
     });
     vbox->addWidget(reconnectCheck);
@@ -5491,7 +7171,7 @@ void RadioSetupDialog::buildDeferredTab(int index)
     if (it == m_deferredBuilders.end())
         return;                             // already built or out of range
 
-    QWidget* placeholder = m_tabs->widget(index);
+    QWidget* placeholder = m_pages->widget(index);
     QWidget* content = it.value()();        // run the real builder
     auto* lay = new QVBoxLayout(placeholder);
     lay->setContentsMargins(0, 0, 0, 0);
@@ -5504,12 +7184,24 @@ void RadioSetupDialog::buildDeferredTab(int index)
 
 void RadioSetupDialog::selectTab(const QString& tabName)
 {
-    if (!m_tabs) return;
-    for (int i = 0; i < m_tabs->count(); ++i) {
-        if (m_tabs->tabText(i) == tabName) {
-            m_tabs->setCurrentIndex(i);
-            return;
-        }
+    if (!m_navigation) {
+        return;
+    }
+
+    static const QHash<QString, QString> kLegacyPageNames = {
+        {QStringLiteral("TX"), QStringLiteral("Transmit")},
+        {QStringLiteral("RX"), QStringLiteral("Receive")},
+        {QStringLiteral("Phone/CW"), QStringLiteral("Phone & CW")},
+        {QStringLiteral("XVTR"), QStringLiteral("Transverters")},
+        {QStringLiteral("Themes"), QStringLiteral("Appearance & Behavior")},
+        {QStringLiteral("QRZ"), QStringLiteral("QRZ & Callsigns")},
+        {QStringLiteral("Serial"), QStringLiteral("Serial & Controllers")}
+    };
+    const QString pageName = kLegacyPageNames.value(tabName, tabName);
+    const int index = m_pageIndexes.value(pageName, -1);
+    if (QTreeWidgetItem* item = m_pageItems.value(index, nullptr)) {
+        m_navigation->setCurrentItem(item);
+        m_navigation->scrollToItem(item, QAbstractItemView::PositionAtCenter);
     }
 }
 
@@ -5860,7 +7552,8 @@ QWidget* RadioSetupDialog::buildUiEnhancementsTab()
 
         auto* reverseChk = new QCheckBox("Reverse mouse-wheel tuning direction");
         AetherSDR::ThemeManager::instance().applyStyleSheet(reverseChk,
-            "QCheckBox { color: {{color.text.primary}}; font-size: 12px; }");
+            "QCheckBox { color: {{color.text.primary}}; font-size: 12px; spacing: 8px; }"
+            + kCheckBoxIndicator);
         {
             auto& s = AppSettings::instance();
             reverseChk->setChecked(s.value("ReverseMouseWheel", false).toBool());
@@ -6005,6 +7698,177 @@ void RadioSetupDialog::refreshPinnedCertsTable()
             : pin.pinnedAtIso.left(10);   // YYYY-MM-DD
         m_pinnedCertsTable->setItem(i, 2, new QTableWidgetItem(when));
     }
+}
+
+QWidget* RadioSetupDialog::buildQrzTab()
+{
+    auto* page = new QWidget;
+    auto* root = new QVBoxLayout(page);
+    root->setContentsMargins(16, 16, 16, 16);
+    root->setSpacing(12);
+
+    auto& svc = CallsignLookupService::instance();
+
+    // ---- Account group -------------------------------------------------
+    auto* acct = new QGroupBox("QRZ.com Account");
+    acct->setStyleSheet(kGroupStyle);
+    auto* acctLay = new QVBoxLayout(acct);
+    acctLay->setSpacing(8);
+
+    auto* desc = new QLabel(
+        "AetherSDR uses your QRZ.com account to look up station details — "
+        "name, location, grid, and photo — for callsigns heard in the CW "
+        "decoder and entered in View → Callsign Lookup. An XML Logbook Data "
+        "subscription returns full details; a free account returns limited "
+        "fields. Your password is stored in the operating system keychain, "
+        "never in the settings file.");
+    desc->setStyleSheet("QLabel { color: #7090a0; font-size: 11px; }");
+    desc->setWordWrap(true);
+    acctLay->addWidget(desc);
+
+    auto* enableCheck = new QCheckBox("Enable QRZ callsign lookups");
+    enableCheck->setObjectName("qrzEnableCheck");
+    enableCheck->setAccessibleName("Enable QRZ callsign lookups");
+    enableCheck->setStyleSheet("QCheckBox { color: #c8d8e8; font-size: 12px; }");
+    enableCheck->setChecked(QrzLookupSettings::enabled());
+    connect(enableCheck, &QCheckBox::toggled, this, [](bool on) {
+        QrzLookupSettings::setEnabled(on);
+        CallsignLookupService::instance().reloadConfiguration();
+    });
+    acctLay->addWidget(enableCheck);
+
+    auto* grid = new QGridLayout;
+    grid->setSpacing(8);
+
+    auto* userLbl = new QLabel("Username (callsign):");
+    userLbl->setStyleSheet(kLabelStyle);
+    grid->addWidget(userLbl, 0, 0);
+    auto* userEdit = new QLineEdit(QrzLookupSettings::username());
+    userEdit->setObjectName("qrzUsernameEdit");
+    userEdit->setAccessibleName("QRZ username");
+    userEdit->setStyleSheet(kEditStyle);
+    userEdit->setMaxLength(64);
+    grid->addWidget(userEdit, 0, 1);
+
+    auto* passLbl = new QLabel("Password:");
+    passLbl->setStyleSheet(kLabelStyle);
+    grid->addWidget(passLbl, 1, 0);
+    auto* passEdit = new QLineEdit;
+    passEdit->setObjectName("qrzPasswordEdit");
+    passEdit->setAccessibleName("QRZ password");
+    passEdit->setStyleSheet(kEditStyle);
+    passEdit->setEchoMode(QLineEdit::Password);
+    passEdit->setMaxLength(128);
+    grid->addWidget(passEdit, 1, 1);
+    grid->setColumnStretch(1, 1);
+    acctLay->addLayout(grid);
+
+    // Populate the password field from the keychain (async).
+    QPointer<QLineEdit> passGuard(passEdit);
+    auto passLoaded = std::make_shared<bool>(false);
+    svc.readPassword([passGuard, passLoaded](const QString& pw) {
+        *passLoaded = true;
+        if (passGuard && passGuard->text().isEmpty())
+            passGuard->setText(pw);
+    });
+
+    connect(userEdit, &QLineEdit::editingFinished, this, [userEdit] {
+        QrzLookupSettings::setUsername(userEdit->text().trimmed());
+        CallsignLookupService::instance().reloadConfiguration();
+    });
+    connect(passEdit, &QLineEdit::editingFinished, this, [passEdit, passLoaded] {
+        // Don't let a focus-out before the async keychain read completes delete
+        // a stored password: skip the save when the field is empty and the read
+        // hasn't landed yet (savePassword("") deletes the keychain entry). (#3990)
+        if (!*passLoaded && passEdit->text().isEmpty())
+            return;
+        CallsignLookupService::instance().savePassword(passEdit->text());
+    });
+
+    auto* testRow = new QHBoxLayout;
+    testRow->setSpacing(8);
+    auto* testBtn = new QPushButton("Test Login");
+    testBtn->setObjectName("qrzTestLoginBtn");
+    testBtn->setAccessibleName("Test QRZ login");
+    testBtn->setStyleSheet(
+        "QPushButton { background: #183548; border: 1px solid #28506a; "
+        "border-radius: 3px; color: #c8d8e8; font-size: 11px; padding: 4px 12px; }"
+        "QPushButton:hover { background: #1f4258; }"
+        "QPushButton:disabled { color: #506070; }");
+    testRow->addWidget(testBtn);
+    auto* testStatus = new QLabel;
+    testStatus->setObjectName("qrzTestStatus");
+    testStatus->setStyleSheet("QLabel { color: #7090a0; font-size: 11px; }");
+    testStatus->setWordWrap(true);
+    testRow->addWidget(testStatus, 1);
+    acctLay->addLayout(testRow);
+
+    connect(testBtn, &QPushButton::clicked, this,
+            [testBtn, testStatus, userEdit, passEdit] {
+        const QString user = userEdit->text().trimmed();
+        const QString pass = passEdit->text();
+        if (user.isEmpty() || pass.isEmpty()) {
+            testStatus->setText("Enter a username and password first.");
+            return;
+        }
+        testBtn->setEnabled(false);
+        testStatus->setText("Contacting QRZ.com…");
+        CallsignLookupService::instance().testLogin(user, pass);
+    });
+    connect(&svc, &CallsignLookupService::loginTestFinished, this,
+            [testBtn, testStatus](bool ok, const QString& message) {
+        testBtn->setEnabled(true);
+        testStatus->setText(ok
+            ? (message.isEmpty() ? QStringLiteral("Login OK.")
+                                 : QStringLiteral("Login OK — %1").arg(message))
+            : QStringLiteral("Login failed: %1").arg(message));
+        testStatus->setStyleSheet(ok
+            ? "QLabel { color: #4dd87a; font-size: 11px; }"
+            : "QLabel { color: #ff6060; font-size: 11px; }");
+    });
+
+    root->addWidget(acct);
+
+    // ---- Cache group ----------------------------------------------------
+    auto* cache = new QGroupBox("Lookup Cache");
+    cache->setStyleSheet(kGroupStyle);
+    auto* cacheLay = new QVBoxLayout(cache);
+    cacheLay->setSpacing(8);
+
+    auto* cacheDesc = new QLabel(
+        "Looked-up callsigns are cached for 7 days so a busy net never asks "
+        "QRZ twice for the same station. Station photos are cached alongside.");
+    cacheDesc->setStyleSheet("QLabel { color: #7090a0; font-size: 11px; }");
+    cacheDesc->setWordWrap(true);
+    cacheLay->addWidget(cacheDesc);
+
+    auto* cacheRow = new QHBoxLayout;
+    cacheRow->setSpacing(8);
+    auto* cacheCount = new QLabel;
+    cacheCount->setObjectName("qrzCacheCount");
+    cacheCount->setStyleSheet(kValueStyle);
+    auto refreshCacheCount = [cacheCount] {
+        cacheCount->setText(QStringLiteral("%1 cached callsign(s)")
+            .arg(CallsignLookupService::instance().cacheEntryCount()));
+    };
+    refreshCacheCount();
+    cacheRow->addWidget(cacheCount);
+    cacheRow->addStretch();
+
+    auto* clearBtn = new QPushButton("Clear Cache");
+    clearBtn->setObjectName("qrzClearCacheBtn");
+    clearBtn->setAccessibleName("Clear QRZ lookup cache");
+    clearBtn->setStyleSheet(testBtn->styleSheet());
+    connect(clearBtn, &QPushButton::clicked, this, [refreshCacheCount] {
+        CallsignLookupService::instance().clearCache();
+        refreshCacheCount();
+    });
+    cacheRow->addWidget(clearBtn);
+    cacheLay->addLayout(cacheRow);
+
+    root->addWidget(cache);
+    root->addStretch();
+    return page;
 }
 
 } // namespace AetherSDR

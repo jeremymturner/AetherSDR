@@ -80,6 +80,47 @@ int main()
         return fail("DC-edge Kiwi row should map into the visible trace");
     }
 
+    QVector<float> wideServerRow(1024, -100.0f);
+    const double serverLowMhz = 10.0;
+    const double serverBandwidthMhz = 10.0;
+    const double carrierMhz = 14.25;
+    const int sourceBin = static_cast<int>(
+        ((carrierMhz - serverLowMhz) / serverBandwidthMhz)
+        * wideServerRow.size());
+    wideServerRow[sourceBin] = -45.0f;
+    const QVector<float> dssMappedTrace = mapRowToTrace(
+        wideServerRow, 768,
+        15.0, serverBandwidthMhz,
+        14.0, 1.0,
+        kMinDbm);
+    if (dssMappedTrace.isEmpty()) {
+        return fail("3D-width Kiwi trace should map into the visible trace");
+    }
+    const int expectedViewportBin = static_cast<int>(
+        ((carrierMhz - 13.5) / 1.0) * dssMappedTrace.size());
+    int strongestBin = 0;
+    for (int i = 1; i < dssMappedTrace.size(); ++i) {
+        if (dssMappedTrace[i] > dssMappedTrace[strongestBin]) {
+            strongestBin = i;
+        }
+    }
+    if (std::abs(strongestBin - expectedViewportBin) > 2) {
+        return fail("3D-width Kiwi trace should align to the viewport frequency frame");
+    }
+
+    const QVector<quint8> narrowCoverage = mapRowCoverageMask(
+        256, 128,
+        14.0, 0.5,
+        14.0, 1.0);
+    if (narrowCoverage.size() != 128
+        || narrowCoverage[0] != 0
+        || narrowCoverage[32] == 0
+        || narrowCoverage[64] == 0
+        || narrowCoverage[95] == 0
+        || narrowCoverage[127] != 0) {
+        return fail("narrow Kiwi row coverage should mark only bins covered by the server row");
+    }
+
     QVector<float> adaptingTrace(128, -80.0f);
     TraceFloorState adaptingFloor{-100.0f, true};
     stabilizeTraceFloor(adaptingTrace, adaptingFloor, true, kMinDbm, kMaxDbm);

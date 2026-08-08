@@ -5,11 +5,18 @@
 
 #include <QBoxLayout>
 #include <QByteArray>
+#include <QCoreApplication>
+#include <QEvent>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QScopeGuard>
 #include <QString>
 #include <QStringList>
+
+#ifdef AETHER_GPU_SPECTRUM
+#include <QRhiWidget>
+#endif
 
 namespace AetherSDR {
 
@@ -21,6 +28,29 @@ constexpr int         kSchemaVersion = 1;
 QString dockModeToString(ContainerWidget::DockMode m)
 {
     return m == ContainerWidget::DockMode::Floating ? "floating" : "panel";
+}
+
+// QRhiWidget descendants must deregister their cleanup callback from the old
+// top-level's backing-store QRhi BEFORE a float/dock reparent, or the stale
+// callback fires against freed state when that QRhi is torn down (#2495 —
+// the same guard SpectrumWidget/PanadapterStack use for splitter moves and
+// pop-outs). Fire the cross-platform notification for every QRhiWidget in
+// the container's subtree; harmless for widgets without one.
+void prepareRhiChildrenForReparent(QWidget* root)
+{
+#ifdef AETHER_GPU_SPECTRUM
+    if (!root)
+        return;
+    QList<QRhiWidget*> rhiWidgets = root->findChildren<QRhiWidget*>();
+    if (auto* self = qobject_cast<QRhiWidget*>(root))
+        rhiWidgets.prepend(self);
+    for (QRhiWidget* w : rhiWidgets) {
+        QEvent event(QEvent::WindowAboutToChangeInternal);
+        QCoreApplication::sendEvent(w, &event);
+    }
+#else
+    Q_UNUSED(root);
+#endif
 }
 
 ContainerWidget::DockMode dockModeFromString(const QString& s)
@@ -159,6 +189,11 @@ void ContainerManager::reparentContainer(const QString& id,
     // external widget).  Floating containers don't have a layout
     // parent right now — just update the logical parentId.
     if (!c->isFloating()) {
+        // #2495: deregister any QRhiWidget child (e.g. the WAVE scope) from the
+        // old backing-store QRhi before reparenting, exactly as
+        // floatContainer()/dockContainer() do — otherwise a stale cleanup
+        // callback can fire against freed state on a GPU build.
+        prepareRhiChildrenForReparent(c);
         if (!meta.parentId.isEmpty()) {
             ContainerWidget* oldParent = m_containers.value(meta.parentId).data();
             if (oldParent) oldParent->removeChildWidget(c);
@@ -204,6 +239,8 @@ void ContainerManager::floatContainer(const QString& id)
 {
     ContainerWidget* c = m_containers.value(id).data();
     if (!c || c->isFloating()) return;
+
+    prepareRhiChildrenForReparent(c);   // #2495 — before any reparent below
 
     // Remember the container's current slot so re-dock restores it.
     // Two cases: nested (parentId points at another container) and
@@ -262,6 +299,8 @@ void ContainerManager::dockContainer(const QString& id)
 {
     ContainerWidget* c = m_containers.value(id).data();
     if (!c || !c->isFloating()) return;
+
+    prepareRhiChildrenForReparent(c);   // #2495 — before releaseContainer()
 
     auto* win = m_floatingWindows.take(id);
     if (!win) return;
@@ -329,13 +368,17 @@ void ContainerManager::wireContainer(ContainerWidget* c)
 void ContainerManager::onFloatRequested()
 {
     auto* c = qobject_cast<ContainerWidget*>(sender());
-    if (c) floatContainer(c->id());
+    if (!c) return;
+    // floatContainer() -> saveState() flushes to disk (unless restoring), so
+    // the transition survives an abnormal termination before closeEvent (#4427).
+    floatContainer(c->id());
 }
 
 void ContainerManager::onDockRequested()
 {
     auto* c = qobject_cast<ContainerWidget*>(sender());
-    if (c) dockContainer(c->id());
+    if (!c) return;
+    dockContainer(c->id()); // dockContainer() -> saveState() flushes (#4427)
 }
 
 void ContainerManager::onCloseRequested()
@@ -343,7 +386,7 @@ void ContainerManager::onCloseRequested()
     auto* c = qobject_cast<ContainerWidget*>(sender());
     if (!c) return;
     c->setContainerVisible(false);
-    saveState();
+    saveState(); // saveState() flushes to disk (#4427)
 }
 
 void ContainerManager::onAlwaysOnTopToggled(bool on)
@@ -352,6 +395,9 @@ void ContainerManager::onAlwaysOnTopToggled(bool on)
     if (!c) return;
     const QString id = c->id();
     AppSettings::instance().setValue(alwaysOnTopKeyFor(id), on);
+    // Always-on-top is its own key (not part of saveState()'s container blob),
+    // so flush it explicitly — setValue() only touches the in-memory map (#4427).
+    AppSettings::instance().save();
     if (auto* win = m_floatingWindows.value(id, nullptr)) {
         win->setAlwaysOnTop(on);
     }
@@ -359,6 +405,8 @@ void ContainerManager::onAlwaysOnTopToggled(bool on)
 
 void ContainerManager::onFloatingWindowDock(ContainerWidget* c)
 {
+    // Re-dock from the floating window (its close = dock). dockContainer() ->
+    // saveState() now flushes to disk, so this transition persists too (#4427).
     if (c) dockContainer(c->id());
 }
 
@@ -397,10 +445,25 @@ void ContainerManager::saveState() const
     AppSettings::instance().setValue(
         kSettingsKey,
         QString::fromUtf8(QJsonDocument(root).toJson(QJsonDocument::Compact)));
+
+    // setValue() only mutates the in-memory AppSettings map. Flush a genuine
+    // transition (float/dock/close, via any slot) to disk here so it survives
+    // an abnormal termination before MainWindow::closeEvent()'s save(). Every
+    // saveState() caller reaches this one flush point, so no transition slot
+    // can forget to persist. Suppressed while restoreState() replays saved
+    // state, which would otherwise re-write what it is reading (#4427).
+    if (!m_restoring) {
+        AppSettings::instance().save();
+    }
 }
 
 void ContainerManager::restoreState()
 {
+    // Suppress saveState()'s per-transition disk flush for the duration of the
+    // replay (floatContainer() below calls saveState()); reset on any exit.
+    m_restoring = true;
+    const auto restoreGuard = qScopeGuard([this] { m_restoring = false; });
+
     const QString json = AppSettings::instance()
         .value(kSettingsKey, "").toString();
     if (json.isEmpty()) return;

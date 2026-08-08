@@ -2,6 +2,8 @@
 #include "core/AudioEngine.h"
 #include "core/AppSettings.h"
 #include "core/NvidiaBnrSettings.h"
+#include "models/Nr2SettingsModel.h"
+#include "models/Rn2SettingsModel.h"
 #include "GuardedSlider.h"
 #include "Theme.h"
 
@@ -19,6 +21,7 @@
 #include <QLineEdit>
 #include <QProgressBar>
 #include <QMessageBox>
+#include <QPointer>
 #ifdef HAVE_NVIDIA_AFX
 #include "core/NvidiaAfxPack.h"
 #endif
@@ -29,9 +32,58 @@
 #include <QSignalBlocker>
 #include "core/ThemeManager.h"
 
+#include <algorithm>
+#include <cmath>
+
 namespace AetherSDR {
 
 namespace {
+
+const char* dspNameForIndex(int index)
+{
+    switch (static_cast<AetherDspWidget::DspId>(index)) {
+    case AetherDspWidget::NR2:  return "NR2";
+    case AetherDspWidget::NR4:  return "NR4";
+    case AetherDspWidget::MNR:  return "MNR";
+    case AetherDspWidget::DFNR: return "DFNR";
+    case AetherDspWidget::RN2:  return "RN2";
+    case AetherDspWidget::BNR:  return "BNR";
+    case AetherDspWidget::NumDsps:
+        break;
+    }
+    return "";
+}
+
+const QString kDfnrUnavailableToolTip = QStringLiteral(
+    "DFNR requires DeepFilterNet to be set up and AetherSDR rebuilt.");
+
+void rememberLastClientNr(int index)
+{
+    const char* name = dspNameForIndex(index);
+    if (name[0] == '\0') {
+        return;
+    }
+
+    auto& s = AppSettings::instance();
+    const QString value = QString::fromLatin1(name);
+    if (s.value("LastClientNr", QString()).toString() == value) {
+        return;
+    }
+
+    s.setValue("LastClientNr", value);
+    s.save();
+}
+
+void clearUnavailableDfnrPreference()
+{
+#ifndef HAVE_DFNR
+    auto& s = AppSettings::instance();
+    if (s.value("LastClientNr", QString()).toString() == QLatin1String("DFNR")) {
+        s.remove("LastClientNr");
+        s.save();
+    }
+#endif
+}
 
 const QString kWidgetStyle = QStringLiteral(
     "QWidget { color: #c8d8e8; }"
@@ -199,6 +251,16 @@ AetherDspWidget::AetherDspWidget(AudioEngine* audio, QWidget* parent)
                           "Install LLVM from llvm.org and rebuild to enable NR4.");
         }
 #endif
+        // DFNR is cross-platform only when the matching DeepFilterNet library
+        // is present at configure time. If HAVE_DFNR is absent, keep the slot
+        // visible like the other optional methods but do not let the UI select
+        // a no-op engine stub.
+#ifndef HAVE_DFNR
+        if (i == DFNR) {
+            b->setEnabled(false);
+            b->setToolTip(kDfnrUnavailableToolTip);
+        }
+#endif
         // BNR (NVIDIA AFX GPU denoiser) is gated at compile time by
         // HAVE_NVIDIA_AFX (defined only on x86_64 Linux/Windows; never on macOS
         // or aarch64 — no Maxine runtime there). Where it IS built, gate the
@@ -219,8 +281,17 @@ AetherDspWidget::AetherDspWidget(AudioEngine* audio, QWidget* parent)
 #else
         if (i == BNR && !NvidiaAfxPack::hasSupportedGpu()) {
             b->setEnabled(false);
-            b->setToolTip("BNR requires an NVIDIA RTX 40-series or later GPU.\n"
-                          "Use DFNR for AI noise removal on other hardware.");
+            if (NvidiaAfxPack::isAfxCapableGpu()) {
+                // Recent NVIDIA card, but no AFX pack is published for its arch
+                // yet (e.g. sm_120 / RTX 50-series). Don't imply the GPU is too
+                // old — say so plainly and point at DFNR. (#3933)
+                b->setToolTip(QStringLiteral("No BNR pack for your GPU (%1) yet — "
+                                             "DFNR remains available.")
+                                  .arg(NvidiaAfxPack::detectArch()));
+            } else {
+                b->setToolTip("BNR requires an NVIDIA RTX 40-series or later GPU.\n"
+                              "Use DFNR for AI noise removal on other hardware.");
+            }
         }
 #endif
         m_dspBtns[i] = b;
@@ -259,13 +330,31 @@ AetherDspWidget::AetherDspWidget(AudioEngine* audio, QWidget* parent)
                 this, &AetherDspWidget::updateBnrStatus);
     }
 
+    connect(&Nr2SettingsModel::instance(),
+            &Nr2SettingsModel::configChanged,
+            this, &AetherDspWidget::syncNr2Settings);
+
     syncDspSelectorFromEngine();
     syncFromEngine();
+    clearUnavailableDfnrPreference();
 }
 
 void AetherDspWidget::onDspButtonClicked(int index, bool nowChecked)
 {
     if (index < 0 || index >= NumDsps) return;
+    if (m_dspBtns[index] && !m_dspBtns[index]->isEnabled()) {
+        syncDspSelectorFromEngine();
+        return;
+    }
+#ifndef HAVE_DFNR
+    if (index == DFNR) {
+        syncDspSelectorFromEngine();
+        return;
+    }
+#endif
+    static const char* kNames[NumDsps] = {"NR2", "NR4", "MNR", "DFNR", "RN2", "BNR"};
+    emit dspMethodUserToggled(QString::fromLatin1(kNames[index]), nowChecked);
+
     // Always bring this DSP's panel forward, regardless of new check
     // state — toggling off keeps the panel visible so the user can
     // re-enable from the same place.
@@ -280,29 +369,31 @@ void AetherDspWidget::onDspButtonClicked(int index, bool nowChecked)
     if (index == NR2 && nowChecked) {
         emit nr2EnableWithWisdomRequested();
     } else {
-        QMetaObject::invokeMethod(m_audio, [this, index, nowChecked]() {
+        AudioEngine* audio = m_audio;
+        QPointer<AetherDspWidget> self(this);
+        QMetaObject::invokeMethod(audio, [audio, self, index, nowChecked]() {
             switch (index) {
-                case NR2:  m_audio->setNr2Enabled(nowChecked); break;
-                case NR4:  m_audio->setNr4Enabled(nowChecked); break;
-                case MNR:  m_audio->setMnrEnabled(nowChecked); break;
-                case DFNR: m_audio->setDfnrEnabled(nowChecked); break;
-                case RN2:  m_audio->setRn2Enabled(nowChecked); break;
-                case BNR:  m_audio->setNvAfxEnabled(nowChecked); break;  // local AFX
+                case NR2:  audio->setNr2Enabled(nowChecked); break;
+                case NR4:  audio->setNr4Enabled(nowChecked); break;
+                case MNR:  audio->setMnrEnabled(nowChecked); break;
+                case DFNR: audio->setDfnrEnabled(nowChecked); break;
+                case RN2:  audio->setRn2Enabled(nowChecked); break;
+                case BNR:  audio->setNvAfxEnabled(nowChecked); break;  // local AFX
+                case NumDsps: break;
+            }
+            if (self) {
+                QMetaObject::invokeMethod(self.data(), [self]() {
+                    if (self) {
+                        self->syncDspSelectorFromEngine();
+                    }
+                }, Qt::QueuedConnection);
             }
         });
     }
-    // Remember the last-enabled module so the RX chain DSP tile can
-    // re-enable it when clicked from a fully-bypassed state.  Don't
-    // overwrite on disable — we want the value to survive a turn-off.
-    if (nowChecked) {
-        static const char* kNames[NumDsps] = {"NR2", "NR4", "MNR", "DFNR", "RN2", "BNR"};
-        auto& s = AppSettings::instance();
-        s.setValue("LastClientNr", QString::fromLatin1(kNames[index]));
-        s.save();
-    }
     // AudioEngine cascades exclusion (enabling NR2 disables DFNR, etc.)
     // and emits *EnabledChanged signals; syncDspSelectorFromEngine()
-    // will update sibling button states without firing setters.
+    // will update sibling button states and persist the last-enabled method
+    // only after engine state proves it actually became active.
 }
 
 void AetherDspWidget::syncDspSelectorFromEngine()
@@ -327,6 +418,9 @@ void AetherDspWidget::syncDspSelectorFromEngine()
     // If something is active, surface its panel.  If nothing's active
     // ("bypass"), keep whichever panel was last visible — don't yank the
     // user back to NR2 just because they clicked the active button off.
+    if (active >= 0) {
+        rememberLastClientNr(active);
+    }
     if (active >= 0 && m_dspStack)
         m_dspStack->setCurrentIndex(active);
 }
@@ -338,10 +432,16 @@ void AetherDspWidget::resetCurrentTab()
     static const char* kNames[NumDsps] = {"NR2", "NR4", "MNR", "DFNR", "RN2", "BNR"};
     const QString name = (idx >= 0 && idx < NumDsps) ? kNames[idx] : QString();
     if (name == "NR2") {
-        if (m_nr2GainGroup) m_nr2GainGroup->button(2)->setChecked(true);
-        if (m_nr2NpeGroup)  m_nr2NpeGroup->button(0)->setChecked(true);
+        // click() is intentional: setChecked() would update the UI without
+        // emitting QButtonGroup::idClicked, leaving the settings model and
+        // live NR2 instances on the previous method.
+        if (m_nr2GainGroup) m_nr2GainGroup->button(2)->click();
+        if (m_nr2NpeGroup)  m_nr2NpeGroup->button(0)->click();
         if (m_nr2AeCheck)        m_nr2AeCheck->setChecked(true);
-        if (m_nr2GainMaxSlider)  m_nr2GainMaxSlider->setValue(150);
+        if (m_nr2OriginalGeometryCheck)
+            m_nr2OriginalGeometryCheck->setChecked(false);
+        if (m_nr2GainMaxSlider)  m_nr2GainMaxSlider->setValue(100);
+        if (m_nr2GainFloorSlider)m_nr2GainFloorSlider->setValue(0);
         if (m_nr2SmoothSlider)   m_nr2SmoothSlider->setValue(85);
         if (m_nr2QsppSlider)     m_nr2QsppSlider->setValue(20);
     } else if (name == "NR4") {
@@ -353,13 +453,14 @@ void AetherDspWidget::resetCurrentTab()
         if (m_nr4MaskingSlider)    m_nr4MaskingSlider->setValue(50);
         if (m_nr4SuppressionSlider)m_nr4SuppressionSlider->setValue(50);
     } else if (name == "MNR") {
-        if (m_mnrEnableCheck)    m_mnrEnableCheck->setChecked(false);
         if (m_mnrStrengthSlider) m_mnrStrengthSlider->setValue(100);
     } else if (name == "DFNR") {
         if (m_dfnrAttenSlider) m_dfnrAttenSlider->setValue(100);
         if (m_dfnrBetaSlider)  m_dfnrBetaSlider->setValue(0);
+    } else if (name == "RN2") {
+        if (m_rn2DryMixSlider) m_rn2DryMixSlider->setValue(0);
     }
-    // RN2 / BNR have no adjustable parameters — Reset Defaults is a no-op.
+    // BNR has no adjustable parameters — Reset Defaults is a no-op there.
 }
 
 void AetherDspWidget::setCompactMode(bool on)
@@ -371,7 +472,8 @@ void AetherDspWidget::setCompactMode(bool on)
     // px — narrower labels free up width for the slider grooves so the
     // tile reads well at the 280 px PooDoo container limit.
     const int valWidth = on ? 30 : 40;
-    for (auto* lbl : { m_nr2GainMaxLabel, m_nr2SmoothLabel, m_nr2QsppLabel,
+    for (auto* lbl : { m_nr2GainMaxLabel, m_nr2GainFloorLabel,
+                       m_nr2SmoothLabel, m_nr2QsppLabel,
                        m_nr4ReductionLabel, m_nr4SmoothingLabel, m_nr4WhiteningLabel,
                        m_nr4MaskingLabel, m_nr4SuppressionLabel,
                        m_mnrStrengthLabel,
@@ -463,8 +565,23 @@ QWidget* AetherDspWidget::buildNr2Page()
     auto* page = new QWidget;
     auto* vbox = new QVBoxLayout(page);
 
-    auto labelStyle = QStringLiteral("QLabel { color: #8090a0; font-size: 11px; }");
-    auto valStyle   = QStringLiteral("QLabel { color: #c8d8e8; font-size: 11px; min-width: 40px; }");
+    auto labelStyle = QStringLiteral(
+        "QLabel { color: #8090a0; font-size: 11px; }"
+        "QLabel:disabled { color: #48515a; }");
+    auto valStyle = QStringLiteral(
+        "QLabel { color: #c8d8e8; font-size: 11px; min-width: 40px; }"
+        "QLabel:disabled { color: #48515a; }");
+
+    auto* agcGuidance = new QLabel(
+        "Tip: Disable slice AGC for more consistent NR2 results.");
+    agcGuidance->setObjectName(QStringLiteral("nr2AgcGuidanceLabel"));
+    agcGuidance->setAccessibleName(QStringLiteral("NR2 AGC guidance"));
+    agcGuidance->setWordWrap(true);
+    agcGuidance->setStyleSheet(labelStyle);
+    agcGuidance->setToolTip(
+        "Slice AGC can briefly raise background noise as it recovers after "
+        "a strong signal.");
+    vbox->addWidget(agcGuidance);
 
     // Gain Method — exclusive toggle row, styled like the slice DSP buttons.
     {
@@ -482,14 +599,18 @@ QWidget* AetherDspWidget::buildNr2Page()
         m_nr2GainGroup->setExclusive(true);
         const char* gainLabels[] = {"Linear", "Log", "Gamma", "Trained"};
         const char* gainTips[] = {
-            "Linear audio amplitude scale for gain computation.",
-            "Logarithmic amplitude scale — compresses dynamic range.",
-            "Gamma distribution model matching typical speech amplitude patterns.",
-            "Noise reduction model trained on real speech and noise samples."
+            "Gaussian speech model optimized for linear amplitude accuracy.",
+            "Gaussian speech model optimized for logarithmic amplitude accuracy.",
+            "Gamma speech model with soft speech-presence weighting.",
+            "Experimental piecewise suppression curve for comparison."
         };
         row->addStretch(1);
         for (int i = 0; i < 4; ++i) {
             auto* b = makeToggle(gainLabels[i]);
+            b->setObjectName(
+                QStringLiteral("nr2GainMethod%1Button").arg(i));
+            b->setAccessibleName(
+                QStringLiteral("NR2 gain method %1").arg(gainLabels[i]));
             b->setToolTip(gainTips[i]);
             b->setFixedSize(48, 18);
             b->setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Fixed);
@@ -499,9 +620,8 @@ QWidget* AetherDspWidget::buildNr2Page()
         }
         m_nr2GainGroup->button(2)->setChecked(true);  // Gamma default
         connect(m_nr2GainGroup, &QButtonGroup::idClicked, this, [this](int id) {
-            auto& s = AppSettings::instance();
-            s.setValue("NR2GainMethod", QString::number(id));
-            s.save();
+            Nr2SettingsModel::instance().setGainMethod(id);
+            updateNr2ControlAvailability();
             emit nr2GainMethodChanged(id);
         });
         vbox->addLayout(row);
@@ -524,11 +644,15 @@ QWidget* AetherDspWidget::buildNr2Page()
         const char* npeTips[] = {
             "Optimal Smoothing Minimum Statistics — tracks noise floor using a running minimum estimate.",
             "Minimum Mean Squared Error — minimizes the expected noise estimation error.",
-            "Non-Stationary estimation — adapts to noise that changes over time."
+            "Non-stationary estimator designed for noise that changes over time."
         };
         row->addStretch(1);
         for (int i = 0; i < 3; ++i) {
             auto* b = makeToggle(npeLabels[i]);
+            b->setObjectName(
+                QStringLiteral("nr2NpeMethod%1Button").arg(i));
+            b->setAccessibleName(
+                QStringLiteral("NR2 noise estimation %1").arg(npeLabels[i]));
             b->setToolTip(npeTips[i]);
             b->setFixedSize(48, 18);
             b->setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Fixed);
@@ -538,9 +662,7 @@ QWidget* AetherDspWidget::buildNr2Page()
         }
         m_nr2NpeGroup->button(0)->setChecked(true);  // OSMS default
         connect(m_nr2NpeGroup, &QButtonGroup::idClicked, this, [this](int id) {
-            auto& s = AppSettings::instance();
-            s.setValue("NR2NpeMethod", QString::number(id));
-            s.save();
+            Nr2SettingsModel::instance().setNpeMethod(id);
             emit nr2NpeMethodChanged(id);
         });
         vbox->addLayout(row);
@@ -548,12 +670,12 @@ QWidget* AetherDspWidget::buildNr2Page()
 
     // AE Filter checkbox + Reset Defaults icon on the same row.
     m_nr2AeCheck = new QCheckBox("AE Filter (artifact elimination)");
+    m_nr2AeCheck->setObjectName(QStringLiteral("nr2AeFilterCheck"));
+    m_nr2AeCheck->setAccessibleName(QStringLiteral("NR2 AE Filter"));
     m_nr2AeCheck->setToolTip("Reduces ringing and musical artifacts typical of frequency-domain noise reduction.");
     m_nr2AeCheck->setChecked(true);
     connect(m_nr2AeCheck, &QCheckBox::toggled, this, [this](bool on) {
-        auto& s = AppSettings::instance();
-        s.setValue("NR2AeFilter", on ? "True" : "False");
-        s.save();
+        Nr2SettingsModel::instance().setAeFilter(on);
         emit nr2AeFilterChanged(on);
     });
     {
@@ -579,22 +701,71 @@ QWidget* AetherDspWidget::buildNr2Page()
         lbl->setStyleSheet(labelStyle);
         sliderGrid->addWidget(lbl, row, 0);
         m_nr2GainMaxSlider = new GuardedSlider(Qt::Horizontal);
+        m_nr2GainMaxSlider->setObjectName(
+            QStringLiteral("nr2GainMaxSlider"));
+        m_nr2GainMaxSlider->setAccessibleName(
+            QStringLiteral("NR2 Reduction"));
         m_nr2GainMaxSlider->setRange(50, 200);
-        m_nr2GainMaxSlider->setValue(150);
+        m_nr2GainMaxSlider->setValue(100);
+        static_cast<GuardedSlider*>(m_nr2GainMaxSlider)
+            ->setDragValueFormatter([](int value) {
+                return QString::number(value / 100.0f, 'f', 2);
+            });
         applyPrimarySliderStyle(m_nr2GainMaxSlider);
-        m_nr2GainMaxSlider->setToolTip("Maximum noise reduction depth. Higher values suppress more noise but risk distorting speech.");
+        m_nr2GainMaxSlider->setToolTip(
+            "Maximum spectral gain. Lower values force deeper reduction; "
+            "higher values retain more of the input level.");
         sliderGrid->addWidget(m_nr2GainMaxSlider, row, 1);
-        m_nr2GainMaxLabel = new QLabel("1.50");
+        m_nr2GainMaxLabel = new QLabel("1.00");
         m_nr2GainMaxLabel->setStyleSheet(valStyle);
         m_nr2GainMaxLabel->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
         sliderGrid->addWidget(m_nr2GainMaxLabel, row, 2);
         connect(m_nr2GainMaxSlider, &QSlider::valueChanged, this, [this](int v) {
             float val = v / 100.0f;
             m_nr2GainMaxLabel->setText(QString::number(val, 'f', 2));
-            auto& s = AppSettings::instance();
-            s.setValue("NR2GainMax", QString::number(val, 'f', 2));
-            s.save();
+            Nr2SettingsModel::instance().setGainMax(val);
             emit nr2GainMaxChanged(val);
+        });
+        ++row;
+    }
+
+    // Gain floor (naturalness / musical-noise tradeoff)
+    {
+        auto* lbl = new QLabel("Naturalness:");
+        lbl->setStyleSheet(labelStyle);
+        sliderGrid->addWidget(lbl, row, 0);
+        m_nr2GainFloorSlider = new GuardedSlider(Qt::Horizontal);
+        m_nr2GainFloorSlider->setObjectName(
+            QStringLiteral("nr2GainFloorSlider"));
+        m_nr2GainFloorSlider->setAccessibleName(
+            QStringLiteral("NR2 Naturalness"));
+        m_nr2GainFloorSlider->setAccessibleDescription(
+            QStringLiteral("Minimum spectral gain from 0.00 to 0.15"));
+        m_nr2GainFloorSlider->setRange(0, 15);
+        m_nr2GainFloorSlider->setSingleStep(1);
+        m_nr2GainFloorSlider->setPageStep(5);
+        m_nr2GainFloorSlider->setValue(0);
+        static_cast<GuardedSlider*>(m_nr2GainFloorSlider)
+            ->setDragValueFormatter([](int value) {
+                return QString::number(value / 100.0f, 'f', 2);
+            });
+        applyPrimarySliderStyle(m_nr2GainFloorSlider);
+        m_nr2GainFloorSlider->setToolTip(
+            "Minimum spectral gain. 0.00 permits the gain mask's full "
+            "suppression; higher values retain more broadband sound to reduce "
+            "metallic or musical artifacts.");
+        sliderGrid->addWidget(m_nr2GainFloorSlider, row, 1);
+        m_nr2GainFloorLabel = new QLabel("0.00");
+        m_nr2GainFloorLabel->setStyleSheet(valStyle);
+        m_nr2GainFloorLabel->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+        sliderGrid->addWidget(m_nr2GainFloorLabel, row, 2);
+        connect(m_nr2GainFloorSlider, &QSlider::valueChanged,
+                this, [this](int value) {
+            const float gainFloor = value / 100.0f;
+            m_nr2GainFloorLabel->setText(
+                QString::number(gainFloor, 'f', 2));
+            Nr2SettingsModel::instance().setGainFloor(gainFloor);
+            emit nr2GainFloorChanged(gainFloor);
         });
         ++row;
     }
@@ -605,10 +776,20 @@ QWidget* AetherDspWidget::buildNr2Page()
         lbl->setStyleSheet(labelStyle);
         sliderGrid->addWidget(lbl, row, 0);
         m_nr2SmoothSlider = new GuardedSlider(Qt::Horizontal);
+        m_nr2SmoothSlider->setObjectName(
+            QStringLiteral("nr2GainSmoothSlider"));
+        m_nr2SmoothSlider->setAccessibleName(
+            QStringLiteral("NR2 Smoothing"));
         m_nr2SmoothSlider->setRange(50, 98);
         m_nr2SmoothSlider->setValue(85);
+        static_cast<GuardedSlider*>(m_nr2SmoothSlider)
+            ->setDragValueFormatter([](int value) {
+                return QString::number(value / 100.0f, 'f', 2);
+            });
         applyPrimarySliderStyle(m_nr2SmoothSlider);
-        m_nr2SmoothSlider->setToolTip("How smoothly the noise estimate tracks changes. Higher values give steadier but slower adaptation.");
+        m_nr2SmoothSlider->setToolTip(
+            "Temporal smoothing of the spectral gain mask. Higher values "
+            "change more slowly and can reduce musical artifacts.");
         sliderGrid->addWidget(m_nr2SmoothSlider, row, 1);
         m_nr2SmoothLabel = new QLabel("0.85");
         m_nr2SmoothLabel->setStyleSheet(valStyle);
@@ -617,9 +798,7 @@ QWidget* AetherDspWidget::buildNr2Page()
         connect(m_nr2SmoothSlider, &QSlider::valueChanged, this, [this](int v) {
             float val = v / 100.0f;
             m_nr2SmoothLabel->setText(QString::number(val, 'f', 2));
-            auto& s = AppSettings::instance();
-            s.setValue("NR2GainSmooth", QString::number(val, 'f', 2));
-            s.save();
+            Nr2SettingsModel::instance().setGainSmooth(val);
             emit nr2GainSmoothChanged(val);
         });
         ++row;
@@ -627,14 +806,25 @@ QWidget* AetherDspWidget::buildNr2Page()
 
     // Q_SPP (voice threshold)
     {
-        auto* lbl = new QLabel("Threshold:");
-        lbl->setStyleSheet(labelStyle);
-        sliderGrid->addWidget(lbl, row, 0);
+        m_nr2QsppTitleLabel = new QLabel("Threshold:");
+        m_nr2QsppTitleLabel->setStyleSheet(labelStyle);
+        sliderGrid->addWidget(m_nr2QsppTitleLabel, row, 0);
         m_nr2QsppSlider = new GuardedSlider(Qt::Horizontal);
+        m_nr2QsppSlider->setObjectName(
+            QStringLiteral("nr2QsppSlider"));
+        m_nr2QsppSlider->setAccessibleName(
+            QStringLiteral("NR2 Voice Threshold"));
         m_nr2QsppSlider->setRange(5, 50);
         m_nr2QsppSlider->setValue(20);
+        static_cast<GuardedSlider*>(m_nr2QsppSlider)
+            ->setDragValueFormatter([](int value) {
+                return QString::number(value / 100.0f, 'f', 2);
+            });
         applyPrimarySliderStyle(m_nr2QsppSlider);
-        m_nr2QsppSlider->setToolTip("Speech detection threshold. Lower values preserve quiet speech but may pass more noise.");
+        m_nr2QsppSlider->setToolTip(
+            "Speech-presence threshold used by the Linear and Gamma gain "
+            "methods. Lower values preserve quiet speech but may pass more "
+            "noise.");
         sliderGrid->addWidget(m_nr2QsppSlider, row, 1);
         m_nr2QsppLabel = new QLabel("0.20");
         m_nr2QsppLabel->setStyleSheet(valStyle);
@@ -643,17 +833,64 @@ QWidget* AetherDspWidget::buildNr2Page()
         connect(m_nr2QsppSlider, &QSlider::valueChanged, this, [this](int v) {
             float val = v / 100.0f;
             m_nr2QsppLabel->setText(QString::number(val, 'f', 2));
-            auto& s = AppSettings::instance();
-            s.setValue("NR2Qspp", QString::number(val, 'f', 2));
-            s.save();
+            Nr2SettingsModel::instance().setQspp(val);
             emit nr2QsppChanged(val);
         });
         ++row;
     }
 
     vbox->addLayout(sliderGrid);
+
+    m_nr2OriginalGeometryCheck = new QCheckBox(
+        "Original NR2 (geometry + gain mapping)");
+    m_nr2OriginalGeometryCheck->setObjectName(
+        QStringLiteral("nr2OriginalGeometryCheck"));
+    m_nr2OriginalGeometryCheck->setAccessibleName(
+        QStringLiteral("Use original NR2 geometry and gain mapping"));
+    m_nr2OriginalGeometryCheck->setToolTip(
+        "Comparison switch: use the original 256-point/50% geometry and the "
+        "pre-test gain-method mapping. Unchecked uses 1024/75% and the faithful "
+        "Gaussian/Gamma mapping. Streaming, estimator, and safety fixes "
+        "remain enabled in both modes.");
+    connect(m_nr2OriginalGeometryCheck, &QCheckBox::toggled,
+            this, [this](bool useOriginal) {
+        Nr2SettingsModel::instance()
+            .setLegacyGeometryAndGainMapping(useOriginal);
+        updateNr2ControlAvailability();
+        emit nr2UseOriginalGeometryChanged(useOriginal);
+    });
+    vbox->addWidget(m_nr2OriginalGeometryCheck);
     vbox->addStretch();
+    updateNr2ControlAvailability();
     return page;
+}
+
+void AetherDspWidget::updateNr2ControlAvailability()
+{
+    if (!m_nr2GainGroup || !m_nr2QsppSlider || !m_nr2QsppLabel) {
+        return;
+    }
+
+    const int gainMethod = m_nr2GainGroup->checkedId();
+    const bool useOriginal = m_nr2OriginalGeometryCheck
+        && m_nr2OriginalGeometryCheck->isChecked();
+    const bool thresholdAvailable = gainMethod == 2
+        || (!useOriginal && gainMethod == 0);
+    const QString tooltip = thresholdAvailable
+        ? QStringLiteral(
+            "Speech-presence threshold used by this gain method. Lower "
+            "values preserve quiet speech but may pass more noise.")
+        : QStringLiteral(
+            "Voice Threshold does not affect the selected gain method.");
+
+    if (m_nr2QsppTitleLabel) {
+        m_nr2QsppTitleLabel->setEnabled(thresholdAvailable);
+        m_nr2QsppTitleLabel->setToolTip(tooltip);
+    }
+    m_nr2QsppSlider->setEnabled(thresholdAvailable);
+    m_nr2QsppSlider->setToolTip(tooltip);
+    m_nr2QsppLabel->setEnabled(thresholdAvailable);
+    m_nr2QsppLabel->setToolTip(tooltip);
 }
 
 // ── NR4 Tab (libspecbleach) ──────────────────────────────────────────────────
@@ -869,13 +1106,9 @@ QWidget* AetherDspWidget::buildMnrPage()
     auto labelStyle = QStringLiteral("QLabel { color: #8090a0; font-size: 11px; }");
     auto valStyle   = QStringLiteral("QLabel { color: #c8d8e8; font-size: 11px; min-width: 40px; }");
 
-    m_mnrEnableCheck = new QCheckBox("Enable MNR (macOS only)");
-    m_mnrEnableCheck->setToolTip("MMSE-Wiener spectral noise reduction with asymmetric gain smoothing.\n"
-                                 "Removes consistent background noise while preserving speech quality.");
     {
         auto* hdrRow = new QHBoxLayout;
         hdrRow->setContentsMargins(0, 0, 0, 0);
-        hdrRow->addWidget(m_mnrEnableCheck);
         hdrRow->addStretch(1);
         auto* resetBtn = makeResetIconButton();
         connect(resetBtn, &QPushButton::clicked,
@@ -883,13 +1116,6 @@ QWidget* AetherDspWidget::buildMnrPage()
         hdrRow->addWidget(resetBtn);
         vbox->addLayout(hdrRow);
     }
-    connect(m_mnrEnableCheck, &QCheckBox::toggled, this, [this](bool checked) {
-        auto& s = AppSettings::instance();
-        s.setValue("MnrEnabled", checked ? "True" : "False");
-        s.save();
-        emit mnrEnabledChanged(checked);
-    });
-
     {
         auto* row = new QHBoxLayout;
         auto* lbl = new QLabel("Strength");
@@ -897,10 +1123,14 @@ QWidget* AetherDspWidget::buildMnrPage()
         row->addWidget(lbl);
 
         m_mnrStrengthSlider = new GuardedSlider(Qt::Horizontal);
+        m_mnrStrengthSlider->setObjectName(QStringLiteral("mnrStrengthSlider"));
+        m_mnrStrengthSlider->setAccessibleName(QStringLiteral("MNR Strength"));
+        m_mnrStrengthSlider->setAccessibleDescription(
+            QStringLiteral("Noise-reduction synthesis strength from 0 to 100 percent"));
         m_mnrStrengthSlider->setRange(0, 100);
         m_mnrStrengthSlider->setValue(100);
         applyPrimarySliderStyle(m_mnrStrengthSlider);
-        m_mnrStrengthSlider->setToolTip("Adjust noise reduction aggressiveness (0 = mild, 100 = maximum)");
+        m_mnrStrengthSlider->setToolTip("Adjust noise reduction aggressiveness (0 = bypass, 100 = maximum)");
         row->addWidget(m_mnrStrengthSlider, 1);
 
         m_mnrStrengthLabel = new QLabel("100%");
@@ -918,8 +1148,8 @@ QWidget* AetherDspWidget::buildMnrPage()
         });
     }
 
-    auto* info = new QLabel("Asymmetric temporal smoothing: fast release (~15ms) for quick noise suppression,\n"
-                            "gentle attack (~64ms) to preserve speech transients without artifacts.");
+    auto* info = new QLabel("Smoothed minimum-statistics tracking learns steady background noise,\n"
+                            "then applies a shared Wiener mask that preserves stereo balance.");
     info->setWordWrap(true);
     AetherSDR::ThemeManager::instance().applyStyleSheet(info, "QLabel { color: {{color.text.secondary}}; font-size: 11px; }");
     vbox->addSpacing(8);
@@ -935,15 +1165,71 @@ QWidget* AetherDspWidget::buildRn2Page()
 {
     auto* page = new QWidget;
     auto* vbox = new QVBoxLayout(page);
+    vbox->setContentsMargins(10, 20, 0, 0);
     auto* lbl = new QLabel(
         "RNNoise — open-source recurrent neural-network voice denoiser. "
         "Removes stationary background noise (fans, hum, white-noise floor) "
-        "while preserving speech.  Lightweight and CPU-only.  No adjustable "
-        "parameters.");
+        "while preserving speech.  Lightweight and CPU-only.");
     lbl->setWordWrap(true);
     lbl->setAlignment(Qt::AlignTop | Qt::AlignLeft);
     AetherSDR::ThemeManager::instance().applyStyleSheet(lbl, "QLabel { color: {{color.text.secondary}}; font-size: 12px; }");
-    vbox->addWidget(lbl);
+    {
+        auto* infoRow = new QHBoxLayout;
+        infoRow->setContentsMargins(0, 0, 10, 0);
+        infoRow->addWidget(lbl);
+        vbox->addLayout(infoRow);
+    }
+
+    {
+        auto* resetRow = new QHBoxLayout;
+        resetRow->setContentsMargins(0, 10, 10, 0);
+        resetRow->addStretch(1);
+        auto* rn2ResetBtn = makeResetIconButton();
+        connect(rn2ResetBtn, &QPushButton::clicked,
+                this, &AetherDspWidget::resetCurrentTab);
+        resetRow->addWidget(rn2ResetBtn);
+        vbox->addLayout(resetRow);
+    }
+
+    auto* grid = new QGridLayout;
+    grid->setColumnStretch(1, 1);
+
+    // Dry mix. RNNoise gates hard between phrases, which some operators hear
+    // as the receiver going dead rather than quiet. Retaining a slice of the
+    // original spectrum leaves a constant floor under the speech. Default 0 is
+    // RN2's behavior since it shipped, so nothing changes until it is asked for.
+    auto* dryTitle = new QLabel("Noise Floor");
+    grid->addWidget(dryTitle, 0, 0);
+    m_rn2DryMixSlider = new QSlider(Qt::Horizontal);
+    m_rn2DryMixSlider->setObjectName(QStringLiteral("rn2DryMixSlider"));
+    m_rn2DryMixSlider->setAccessibleName(tr("RN2 noise floor"));
+    m_rn2DryMixSlider->setAccessibleDescription(
+        tr("Percentage of the original signal RN2 leaves under the denoised "
+           "audio. Zero is full noise suppression."));
+    m_rn2DryMixSlider->setRange(
+        0, static_cast<int>(Rn2SettingsModel::kMaxRxDryMix * 100.0f));
+    m_rn2DryMixSlider->setValue(static_cast<int>(
+        Rn2SettingsModel::instance().config().rxDryMix * 100.0f + 0.5f));
+    applyPrimarySliderStyle(m_rn2DryMixSlider);
+    m_rn2DryMixSlider->setToolTip(
+        "How much of the original signal RN2 leaves under the denoised audio.\n"
+        "0% = full suppression (default) — silent between phrases\n"
+        "10–20% = a steady, quiet noise floor so the receiver still sounds live\n\n"
+        "Affects received audio only; the transmit denoiser is unchanged.");
+    grid->addWidget(m_rn2DryMixSlider, 0, 1);
+    m_rn2DryMixLabel = new QLabel(
+        QString::number(m_rn2DryMixSlider->value()) + QStringLiteral("%"));
+    m_rn2DryMixLabel->setFixedWidth(40);
+    grid->addWidget(m_rn2DryMixLabel, 0, 2);
+
+    connect(m_rn2DryMixSlider, &QSlider::valueChanged, this, [this](int v) {
+        m_rn2DryMixLabel->setText(QString::number(v) + QStringLiteral("%"));
+        const float mix = static_cast<float>(v) / 100.0f;
+        Rn2SettingsModel::instance().setRxDryMix(mix);
+        emit rn2DryMixChanged(mix);
+    });
+
+    vbox->addLayout(grid);
     vbox->addStretch();
     return page;
 }
@@ -993,6 +1279,20 @@ void AetherDspWidget::updateBnrStatus()
                                      : partial ? tr("Resume download")
                                                : QStringLiteral("Download (~1 GB)"));
         m_bnrAfxDownloadBtn->setEnabled(true);
+#ifdef HAVE_NVIDIA_AFX
+        // If no afx-bits pack is published for this GPU's arch (e.g. sm_120 /
+        // RTX 50-series), don't offer a Download that would 404 — disable it and
+        // say why, steering the user to DFNR. (#3933)
+        if (!NvidiaAfxPack::hasSupportedGpu()) {
+            m_bnrAfxDownloadBtn->setEnabled(false);
+            if (NvidiaAfxPack::isAfxCapableGpu()) {
+                m_bnrAfxDownloadBtn->setText(tr("No pack for this GPU"));
+                m_bnrAfxDownloadBtn->setToolTip(
+                    QStringLiteral("No BNR pack for your GPU (%1) yet — use DFNR.")
+                        .arg(NvidiaAfxPack::detectArch()));
+            }
+        }
+#endif
     }
     if (m_bnrAfxIntensitySlider)
         m_bnrAfxIntensitySlider->setEnabled(installed);
@@ -1320,6 +1620,11 @@ QWidget* AetherDspWidget::buildDfnrPage()
 
     auto* info = new QLabel("AI-powered speech enhancement — higher fidelity than RNNoise "
                             "in high-noise HF environments. CPU-only, 10 ms latency, 48 kHz.");
+#ifndef HAVE_DFNR
+    info->setText("DFNR is unavailable in this build. Set up the platform "
+                  "DeepFilterNet library and rebuild AetherSDR to enable it.");
+    info->setToolTip(kDfnrUnavailableToolTip);
+#endif
     info->setWordWrap(true);
     AetherSDR::ThemeManager::instance().applyStyleSheet(info, "QLabel { color: {{color.text.secondary}}; font-size: 12px; }");
     {
@@ -1339,12 +1644,21 @@ QWidget* AetherDspWidget::buildDfnrPage()
         auto* dfnrResetBtn = makeResetIconButton();
         connect(dfnrResetBtn, &QPushButton::clicked,
                 this, &AetherDspWidget::resetCurrentTab);
+#ifndef HAVE_DFNR
+        dfnrResetBtn->setEnabled(false);
+        dfnrResetBtn->setToolTip(kDfnrUnavailableToolTip);
+#endif
         resetRow->addWidget(dfnrResetBtn);
         vbox->addLayout(resetRow);
     }
 
-    grid->addWidget(new QLabel("Attenuation Limit"), 1, 0);
+    auto* attenTitle = new QLabel("Attenuation Limit");
+    grid->addWidget(attenTitle, 1, 0);
     m_dfnrAttenSlider = new QSlider(Qt::Horizontal);
+    m_dfnrAttenSlider->setObjectName(QStringLiteral("dfnrAttenLimitSlider"));
+    m_dfnrAttenSlider->setAccessibleName(tr("DFNR attenuation limit"));
+    m_dfnrAttenSlider->setAccessibleDescription(
+        tr("Maximum noise attenuation in dB for DeepFilterNet noise reduction."));
     m_dfnrAttenSlider->setRange(0, 100);
     m_dfnrAttenSlider->setValue(static_cast<int>(s.value("DfnrAttenLimit", "100").toFloat()));
     applyPrimarySliderStyle(m_dfnrAttenSlider);
@@ -1354,9 +1668,19 @@ QWidget* AetherDspWidget::buildDfnrPage()
                                    "For weak signals: 20–30 dB\n"
                                    "For casual listening: 40–60 dB\n"
                                    "For strong signals: 80–100 dB");
+#ifndef HAVE_DFNR
+    attenTitle->setEnabled(false);
+    attenTitle->setToolTip(kDfnrUnavailableToolTip);
+    m_dfnrAttenSlider->setEnabled(false);
+    m_dfnrAttenSlider->setToolTip(kDfnrUnavailableToolTip);
+#endif
     grid->addWidget(m_dfnrAttenSlider, 1, 1);
     m_dfnrAttenLabel = new QLabel(QString::number(m_dfnrAttenSlider->value()));
     m_dfnrAttenLabel->setFixedWidth(40);
+#ifndef HAVE_DFNR
+    m_dfnrAttenLabel->setEnabled(false);
+    m_dfnrAttenLabel->setToolTip(kDfnrUnavailableToolTip);
+#endif
     grid->addWidget(m_dfnrAttenLabel, 1, 2);
 
     connect(m_dfnrAttenSlider, &QSlider::valueChanged, this, [this](int v) {
@@ -1368,8 +1692,13 @@ QWidget* AetherDspWidget::buildDfnrPage()
         emit dfnrAttenLimitChanged(db);
     });
 
-    grid->addWidget(new QLabel("Post-Filter Beta"), 2, 0);
+    auto* betaTitle = new QLabel("Post-Filter Beta");
+    grid->addWidget(betaTitle, 2, 0);
     m_dfnrBetaSlider = new QSlider(Qt::Horizontal);
+    m_dfnrBetaSlider->setObjectName(QStringLiteral("dfnrPostFilterBetaSlider"));
+    m_dfnrBetaSlider->setAccessibleName(tr("DFNR post-filter beta"));
+    m_dfnrBetaSlider->setAccessibleDescription(
+        tr("Post-filter strength for DeepFilterNet noise reduction."));
     m_dfnrBetaSlider->setRange(0, 30);
     m_dfnrBetaSlider->setValue(static_cast<int>(s.value("DfnrPostFilterBeta", "0.0").toFloat() * 100));
     applyPrimarySliderStyle(m_dfnrBetaSlider);
@@ -1377,9 +1706,19 @@ QWidget* AetherDspWidget::buildDfnrPage()
                                   "0 = disabled (default)\n"
                                   "0.05–0.15 = subtle additional filtering\n"
                                   "0.15–0.30 = aggressive post-processing");
+#ifndef HAVE_DFNR
+    betaTitle->setEnabled(false);
+    betaTitle->setToolTip(kDfnrUnavailableToolTip);
+    m_dfnrBetaSlider->setEnabled(false);
+    m_dfnrBetaSlider->setToolTip(kDfnrUnavailableToolTip);
+#endif
     grid->addWidget(m_dfnrBetaSlider, 2, 1);
     m_dfnrBetaLabel = new QLabel(QString::number(m_dfnrBetaSlider->value() / 100.0f, 'f', 2));
     m_dfnrBetaLabel->setFixedWidth(40);
+#ifndef HAVE_DFNR
+    m_dfnrBetaLabel->setEnabled(false);
+    m_dfnrBetaLabel->setToolTip(kDfnrUnavailableToolTip);
+#endif
     grid->addWidget(m_dfnrBetaLabel, 2, 2);
 
     connect(m_dfnrBetaSlider, &QSlider::valueChanged, this, [this](int v) {
@@ -1396,40 +1735,82 @@ QWidget* AetherDspWidget::buildDfnrPage()
     return page;
 }
 
-// ── Sync from saved settings ─────────────────────────────────────────────────
+// ── Sync from the feature-owned settings model ───────────────────────────────
+
+void AetherDspWidget::syncNr2Settings()
+{
+    const Nr2SettingsModel::Config config =
+        Nr2SettingsModel::instance().config();
+
+    if (QAbstractButton* button =
+            m_nr2GainGroup->button(config.gainMethod)) {
+        QSignalBlocker blocker(button);
+        button->setChecked(true);
+    }
+    if (QAbstractButton* button =
+            m_nr2NpeGroup->button(config.npeMethod)) {
+        QSignalBlocker blocker(button);
+        button->setChecked(true);
+    }
+
+    {
+        QSignalBlocker blocker(m_nr2AeCheck);
+        m_nr2AeCheck->setChecked(config.aeFilter);
+    }
+
+    const int gainMax = std::clamp(
+        static_cast<int>(std::lround(config.gainMax * 100.0f)), 50, 200);
+    {
+        QSignalBlocker blocker(m_nr2GainMaxSlider);
+        m_nr2GainMaxSlider->setValue(gainMax);
+    }
+    m_nr2GainMaxLabel->setText(
+        QString::number(gainMax / 100.0f, 'f', 2));
+
+    const int gainFloor = std::clamp(
+        static_cast<int>(std::lround(config.gainFloor * 100.0f)), 0, 15);
+    {
+        QSignalBlocker blocker(m_nr2GainFloorSlider);
+        m_nr2GainFloorSlider->setValue(gainFloor);
+    }
+    m_nr2GainFloorLabel->setText(
+        QString::number(gainFloor / 100.0f, 'f', 2));
+
+    const int gainSmooth = std::clamp(
+        static_cast<int>(std::lround(config.gainSmooth * 100.0f)), 50, 98);
+    {
+        QSignalBlocker blocker(m_nr2SmoothSlider);
+        m_nr2SmoothSlider->setValue(gainSmooth);
+    }
+    m_nr2SmoothLabel->setText(
+        QString::number(gainSmooth / 100.0f, 'f', 2));
+
+    const int qspp = std::clamp(
+        static_cast<int>(std::lround(config.qspp * 100.0f)), 5, 50);
+    {
+        QSignalBlocker blocker(m_nr2QsppSlider);
+        m_nr2QsppSlider->setValue(qspp);
+    }
+    m_nr2QsppLabel->setText(QString::number(qspp / 100.0f, 'f', 2));
+
+    {
+        QSignalBlocker blocker(m_nr2OriginalGeometryCheck);
+        m_nr2OriginalGeometryCheck->setChecked(
+            config.legacyGeometryAndGainMapping);
+    }
+    updateNr2ControlAvailability();
+}
+
+// ── Sync from engine and saved settings ──────────────────────────────────────
 
 void AetherDspWidget::syncFromEngine()
 {
     syncDspSelectorFromEngine();
+    syncNr2Settings();
 
     auto& s = AppSettings::instance();
 
-    int gainMethod = s.value("NR2GainMethod", "2").toInt();
-    if (auto* btn = m_nr2GainGroup->button(gainMethod))
-        btn->setChecked(true);
-
-    int npeMethod = s.value("NR2NpeMethod", "0").toInt();
-    if (auto* btn = m_nr2NpeGroup->button(npeMethod))
-        btn->setChecked(true);
-
-    bool aeFilter = s.value("NR2AeFilter", "True").toString() == "True";
-    m_nr2AeCheck->setChecked(aeFilter);
-
-    int gainMax = static_cast<int>(s.value("NR2GainMax", "1.50").toFloat() * 100);
-    m_nr2GainMaxSlider->setValue(gainMax);
-    m_nr2GainMaxLabel->setText(QString::number(gainMax / 100.0f, 'f', 2));
-
-    int smooth = static_cast<int>(s.value("NR2GainSmooth", "0.85").toFloat() * 100);
-    m_nr2SmoothSlider->setValue(smooth);
-    m_nr2SmoothLabel->setText(QString::number(smooth / 100.0f, 'f', 2));
-
-    int qspp = static_cast<int>(s.value("NR2Qspp", "0.20").toFloat() * 100);
-    m_nr2QsppSlider->setValue(qspp);
-    m_nr2QsppLabel->setText(QString::number(qspp / 100.0f, 'f', 2));
-
-    if (m_mnrEnableCheck) {
-        { QSignalBlocker sb(m_mnrEnableCheck);
-          m_mnrEnableCheck->setChecked(m_audio->mnrEnabled()); }
+    if (m_mnrStrengthSlider) {
         { QSignalBlocker sb(m_mnrStrengthSlider);
           int strength = static_cast<int>(m_audio->mnrStrength() * 100.0f);
           m_mnrStrengthSlider->setValue(strength);
